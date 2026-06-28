@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/kamaji-proto",
+    "crates/kamaji",
+    "crates/kamaji-bin",
+    "crates/cheers-mock",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.16"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/kamaji"
+
+# Base crates live in the yah-base repo; redirect the version-based deps to
+# their local path for atomic monorepo dev. Stripped on export
+# (scripts/export-oss.sh) so the standalone mirror resolves yah-base from
+# crates.io.
