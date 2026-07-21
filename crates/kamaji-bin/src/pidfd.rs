@@ -19,9 +19,9 @@
 //!   a [`ExitEvent`] over an unbounded mpsc channel.
 //! - [`PidfdReaper::recv`] is the consumer side — Kamaji's server reads
 //!   events here and pushes them to Yubaba as
-//!   [`constable_proto::ConstableToWarden::WorkloadExited`].
+//!   [`kamaji_proto::KamajiToYubaba::WorkloadExited`].
 //!
-//! The translation from `WaitStatus` to the wire [`constable_proto::ExitStatus`]
+//! The translation from `WaitStatus` to the wire [`kamaji_proto::ExitStatus`]
 //! is in [`translate_wait_status`] and is the only piece tested off-Linux.
 
 use std::io;
@@ -130,11 +130,7 @@ impl PidfdReaperHandle {
     ///
     /// Linux-only. Non-Linux returns [`PidfdError::Unsupported`] without
     /// spawning anything.
-    pub fn register(
-        &self,
-        workload_id: WorkloadId,
-        pidfd: OwnedFd,
-    ) -> Result<(), PidfdError> {
+    pub fn register(&self, workload_id: WorkloadId, pidfd: OwnedFd) -> Result<(), PidfdError> {
         #[cfg(target_os = "linux")]
         {
             let tx = self.events_tx.clone();
@@ -169,9 +165,7 @@ impl PidfdReaperHandle {
 /// Translate `nix::sys::wait::WaitStatus` into the wire-level
 /// [`WireExitStatus`]. Exposed for unit testing on every platform.
 #[cfg(target_os = "linux")]
-pub fn translate_wait_status(
-    s: nix::sys::wait::WaitStatus,
-) -> Result<WireExitStatus, PidfdError> {
+pub fn translate_wait_status(s: nix::sys::wait::WaitStatus) -> Result<WireExitStatus, PidfdError> {
     use nix::sys::wait::WaitStatus;
     match s {
         WaitStatus::Exited(_, code) => Ok(WireExitStatus::Exited(code)),
@@ -205,8 +199,8 @@ mod linux {
     pub(super) fn watch_pidfd(
         pidfd: OwnedFd,
     ) -> Result<impl Future<Output = Result<WireExitStatus, PidfdError>>, PidfdError> {
-        let async_fd = AsyncFd::with_interest(pidfd, Interest::READABLE)
-            .map_err(PidfdError::AsyncRegister)?;
+        let async_fd =
+            AsyncFd::with_interest(pidfd, Interest::READABLE).map_err(PidfdError::AsyncRegister)?;
         Ok(async move {
             // Wait for EPOLLIN — kernel fires this on child exit.
             let _guard = async_fd

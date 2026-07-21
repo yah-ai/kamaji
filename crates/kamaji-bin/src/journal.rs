@@ -35,21 +35,11 @@
 //! logs still surface through whatever subscriber the operator has wired
 //! up. The line buffering logic itself is platform-neutral.
 //!
-//! @yah:relay(R428, "Multi-player attribution + audit journal forwarding")
-//! @yah:at(2026-06-03T22:42:08Z)
-//! @yah:status(open)
-//! @yah:phase(P3)
-//! @yah:parent(Q425)
-//! @arch:see(.yah/docs/working/W159-camp-trust-boundaries-and-mcp-auth.md)
-//! @yah:depends_on(R426)
-//!
-//! @yah:ticket(R428-F2, "Audit journal: local JSONL + rotation + denied.jsonl sampling + cheers forwarder + W127 projection contract")
-//! @yah:at(2026-06-03T22:46:06Z)
-//! @yah:status(open)
-//! @yah:phase(P3)
-//! @yah:parent(R428)
-//! @arch:see(.yah/docs/working/W159-camp-trust-boundaries-and-mcp-auth.md)
-//! @yah:depends_on(R426-F3)
+//! The R428 relay + R428-F2 audit-journal ticket used to be homed here.
+//! They've moved to `oss/kamaji/crates/kamaji-bin/src/audit/mod.rs` — the
+//! canonical source file for the auth-event audit journal, which is
+//! distinct in schema, retention, and destination from this
+//! workload-stdout fan-in.
 
 use std::io;
 use std::path::Path;
@@ -143,11 +133,7 @@ pub trait LogSink: std::fmt::Debug + Send + Sync {
 /// Each field is followed by either a terminating `\n` (text form) or an
 /// explicit separator `\n` after the value bytes (binary form). The whole
 /// datagram is then sent in one `send(2)` to journald's UDS.
-pub fn build_journal_payload(
-    workload_id: &WorkloadId,
-    stream: Stream,
-    line: &[u8],
-) -> Vec<u8> {
+pub fn build_journal_payload(workload_id: &WorkloadId, stream: Stream, line: &[u8]) -> Vec<u8> {
     let truncated_len = line.len().min(MAX_MESSAGE_LEN);
     let body = &line[..truncated_len];
 
@@ -378,7 +364,8 @@ mod tests {
         let p = build_journal_payload(&wid("svc-1"), Stream::Stderr, b"boom");
         // Just the first line and the stream tag — full bytes covered above.
         assert!(p.starts_with(b"PRIORITY=3\n"));
-        assert!(p.windows(b"YAH_STREAM=stderr\n".len())
+        assert!(p
+            .windows(b"YAH_STREAM=stderr\n".len())
             .any(|w| w == b"YAH_STREAM=stderr\n"));
     }
 
@@ -423,9 +410,7 @@ mod tests {
     fn payload_carries_workload_id_field_verbatim() {
         let p = build_journal_payload(&wid("orchard-37b"), Stream::Stdout, b"msg");
         let needle = b"YAH_WORKLOAD_ID=orchard-37b\n";
-        assert!(p
-            .windows(needle.len())
-            .any(|w| w == needle));
+        assert!(p.windows(needle.len()).any(|w| w == needle));
     }
 
     #[tokio::test]

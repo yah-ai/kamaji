@@ -39,8 +39,8 @@ const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory"];
 /// native and container workloads.
 const CPU_PERIOD_US: u64 = 100_000;
 
-/// `cpu_shares` value workload-spec documents as "≈ one full core".
-const SHARES_PER_CORE: u64 = 1024;
+/// Millicores that make one full core (k8s convention: `1000m` = 1 CPU).
+const MILLIS_PER_CORE: u64 = 1000;
 
 /// Driver scoped to one `<slice_root>/native` sub-tree. Cheap to clone — only
 /// holds a path.
@@ -98,8 +98,11 @@ impl CgroupV2 {
         validate_id(id)?;
         let path = self.native_root.join(id);
         create_dir_all(&path)?;
-        write_file(&path.join("cpu.max"), &format_cpu_max(limits.cpu_shares))?;
-        write_file(&path.join("memory.max"), &format_memory_max(limits.memory_mb))?;
+        write_file(&path.join("cpu.max"), &format_cpu_max(limits.cpu_millis))?;
+        write_file(
+            &path.join("memory.max"),
+            &format_memory_max(limits.memory_mb),
+        )?;
         Ok(CgroupHandle { path })
     }
 
@@ -137,14 +140,14 @@ impl CgroupHandle {
     }
 }
 
-/// Translate `cpu_shares` (workload-spec, where 1024 ≈ one full core) into a
-/// cgroup v2 `cpu.max` line — `"<quota_us> <period_us>"`, or `"max <period>"`
-/// for unlimited.
-pub fn format_cpu_max(cpu_shares: u32) -> String {
-    if cpu_shares == 0 {
+/// Translate `cpu_millis` (workload-spec millicore request, where 1000 = one
+/// full core) into a cgroup v2 `cpu.max` line — `"<quota_us> <period_us>"`, or
+/// `"max <period>"` for unlimited.
+pub fn format_cpu_max(cpu_millis: u32) -> String {
+    if cpu_millis == 0 {
         return format!("max {CPU_PERIOD_US}");
     }
-    let quota = (u64::from(cpu_shares) * CPU_PERIOD_US) / SHARES_PER_CORE;
+    let quota = (u64::from(cpu_millis) * CPU_PERIOD_US) / MILLIS_PER_CORE;
     let quota = quota.max(1);
     format!("{quota} {CPU_PERIOD_US}")
 }
@@ -206,10 +209,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn limits(memory_mb: u32, cpu_shares: u32) -> ResourceLimits {
+    fn limits(memory_mb: u32, cpu_millis: u32) -> ResourceLimits {
         ResourceLimits {
             memory_mb,
-            cpu_shares,
+            cpu_millis,
             ephemeral_storage_mb: 0,
         }
     }
@@ -238,7 +241,7 @@ mod tests {
     fn create_workload_writes_cpu_and_memory() {
         let (_tmp, cg) = driver();
         cg.ensure_root().unwrap();
-        let handle = cg.create_workload("svc-a", &limits(256, 1024)).unwrap();
+        let handle = cg.create_workload("svc-a", &limits(256, 1000)).unwrap();
 
         let cpu = fs::read_to_string(handle.path().join("cpu.max")).unwrap();
         assert_eq!(cpu, "100000 100000");
@@ -248,15 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn cpu_max_translates_shares_to_quota_period() {
-        // 1024 shares = one full core
-        assert_eq!(format_cpu_max(1024), "100000 100000");
-        // 2048 shares = two cores
-        assert_eq!(format_cpu_max(2048), "200000 100000");
-        // 512 shares = half a core
-        assert_eq!(format_cpu_max(512), "50000 100000");
-        // 1 share rounds to a 1us quota, not zero.
-        assert_eq!(format_cpu_max(1), "97 100000");
+    fn cpu_max_translates_millis_to_quota_period() {
+        // 1000m = one full core
+        assert_eq!(format_cpu_max(1000), "100000 100000");
+        // 2000m = two cores
+        assert_eq!(format_cpu_max(2000), "200000 100000");
+        // 500m = half a core
+        assert_eq!(format_cpu_max(500), "50000 100000");
+        // 1m rounds to a 100us quota, not zero.
+        assert_eq!(format_cpu_max(1), "100 100000");
         // 0 means "no limit" — matches workload-spec's "leave it unbounded".
         assert_eq!(format_cpu_max(0), "max 100000");
     }
@@ -309,9 +312,7 @@ mod tests {
     #[test]
     fn invalid_id_with_slash_rejected() {
         let (_tmp, cg) = driver();
-        let err = cg
-            .create_workload("foo/bar", &limits(64, 512))
-            .unwrap_err();
+        let err = cg.create_workload("foo/bar", &limits(64, 512)).unwrap_err();
         assert!(matches!(err, CgroupError::InvalidWorkloadId(_)));
     }
 

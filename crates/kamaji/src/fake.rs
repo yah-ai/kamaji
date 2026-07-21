@@ -30,8 +30,8 @@
 //!
 //! Supported targets match `YAH_LOCAL_FAIL_INJECT` from the arch doc
 //! (§Knobs for edge cases): `deploy_workload`, `teardown_workload`,
-//! `restart_workload`, `list_workloads`, `get_workload`, `stream_logs`,
-//! `health`.
+//! `restart_workload`, `graceful_upgrade_workload`, `list_workloads`,
+//! `get_workload`, `stream_logs`, `health`.
 //!
 //! @yah:ticket(R091-F2, "runtime::fake: in-memory ContainerRuntime for yubaba orchestration unit tests")
 //! @yah:status(review)
@@ -48,7 +48,7 @@ use tokio_stream::iter as stream_iter;
 use workload_spec::MeshIdent;
 
 use crate::{
-    Backend, Kamaji, DeployResult, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
+    Backend, DeployResult, Kamaji, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
     RuntimeHealth, WorkloadState, WorkloadStatus,
 };
 
@@ -71,6 +71,7 @@ pub enum FaultTarget {
     DeployWorkload,
     TeardownWorkload,
     RestartWorkload,
+    GracefulUpgradeWorkload,
     ListWorkloads,
     GetWorkload,
     StreamLogs,
@@ -85,6 +86,7 @@ impl std::str::FromStr for FaultTarget {
             "deploy_workload" => Ok(FaultTarget::DeployWorkload),
             "teardown_workload" => Ok(FaultTarget::TeardownWorkload),
             "restart_workload" => Ok(FaultTarget::RestartWorkload),
+            "graceful_upgrade_workload" => Ok(FaultTarget::GracefulUpgradeWorkload),
             "list_workloads" => Ok(FaultTarget::ListWorkloads),
             "get_workload" => Ok(FaultTarget::GetWorkload),
             "stream_logs" => Ok(FaultTarget::StreamLogs),
@@ -108,6 +110,10 @@ struct FakeWorkload {
 struct Inner {
     workloads: HashMap<String, FakeWorkload>,
     faults: HashMap<FaultTarget, (FailMode, u64 /* fired count */)>,
+    /// Mesh idents passed to `graceful_upgrade_workload`, in call order.
+    /// Lets R600-F4 orchestration tests assert *which* workloads were
+    /// graceful-upgraded (and how many times) after a secret rotation.
+    graceful_upgrades: Vec<String>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -187,15 +193,18 @@ impl FakeRuntime {
     ) {
         let key = ident.into();
         let mut guard = self.inner.lock().unwrap();
-        let entry = guard.workloads.entry(key.clone()).or_insert_with(|| FakeWorkload {
-            state: WorkloadState {
-                ident: MeshIdent(key.clone()),
-                container_id: format!("fake-{key}"),
-                status: WorkloadStatus::Pending,
-                mesh_ip: None,
-            },
-            logs: vec![],
-        });
+        let entry = guard
+            .workloads
+            .entry(key.clone())
+            .or_insert_with(|| FakeWorkload {
+                state: WorkloadState {
+                    ident: MeshIdent(key.clone()),
+                    container_id: format!("fake-{key}"),
+                    status: WorkloadStatus::Pending,
+                    mesh_ip: None,
+                },
+                logs: vec![],
+            });
         entry.state.status = WorkloadStatus::Restarting {
             last_exit_code,
             restart_count,
@@ -209,6 +218,14 @@ impl FakeRuntime {
     pub fn snapshot(&self) -> Vec<WorkloadState> {
         let guard = self.inner.lock().unwrap();
         guard.workloads.values().map(|w| w.state.clone()).collect()
+    }
+
+    /// The mesh idents passed to `graceful_upgrade_workload`, in call order
+    /// (R600-F4). Empty until a graceful upgrade is dispatched — the rotation
+    /// → live-reload tests assert on this to confirm only the workloads whose
+    /// cluster secret actually changed were upgraded.
+    pub fn graceful_upgrade_calls(&self) -> Vec<String> {
+        self.inner.lock().unwrap().graceful_upgrades.clone()
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
@@ -343,6 +360,46 @@ impl Kamaji for FakeRuntime {
         Ok(Box::pin(stream_iter(events)))
     }
 
+    async fn graceful_upgrade_workload(
+        &self,
+        spec: &workload_spec::WorkloadSpec,
+        mesh: &MeshAssignment,
+    ) -> anyhow::Result<DeployResult> {
+        if self.check_fault(&FaultTarget::GracefulUpgradeWorkload) {
+            anyhow::bail!("fake: injected fault on graceful_upgrade_workload");
+        }
+        let ident = spec.expose.mesh.identity.clone();
+        let container_id = format!("fake-{}", ident.0);
+        let mesh_ip = mesh.mesh_ip;
+
+        let mut guard = self.inner.lock().unwrap();
+        guard.graceful_upgrades.push(ident.0.clone());
+        // Model the fd-handoff as a same-identity swap: a new instance takes
+        // over, so the workload stays Running (no dropped-connection blip that
+        // a plain restart would show as Stopping).
+        let entry = guard
+            .workloads
+            .entry(ident.0.clone())
+            .or_insert_with(|| FakeWorkload {
+                state: WorkloadState {
+                    ident: ident.clone(),
+                    container_id: container_id.clone(),
+                    status: WorkloadStatus::Pending,
+                    mesh_ip: None,
+                },
+                logs: vec![],
+            });
+        entry.state.status = WorkloadStatus::Running;
+        entry.state.container_id = container_id.clone();
+        entry.state.mesh_ip = Some(mesh_ip);
+
+        Ok(DeployResult {
+            container_id,
+            mesh_ip,
+            task_pid: 1,
+        })
+    }
+
     async fn restart_workload(&self, ident: &MeshIdent) -> anyhow::Result<()> {
         if self.check_fault(&FaultTarget::RestartWorkload) {
             anyhow::bail!("fake: injected fault on restart_workload");
@@ -392,16 +449,18 @@ impl Kamaji for FakeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workload_spec::{
-        ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits, RestartPolicy,
-        SchemaVersion, StopPolicy, TierTag, WorkloadSpec, Millis,
-    };
     use tokio_stream::StreamExt as _;
+    use workload_spec::{
+        ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits,
+        RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+    };
 
     fn test_spec(name: &str) -> WorkloadSpec {
         WorkloadSpec {
             schema_version: SchemaVersion::V1,
             name: name.to_string(),
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
             image: ImageRef {
                 registry: "docker.io".to_string(),
                 repository: "library/alpine".to_string(),
@@ -419,12 +478,13 @@ mod tests {
             volumes: vec![],
             resources: ResourceLimits {
                 memory_mb: 64,
-                cpu_shares: 128,
+                cpu_millis: 128,
                 ephemeral_storage_mb: 128,
             },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Never,
+            archetype: None,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: Millis::from_secs(5),
@@ -457,11 +517,21 @@ mod tests {
         assert_eq!(result.container_id, "fake-api");
         assert_eq!(result.mesh_ip, mesh.mesh_ip);
 
-        let state = rt.get_workload(&spec.expose.mesh.identity).await.unwrap().unwrap();
+        let state = rt
+            .get_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(state.status, WorkloadStatus::Running);
 
-        rt.teardown_workload(&spec.expose.mesh.identity).await.unwrap();
-        assert!(rt.get_workload(&spec.expose.mesh.identity).await.unwrap().is_none());
+        rt.teardown_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap();
+        assert!(rt
+            .get_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -476,8 +546,12 @@ mod tests {
     async fn list_workloads_returns_all() {
         let rt = FakeRuntime::new();
         let mesh = stub_mesh();
-        rt.deploy_workload(&test_spec("svc-a"), &mesh).await.unwrap();
-        rt.deploy_workload(&test_spec("svc-b"), &mesh).await.unwrap();
+        rt.deploy_workload(&test_spec("svc-a"), &mesh)
+            .await
+            .unwrap();
+        rt.deploy_workload(&test_spec("svc-b"), &mesh)
+            .await
+            .unwrap();
 
         let list = rt.list_workloads().await.unwrap();
         assert_eq!(list.len(), 2);
@@ -490,7 +564,9 @@ mod tests {
         let spec = test_spec("bouncy");
         rt.deploy_workload(&spec, &stub_mesh()).await.unwrap();
 
-        rt.restart_workload(&spec.expose.mesh.identity).await.unwrap();
+        rt.restart_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap();
 
         let state = rt
             .get_workload(&spec.expose.mesh.identity)
@@ -509,8 +585,15 @@ mod tests {
         rt.push_log("logger", LogStreamKind::Stdout, "hello");
         rt.push_log("logger", LogStreamKind::Stdout, "world");
 
-        let opts = LogOpts { tail: None, follow: false, stream: None };
-        let mut stream = rt.stream_logs(&spec.expose.mesh.identity, opts).await.unwrap();
+        let opts = LogOpts {
+            tail: None,
+            follow: false,
+            stream: None,
+        };
+        let mut stream = rt
+            .stream_logs(&spec.expose.mesh.identity, opts)
+            .await
+            .unwrap();
 
         let mut messages = vec![];
         while let Some(ev) = stream.next().await {
@@ -519,8 +602,15 @@ mod tests {
         assert_eq!(messages, vec!["hello", "world"]);
 
         // Second drain is empty — logs are consumed.
-        let opts2 = LogOpts { tail: None, follow: false, stream: None };
-        let mut stream2 = rt.stream_logs(&spec.expose.mesh.identity, opts2).await.unwrap();
+        let opts2 = LogOpts {
+            tail: None,
+            follow: false,
+            stream: None,
+        };
+        let mut stream2 = rt
+            .stream_logs(&spec.expose.mesh.identity, opts2)
+            .await
+            .unwrap();
         assert!(stream2.next().await.is_none());
     }
 
@@ -534,8 +624,15 @@ mod tests {
             rt.push_log("tailer", LogStreamKind::Stdout, format!("line {i}"));
         }
 
-        let opts = LogOpts { tail: Some(3), follow: false, stream: None };
-        let stream = rt.stream_logs(&spec.expose.mesh.identity, opts).await.unwrap();
+        let opts = LogOpts {
+            tail: Some(3),
+            follow: false,
+            stream: None,
+        };
+        let stream = rt
+            .stream_logs(&spec.expose.mesh.identity, opts)
+            .await
+            .unwrap();
         let events: Vec<_> = stream.collect().await;
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].message, "line 7");
@@ -551,8 +648,15 @@ mod tests {
         rt.push_log("filtered", LogStreamKind::Stdout, "out");
         rt.push_log("filtered", LogStreamKind::Stderr, "err");
 
-        let opts = LogOpts { tail: None, follow: false, stream: Some(LogStreamKind::Stderr) };
-        let stream = rt.stream_logs(&spec.expose.mesh.identity, opts).await.unwrap();
+        let opts = LogOpts {
+            tail: None,
+            follow: false,
+            stream: Some(LogStreamKind::Stderr),
+        };
+        let stream = rt
+            .stream_logs(&spec.expose.mesh.identity, opts)
+            .await
+            .unwrap();
         let events: Vec<_> = stream.collect().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stream, LogStreamKind::Stderr);
@@ -606,7 +710,11 @@ mod tests {
         assert!(err.to_string().contains("injected fault"));
 
         // After the fault the workload should be absent.
-        assert!(rt.get_workload(&spec.expose.mesh.identity).await.unwrap().is_none());
+        assert!(rt
+            .get_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -640,8 +748,12 @@ mod tests {
     #[tokio::test]
     async fn snapshot_reflects_deployed_workloads() {
         let rt = FakeRuntime::new();
-        rt.deploy_workload(&test_spec("snap-a"), &stub_mesh()).await.unwrap();
-        rt.deploy_workload(&test_spec("snap-b"), &stub_mesh()).await.unwrap();
+        rt.deploy_workload(&test_spec("snap-a"), &stub_mesh())
+            .await
+            .unwrap();
+        rt.deploy_workload(&test_spec("snap-b"), &stub_mesh())
+            .await
+            .unwrap();
         let snap = rt.snapshot();
         let names: std::collections::HashSet<_> = snap.iter().map(|w| w.ident.0.as_str()).collect();
         assert!(names.contains("snap-a"));

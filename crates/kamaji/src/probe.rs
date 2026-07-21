@@ -315,7 +315,10 @@ mod tests {
             Some(v) => std::env::set_var("DOCKER_HOST", v),
             None => std::env::remove_var("DOCKER_HOST"),
         }
-        assert_eq!(paths.first().unwrap(), &PathBuf::from("/tmp/explicit-docker.sock"));
+        assert_eq!(
+            paths.first().unwrap(),
+            &PathBuf::from("/tmp/explicit-docker.sock")
+        );
     }
 
     #[test]
@@ -327,6 +330,9 @@ mod tests {
             Some(v) => std::env::set_var("CONTAINERD_ADDRESS", v),
             None => std::env::remove_var("CONTAINERD_ADDRESS"),
         }
-        assert_eq!(paths.first().unwrap(), &PathBuf::from("/tmp/explicit-cd.sock"));
+        assert_eq!(
+            paths.first().unwrap(),
+            &PathBuf::from("/tmp/explicit-cd.sock")
+        );
     }
 }

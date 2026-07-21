@@ -43,7 +43,7 @@ use tokio::process::Command;
 use workload_spec::{MeshIdent, WorkloadSpec};
 
 use crate::{
-    Backend, Kamaji, DeployResult, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
+    Backend, DeployResult, Kamaji, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
     RuntimeHealth, WorkloadState, WorkloadStatus,
 };
 
@@ -109,12 +109,16 @@ pub struct DockerRuntime {
 impl DockerRuntime {
     /// Use the system-default docker socket (inherit `DOCKER_HOST`).
     pub fn new() -> Self {
-        Self { docker_host: String::new() }
+        Self {
+            docker_host: String::new(),
+        }
     }
 
     /// Use a specific docker host (e.g. `"unix:///var/run/docker.sock"`).
     pub fn with_host(docker_host: impl Into<String>) -> Self {
-        Self { docker_host: docker_host.into() }
+        Self {
+            docker_host: docker_host.into(),
+        }
     }
 
     fn cmd(&self) -> Command {
@@ -126,11 +130,13 @@ impl DockerRuntime {
         cmd
     }
 
-    /// Build the full image reference. Always includes the digest so pulls are
-    /// content-addressed (matches containerd impl — see R438-T3).
+    /// Build the image reference handed to `docker`. Pinned images pull
+    /// content-addressed (`repo:tag@digest`); unpinned images (all-zeros
+    /// sentinel) fall back to tag-only — docker holds a locally-built or
+    /// tag-pulled image under `repo:tag`, not under the sentinel digest
+    /// (R590-B5, matches the containerd `kcc::image_ref` path).
     fn image_ref(spec: &WorkloadSpec) -> String {
-        let img = &spec.image;
-        format!("{}/{}:{}@{}", img.registry, img.repository, img.tag, img.digest)
+        spec.image.pull_ref()
     }
 
     /// Container name derived from the mesh identity. Used as the `--name`
@@ -221,17 +227,25 @@ impl Kamaji for DockerRuntime {
 
         // Build the `docker run` arg list.
         let mut args: Vec<String> = vec![
-            "run".into(), "-d".into(),
-            "--name".into(), name.clone(),
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            name.clone(),
             // Labels for identity + mesh bookkeeping.
-            "--label".into(), format!("yah.ident={}", ident.0),
-            "--label".into(), format!("yah.mesh_ip={}", mesh.mesh_ip),
-            // Memory ceiling. CPU shares aren't a docker CLI concept
-            // (--cpu-shares sets cgroup weight; matches containerd semantics).
-            "--memory".into(), format!("{}m", spec.resources.memory_mb),
-            "--cpu-shares".into(), spec.resources.cpu_shares.to_string(),
+            "--label".into(),
+            format!("yah.ident={}", ident.0),
+            "--label".into(),
+            format!("yah.mesh_ip={}", mesh.mesh_ip),
+            // Memory ceiling + CPU weight. Docker's --cpu-shares sets the
+            // cgroup relative weight (matches containerd semantics); we derive
+            // it from the millicore request (1000m ≈ 1024 shares).
+            "--memory".into(),
+            format!("{}m", spec.resources.memory_mb),
+            "--cpu-shares".into(),
+            spec.resources.cpu_shares().to_string(),
             // Mesh IP surfaced to the workload as an env var.
-            "--env".into(), format!("YAH_MESH_IP={}", mesh.mesh_ip),
+            "--env".into(),
+            format!("YAH_MESH_IP={}", mesh.mesh_ip),
         ];
 
         // Literal env vars from the spec.
@@ -291,9 +305,12 @@ impl Kamaji for DockerRuntime {
         let out = self
             .cmd()
             .args([
-                "ps", "-a",
-                "--filter", "label=yah.ident",
-                "--format", "{{.Names}}",
+                "ps",
+                "-a",
+                "--filter",
+                "label=yah.ident",
+                "--format",
+                "{{.Names}}",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -422,6 +439,29 @@ impl Kamaji for DockerRuntime {
         Ok(Box::pin(tokio_stream::iter(events)))
     }
 
+    /// Docker graceful upgrade (R600-F4). The dev/pond docker backend does not
+    /// wire the shared upgrade-socket + network-namespace plumbing that
+    /// pingora's cross-container fd-handoff needs (its `deploy_workload` renders
+    /// no volumes), so a true zero-downtime swap is not available here. This
+    /// re-deploys the (already re-rendered) spec — the container comes back with
+    /// the new cert files — and logs that the reload drops in-flight
+    /// connections. The zero-downtime handoff (sandbox-held netns or
+    /// kamaji-held listening fd) is R600-F7; dev/pond passway tolerates the
+    /// brief blip.
+    async fn graceful_upgrade_workload(
+        &self,
+        spec: &WorkloadSpec,
+        mesh: &MeshAssignment,
+    ) -> Result<DeployResult> {
+        tracing::warn!(
+            ident = %spec.expose.mesh.identity.0,
+            "Backend::Docker graceful_upgrade_workload performs a connection-dropping \
+             reload (re-deploy) — pingora zero-downtime fd-handoff is a containerd/native \
+             capability; the new cert goes live but existing connections are dropped"
+        );
+        self.deploy_workload(spec, mesh).await
+    }
+
     async fn restart_workload(&self, ident: &MeshIdent) -> Result<()> {
         let name = Self::container_name(ident);
         let out = self
@@ -494,7 +534,11 @@ impl Kamaji for DockerRuntime {
                 let version = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 Ok(RuntimeHealth {
                     ok: true,
-                    version: if version.is_empty() { None } else { Some(version) },
+                    version: if version.is_empty() {
+                        None
+                    } else {
+                        Some(version)
+                    },
                     detail: None,
                 })
             }
@@ -503,7 +547,11 @@ impl Kamaji for DockerRuntime {
                 Ok(RuntimeHealth {
                     ok: false,
                     version: None,
-                    detail: if detail.is_empty() { None } else { Some(detail) },
+                    detail: if detail.is_empty() {
+                        None
+                    } else {
+                        Some(detail)
+                    },
                 })
             }
             Err(e) => Ok(RuntimeHealth {
@@ -540,7 +588,9 @@ fn map_docker_state(state: &DockerState, restart_count: u32) -> WorkloadStatus {
         "exited" => WorkloadStatus::Failed {
             reason: format!("exited with code {}", state.exit_code),
         },
-        "dead" => WorkloadStatus::Failed { reason: "container is dead".into() },
+        "dead" => WorkloadStatus::Failed {
+            reason: "container is dead".into(),
+        },
         other => WorkloadStatus::Failed {
             reason: format!("unknown docker status: {other}"),
         },
@@ -635,7 +685,11 @@ mod tests {
         // sleeping before the next restart attempt.
         let ws = map_docker_state(&state("running", true, 137), 3);
         match ws {
-            WorkloadStatus::Restarting { last_exit_code, restart_count, last_finished_at_unix_ms } => {
+            WorkloadStatus::Restarting {
+                last_exit_code,
+                restart_count,
+                last_finished_at_unix_ms,
+            } => {
                 assert_eq!(last_exit_code, 137);
                 assert_eq!(restart_count, 3);
                 assert!(last_finished_at_unix_ms > 0);
@@ -654,29 +708,48 @@ mod tests {
         };
         let ws = map_docker_state(&s, 1);
         assert!(
-            matches!(ws, WorkloadStatus::Restarting { restart_count: 1, last_exit_code: 2, .. }),
+            matches!(
+                ws,
+                WorkloadStatus::Restarting {
+                    restart_count: 1,
+                    last_exit_code: 2,
+                    ..
+                }
+            ),
             "got {ws:?}"
         );
     }
 
     #[test]
     fn running_maps_to_running() {
-        assert_eq!(map_docker_state(&state("running", false, 0), 0), WorkloadStatus::Running);
+        assert_eq!(
+            map_docker_state(&state("running", false, 0), 0),
+            WorkloadStatus::Running
+        );
     }
 
     #[test]
     fn created_maps_to_pending() {
-        assert_eq!(map_docker_state(&state("created", false, 0), 0), WorkloadStatus::Pending);
+        assert_eq!(
+            map_docker_state(&state("created", false, 0), 0),
+            WorkloadStatus::Pending
+        );
     }
 
     #[test]
     fn paused_maps_to_stopping() {
-        assert_eq!(map_docker_state(&state("paused", false, 0), 0), WorkloadStatus::Stopping);
+        assert_eq!(
+            map_docker_state(&state("paused", false, 0), 0),
+            WorkloadStatus::Stopping
+        );
     }
 
     #[test]
     fn exited_zero_maps_to_stopped() {
-        assert_eq!(map_docker_state(&state("exited", false, 0), 0), WorkloadStatus::Stopped);
+        assert_eq!(
+            map_docker_state(&state("exited", false, 0), 0),
+            WorkloadStatus::Stopped
+        );
     }
 
     #[test]
@@ -723,7 +796,9 @@ mod tests {
     #[test]
     fn missing_container_detection() {
         assert!(is_missing_container("Error: No such container: foo"));
-        assert!(is_missing_container("Error response from daemon: No such object: bar"));
+        assert!(is_missing_container(
+            "Error response from daemon: No such object: bar"
+        ));
         assert!(!is_missing_container("Error: permission denied"));
     }
 

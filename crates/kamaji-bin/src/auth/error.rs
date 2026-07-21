@@ -12,6 +12,18 @@ use thiserror::Error;
 /// Lifecycle errors — fetching cheers's JWKS, persisting the cache, parsing.
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// The configured cheers issuer (and thus its derived JWKS URL) is a
+    /// plaintext `http://` endpoint against a non-loopback host. Rejected at
+    /// boot before any fetch: a cleartext JWKS is a MITM key-substitution
+    /// vector — an on-path attacker swaps the published Ed25519 keys and forges
+    /// tokens kamaji will accept. Use `https://`, or `http://` only against a
+    /// loopback host (`127.0.0.1`, `[::1]`, `localhost`) for local dev.
+    #[error(
+        "insecure cheers issuer {issuer:?}: the JWKS must be fetched over \
+         https:// (plaintext http:// is allowed only for loopback hosts)"
+    )]
+    InsecureIssuer { issuer: String },
+
     /// First-start fetch failed and there is no cached JWKS to fall back to.
     /// W159: "Fetch failure on first start is fatal — operator must fix the
     /// AS URL or seed the cache out-of-band before retry."

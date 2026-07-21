@@ -11,7 +11,7 @@
 //! and push/pull framed bytes through [`encode_frame`] / [`decode_frame`].
 //!
 //! Both directions are versioned via [`ProtocolVersion`]; peers exchange
-//! [`WardenToConstable::Hello`] / [`ConstableToWarden::Welcome`] at connection
+//! [`YubabaToKamaji::Hello`] / [`KamajiToYubaba::Welcome`] at connection
 //! start so a rolling cluster can decode multiple versions during upgrades.
 //!
 //! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
@@ -22,7 +22,7 @@ pub mod version;
 
 pub use codec::{decode_frame, encode_frame, Error, MAX_FRAME_BYTES};
 pub use messages::{
-    AckKind, ConstableToWarden, DrainBudget, DrainOutcome, DrainPhase, ErrorCode, ExitStatus,
-    ProbeStatus, RequestId, WardenToConstable, WorkloadEntry, WorkloadId, WorkloadState,
+    AckKind, DrainBudget, DrainOutcome, DrainPhase, ErrorCode, ExitStatus, KamajiToYubaba,
+    ProbeStatus, RequestId, WorkloadEntry, WorkloadId, WorkloadState, YubabaToKamaji,
 };
 pub use version::ProtocolVersion;

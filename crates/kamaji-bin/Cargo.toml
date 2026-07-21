@@ -21,13 +21,42 @@ path = "src/main.rs"
 # starts containers. Excluded from the dev binary by default — non-Linux
 # hosts and pond's inner kamaji (which uses the docker socket via
 # a different backend) don't need it.
-containerd-integration = ["dep:containerd-client", "dep:prost-types", "dep:sha2"]
+# Forwards onto kamaji-containerd-core's identically-named feature (R592-T1 —
+# shared OCI-spec-building / image-resolution / task-status core with the
+# inlined `kamaji` crate, so the two deployment shapes cannot drift apart
+# again).
+containerd-integration = [
+    "dep:containerd-client",
+    "dep:prost-types",
+    "dep:kamaji-containerd-core",
+    "kamaji-containerd-core/containerd-integration",
+    # Fleet cert-rotation zero-downtime (R600-F9): kamaji is the socket custodian.
+    "dep:kamaji",
+    "kamaji/socket-custody",
+]
+
+# R599-F10: keep-alive native bundle backend. Wires the kamaji crate's native
+# (fork+exec) supervisor + the node bundle store into the UDS ServerCtx so a
+# MesofactStatic workload carrying a serve_bundle (lifecycle=KeepAlive) is
+# materialized (yah-mesofact-bundle store) and served by forking
+# `mesofact-serve --bundle <dir> --listen <addr>`. Excluded from the default
+# build (native + object-store weight); when off, deploy_mesofact_bundle returns
+# a clear "rebuild with --features bundle-serving" BackendRefused, exactly like
+# the containerd None arm.
+bundle-serving = [
+    "dep:kamaji",
+    "kamaji/native-integration",
+    "dep:yah-object-store",
+    "dep:yah-mesofact-bundle",
+    "yah-mesofact-bundle/store",
+]
 
 [dependencies]
-kamaji-proto = { path = "../kamaji-proto", version = "0.8.16" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
+kamaji-proto = { path = "../kamaji-proto", version = "0.8.20" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
 
 anyhow = "1.0"
+async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
@@ -47,8 +76,21 @@ base64ct = { version = "1", features = ["alloc"] }
 # Mirrors yubaba's optional dep so both processes can share crates.io artifacts.
 containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
-# sha256 for OCI layer chainID computation (snapshot prepare) — containerd-integration only.
-sha2 = { version = "0.10", optional = true }
+# Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
+# resolution, task-status querying. One home for both kamaji and kamaji-bin.
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.20", default-features = false }
+# Socket-custodian primitive (R599-F9 / R600-F9) — kamaji holds the passway
+# listen fd and hands it to each generation so a cert reload drops no
+# connections. Only the `socket-custody` feature of kamaji is pulled in (just
+# `nix`); gated behind containerd-integration since only the fleet backend uses it.
+kamaji = { path = "../kamaji", optional = true, default-features = false, version = "0.8.20" }
+
+# R599-F10 node bundle backend (only linked with the `bundle-serving` feature).
+# yah-object-store is the R2/in-memory blob store; yah-mesofact-bundle (store
+# feature) materializes a W272 bundle from it into the node cache. Both live in
+# oss/yah-base, redirected to path by the root [patch.crates-io] block.
+yah-object-store = { version = "0.8.20", optional = true }
+yah-mesofact-bundle = { version = "0.8.20", optional = true }
 
 # Linux-only syscall surface used by the native driver (R406-T5).
 # All three are permissive (MIT / Apache-2.0). The `landlock` crate is a thin
@@ -61,9 +103,15 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# R428-F2 adds `test-util` (paused-clock timer control for the audit forwarder tests).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "fs", "signal", "time", "test-util", "process"] }
 
 # R426-F5 — drives the production verifier path against the in-process mock
 # issuer end-to-end (boot → JWKS fetch → mint → verify).
 cheers-mock = { path = "../cheers-mock" }
 serde_json = "1.0"
+
+# R592-T5 — the sibling-shape KamajiClient, so the integration test can drive
+# a real WorkloadSpec through the postcard UDS into this crate's dispatch loop
+# exactly as a live yubaba does. `sibling` pulls in kamaji-proto for the codec.
+kamaji = { path = "../kamaji", features = ["sibling"] }

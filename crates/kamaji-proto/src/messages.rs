@@ -1,3 +1,20 @@
+//! @yah:ticket(R592-T4, "Finish warden/constable rename at the wire layer: enums, client type, socket defaults, unit templates")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-06T07:43:16Z)
+//! @yah:phase(P3)
+//! @yah:parent(R592)
+//! @yah:verify("grep for YubabaToKamaji / KamajiToYubaba / KamajiClient / run-constable paths in oss/kamaji returns zero hits; cd oss/kamaji && cargo test --workspace")
+//! @yah:depends_on(R592-T1)
+//! @yah:depends_on(R590-B3)
+//! @yah:tier(Warrior)
+//! @yah:next("DONE (R597-T1): env var renamed to KAMAJI_SOCK across kamaji-bin/src/main.rs, yah-yubaba/Dockerfile, yah-yubaba/pond-supervise.sh, kamaji.service comment.")
+//! @yah:next("DEFERRED -> filed as followup: yubaba-internal raft rename WardenState/WardenRequest/WardenNodeId/WardenRaft (oss/yubaba/crates/yubaba/src/raft/*, leader.rs, lib.rs). Independent of the wire surface; postcard-internal.")
+//! @yah:next("OPTIONAL cosmetic: test file oss/yubaba/.../tests/integration_constable_client.rs keeps its old filename (content renamed to KamajiClient; git-mv skipped to avoid shared-tree churn).")
+//! @yah:handoff("DONE + verify-clean across 3 workspaces. Renamed the pub wire surface: WardenToConstable->YubabaToKamaji, ConstableToWarden->KamajiToYubaba, ConstableClient->KamajiClient, Welcome/ConstableInfo field constable_version->kamaji_version, plus stale doc module-path constable_proto::->kamaji_proto:: -- across oss/kamaji (15 files), root crates/yah/hub (4), oss/yubaba (5). Postcard is positional so this is wire-compatible (no protocol-version bump). Socket PATHS already agreed everywhere (/run/kamaji/kamaji.sock -- peer landed that under R589-T2 in commit e815d59), so no path edit needed; T4 shrank to the pure symbol rename.")
+//! @yah:handoff("INCIDENTAL green-keeping fix (NOT part of the rename): added `render_command: None` to two BuildConfig test fixtures (kamaji-proto/src/codec.rs:785, kamaji-bin/src/server.rs:761) that drifted when R535-T7 added BuildConfig.render_command (landed in the same e815d59 wip commit, fixtures not propagated). Two-line adaptation to unblock the workspace test.")
+//! @yah:handoff("VERIFY (all green): oss/kamaji `cargo test --workspace` 0 failed (kamaji-proto 24 + kamaji-bin lib 184 + sibling_wire_e2e 2 + uds_skeleton 1 + kamaji lib 29 + others); root `cargo check -p hub --all-features` clean; oss/yubaba `cargo check -p yubaba --all-features` + `cargo test -p yubaba --test integration_constable_client --no-run` compile clean. Grep: zero residual WardenToConstable/ConstableToWarden/ConstableClient/constable_version/constable_proto in all 3 workspaces; raft Warden* symbols correctly untouched.")
+
 use serde::{Deserialize, Serialize};
 use workload_spec::Workload;
 
@@ -78,8 +95,8 @@ pub enum DrainPhase {
 ///
 /// Returned by Kamaji's drain enforcer ([`crate`] consumer in
 /// `app/yah/kamaji/src/drain.rs`) and surfaced on the wire either as
-/// part of [`ConstableToWarden::DrainAck`]`.reason` (synchronous T7 shape)
-/// or as a dedicated [`ConstableToWarden::DrainCompleted`] push (future
+/// part of [`KamajiToYubaba::DrainAck`]`.reason` (synchronous T7 shape)
+/// or as a dedicated [`KamajiToYubaba::DrainCompleted`] push (future
 /// async shape once Kamaji has a push-channel to Yubaba).
 ///
 /// `#[non_exhaustive]` so future variants (e.g. `WorkloadRefused` when a
@@ -152,7 +169,7 @@ pub enum WorkloadState {
 }
 
 /// Compact snapshot of one workload — returned in
-/// [`ConstableToWarden::WorkloadList`].
+/// [`KamajiToYubaba::WorkloadList`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadEntry {
     pub id: WorkloadId,
@@ -160,9 +177,19 @@ pub struct WorkloadEntry {
     /// OS pid of the workload's root process (native) or containerd task pid
     /// (container). Absent if not yet started or already reaped.
     pub pid: Option<u32>,
+    /// The workload's **mesh identity** (`expose.mesh.identity`), when the
+    /// backend records it. This is the stable handle Yubaba's HTTP surface
+    /// keys on (`GET /workloads/{ident}/state`), and it can differ from
+    /// [`Self::id`]: `id` is the containerd container id (a DNS-label-safe
+    /// name, e.g. `forge-<uuid>`), while the mesh identity may carry dots
+    /// (e.g. `forge.<uuid>`). Yubaba matches the polled ident against *this*
+    /// so a forge run's state is observable; `id` stays the drain/stop key.
+    /// `None` for backends/entries that don't stamp a mesh-ident label (R590-B9).
+    #[serde(default)]
+    pub mesh_ident: Option<String>,
 }
 
-/// Discriminant for a generic [`ConstableToWarden::Ack`] — which request the
+/// Discriminant for a generic [`KamajiToYubaba::Ack`] — which request the
 /// ack belongs to. Lets Yubaba's dispatch table key on request-kind without
 /// re-parsing the original payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +198,9 @@ pub enum AckKind {
     Deploy,
     Stop,
     Probe,
+    /// Ack for [`YubabaToKamaji::GracefulUpgrade`] (R600-F9). Appended last to
+    /// keep the postcard discriminants of the prior variants wire-stable.
+    GracefulUpgrade,
 }
 
 /// Wire-level error codes. The accompanying `message` carries the concrete
@@ -196,7 +226,7 @@ pub enum ErrorCode {
 /// protocol version, as long as the existing variants keep their shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum WardenToConstable {
+pub enum YubabaToKamaji {
     /// Connection greeting — exchanged once per UDS connection.
     Hello { version: ProtocolVersion },
     /// Deploy a workload. Backend (native vs container) is selected by `spec`.
@@ -223,6 +253,19 @@ pub enum WardenToConstable {
     },
     /// List every workload Kamaji is currently supervising.
     List { request_id: RequestId },
+    /// Zero-downtime reload of a passway workload onto re-rendered on-disk
+    /// material (e.g. a rotated TLS cert) — the supervisor half of pingora's
+    /// hot-upgrade (R600-F9 / W273). Kamaji, holding the workload's listen
+    /// socket as custodian, swaps the passway process without closing the
+    /// listener, so no connection is dropped. For a non-passway workload (or
+    /// when custody isn't held) the backend falls back to a connection-dropping
+    /// redeploy. Appended after `List` to keep the postcard variant indices of
+    /// the pre-existing variants wire-stable.
+    GracefulUpgrade {
+        request_id: RequestId,
+        id: WorkloadId,
+        spec: Workload,
+    },
 }
 
 /// Kamaji → Yubaba message variants.
@@ -231,12 +274,12 @@ pub enum WardenToConstable {
 /// lifecycle events (no request id — Kamaji surfaces them spontaneously).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum ConstableToWarden {
-    /// Response to [`WardenToConstable::Hello`].
+pub enum KamajiToYubaba {
+    /// Response to [`YubabaToKamaji::Hello`].
     Welcome {
         version: ProtocolVersion,
         /// Build version of the Kamaji peer (for operator visibility).
-        constable_version: String,
+        kamaji_version: String,
     },
     /// Generic ack to a request.
     Ack {
@@ -254,13 +297,13 @@ pub enum ConstableToWarden {
     WorkloadStarted { id: WorkloadId, pid: u32 },
     /// Push: a workload's root process exited.
     WorkloadExited { id: WorkloadId, exit: ExitStatus },
-    /// Response to [`WardenToConstable::Probe`].
+    /// Response to [`YubabaToKamaji::Probe`].
     ProbeResult {
         request_id: RequestId,
         id: WorkloadId,
         status: ProbeStatus,
     },
-    /// Response to [`WardenToConstable::Drain`].
+    /// Response to [`YubabaToKamaji::Drain`].
     ///
     /// Two semantic modes — both are valid V1 wire shapes; Kamaji picks
     /// based on whether it has a push channel back to Yubaba:
@@ -293,7 +336,7 @@ pub enum ConstableToWarden {
         id: WorkloadId,
         outcome: DrainOutcome,
     },
-    /// Response to [`WardenToConstable::List`].
+    /// Response to [`YubabaToKamaji::List`].
     WorkloadList {
         request_id: RequestId,
         entries: Vec<WorkloadEntry>,

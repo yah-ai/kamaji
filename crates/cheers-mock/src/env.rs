@@ -53,6 +53,18 @@ pub enum AuthModeError {
     /// `YAH_DEV_AUTH` was set to something other than `mock`.
     #[error("YAH_DEV_AUTH={0:?} is not a recognised value; expected 'mock'")]
     UnknownDevAuth(String),
+
+    /// The in-process mock issuer was requested (`YAH_DEV_AUTH=mock` /
+    /// `--auth-mode mock`) in a release build. The mock mints tokens with an
+    /// ephemeral self-generated keypair — allowing it in a release binary would
+    /// let a production deployment authenticate against attacker-choosable
+    /// keys. Refused fail-closed; only `debug_assertions` builds may select it.
+    #[error(
+        "YAH_DEV_AUTH=mock is refused in release builds: the in-process mock \
+         issuer is dev-only. Set YAH_CHEERS_ISSUER=https://… for the real \
+         cheers AS."
+    )]
+    MockRefusedInRelease,
 }
 
 impl AuthMode {
@@ -60,6 +72,19 @@ impl AuthMode {
     /// [`Self::from_env_with`] using `std::env::var_os`.
     pub fn from_env() -> Result<Self, AuthModeError> {
         Self::from_env_with(|k| std::env::var_os(k))
+    }
+
+    /// Resolve a request for the in-process mock issuer. The mock is a
+    /// dev-only affordance: in a release build (`!debug_assertions`) selecting
+    /// it is refused fail-closed via [`AuthModeError::MockRefusedInRelease`] so
+    /// a production binary can never run against a self-minted keypair. Debug
+    /// builds get [`AuthMode::Mock`] unchanged.
+    fn mock_mode() -> Result<Self, AuthModeError> {
+        if cfg!(debug_assertions) {
+            Ok(Self::Mock)
+        } else {
+            Err(AuthModeError::MockRefusedInRelease)
+        }
     }
 
     /// Same as [`Self::from_env`] but pulls values through a caller-supplied
@@ -96,7 +121,7 @@ impl AuthMode {
         match (dev, real_issuer) {
             (Some(dev), Some(_)) if dev == "mock" => Err(AuthModeError::Ambiguous),
             (Some(dev), _) if dev != "mock" => Err(AuthModeError::UnknownDevAuth(dev)),
-            (Some(_), None) => Ok(Self::Mock),
+            (Some(_), None) => Self::mock_mode(),
             (None, Some(issuer)) => Ok(Self::Real { issuer }),
             (None, None) => Ok(Self::Unconfigured),
             // The (Some(dev), Some(_)) arm above already handles the "both
@@ -125,7 +150,7 @@ impl FromStr for AuthMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "" => Ok(Self::Unconfigured),
-            "mock" => Ok(Self::Mock),
+            "mock" => Self::mock_mode(),
             other if other.starts_with("http://") || other.starts_with("https://") => {
                 Ok(Self::Real {
                     issuer: other.to_string(),
@@ -158,8 +183,28 @@ mod tests {
 
     #[test]
     fn dev_mock_picks_mock_mode() {
-        let m = AuthMode::from_env_with(env_of(&[("YAH_DEV_AUTH", "mock")])).unwrap();
-        assert_eq!(m, AuthMode::Mock);
+        // Debug builds get the mock; release builds refuse it fail-closed.
+        let r = AuthMode::from_env_with(env_of(&[("YAH_DEV_AUTH", "mock")]));
+        if cfg!(debug_assertions) {
+            assert_eq!(r.unwrap(), AuthMode::Mock);
+        } else {
+            assert!(matches!(r, Err(AuthModeError::MockRefusedInRelease)));
+        }
+    }
+
+    #[test]
+    fn mock_is_refused_in_release_builds() {
+        // The security gate itself: the dev/mock issuer must not be selectable
+        // in a release binary. Guarded so it holds in either build profile.
+        let r = AuthMode::from_env_with(env_of(&[("YAH_DEV_AUTH", "mock")]));
+        if cfg!(debug_assertions) {
+            assert_eq!(r.unwrap(), AuthMode::Mock, "debug builds allow the dev mock");
+        } else {
+            assert!(
+                matches!(r, Err(AuthModeError::MockRefusedInRelease)),
+                "release builds must refuse the dev mock fail-closed"
+            );
+        }
     }
 
     #[test]
@@ -179,10 +224,14 @@ mod tests {
 
     #[test]
     fn yah_auth_on_is_allowed() {
-        let m =
-            AuthMode::from_env_with(env_of(&[("YAH_AUTH", "on"), ("YAH_DEV_AUTH", "mock")]))
-                .unwrap();
-        assert_eq!(m, AuthMode::Mock);
+        // `YAH_AUTH=on` is not itself a bypass; the mock underneath it still
+        // follows the debug/release gate.
+        let r = AuthMode::from_env_with(env_of(&[("YAH_AUTH", "on"), ("YAH_DEV_AUTH", "mock")]));
+        if cfg!(debug_assertions) {
+            assert_eq!(r.unwrap(), AuthMode::Mock);
+        } else {
+            assert!(matches!(r, Err(AuthModeError::MockRefusedInRelease)));
+        }
     }
 
     #[test]
@@ -225,7 +274,15 @@ mod tests {
     #[test]
     fn from_str_round_trips() {
         assert_eq!(AuthMode::from_str("").unwrap(), AuthMode::Unconfigured);
-        assert_eq!(AuthMode::from_str("mock").unwrap(), AuthMode::Mock);
+        // `mock` follows the same debug/release gate as the env path.
+        if cfg!(debug_assertions) {
+            assert_eq!(AuthMode::from_str("mock").unwrap(), AuthMode::Mock);
+        } else {
+            assert!(matches!(
+                AuthMode::from_str("mock"),
+                Err(AuthModeError::MockRefusedInRelease)
+            ));
+        }
         assert_eq!(
             AuthMode::from_str("https://cheers.example").unwrap(),
             AuthMode::Real {

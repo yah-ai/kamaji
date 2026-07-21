@@ -19,8 +19,8 @@ use std::time::Duration;
 use kamaji::native::NativeRuntime;
 use kamaji::{Kamaji, MeshAssignment, WorkloadStatus};
 use workload_spec::{
-    EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits,
-    RestartPolicy, SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+    EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId,
+    ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
 };
 
 fn usage() -> ! {
@@ -46,10 +46,14 @@ async fn main() -> anyhow::Result<()> {
             "--workdir" => workdir = args.next(),
             "--env" => {
                 let Some(kv) = args.next() else { usage() };
-                let Some((k, v)) = kv.split_once('=') else { usage() };
+                let Some((k, v)) = kv.split_once('=') else {
+                    usage()
+                };
                 env.push(EnvVar {
                     name: k.to_string(),
-                    value: EnvValue::Literal { value: v.to_string() },
+                    value: EnvValue::Literal {
+                        value: v.to_string(),
+                    },
                 });
             }
             "--" => {
@@ -59,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
             _ => usage(),
         }
     }
-    let (Some(name), Some(state_dir)) = (name, state_dir) else { usage() };
+    let (Some(name), Some(state_dir)) = (name, state_dir) else {
+        usage()
+    };
     if argv.is_empty() {
         usage();
     }
@@ -67,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
     let spec = WorkloadSpec {
         schema_version: SchemaVersion::V1,
         name: name.clone(),
+        tenant: TenantId::singleton(),
+        namespace: NamespaceId::singleton(),
         image: ImageRef {
             registry: "localhost".into(),
             repository: format!("native/{name}"),
@@ -82,11 +90,19 @@ async fn main() -> anyhow::Result<()> {
         env,
         secrets: vec![],
         volumes: vec![],
-        resources: ResourceLimits { memory_mb: 512, cpu_shares: 512, ephemeral_storage_mb: 512 },
+        resources: ResourceLimits {
+            memory_mb: 512,
+            cpu_millis: 512,
+            ephemeral_storage_mb: 512,
+        },
         depends_on: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Never,
-        stop_policy: StopPolicy { signal: 15, grace_period: Millis::from_secs(5) },
+        archetype: None,
+        stop_policy: StopPolicy {
+            signal: 15,
+            grace_period: Millis::from_secs(5),
+        },
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(name.clone()),
@@ -106,7 +122,10 @@ async fn main() -> anyhow::Result<()> {
 
     let deployed = runtime.deploy_workload(&spec, &mesh).await?;
     println!("{}", serde_json::to_string(&deployed)?);
-    eprintln!("[native_supervise] {} running as pid {}", ident.0, deployed.task_pid);
+    eprintln!(
+        "[native_supervise] {} running as pid {}",
+        ident.0, deployed.task_pid
+    );
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {

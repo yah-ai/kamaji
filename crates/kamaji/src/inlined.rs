@@ -72,7 +72,10 @@ impl Inlined {
     where
         F: FnOnce(Backend) -> Arc<dyn Kamaji>,
     {
-        assert!(!prefer.is_empty(), "Inlined::pick: preference list cannot be empty");
+        assert!(
+            !prefer.is_empty(),
+            "Inlined::pick: preference list cannot be empty"
+        );
         for backend in prefer {
             if availability.get(*backend).available {
                 return Ok(factory(*backend));
@@ -82,13 +85,14 @@ impl Inlined {
         // priority) entry so callers who chained "Docker, else Containerd"
         // get the Containerd install hint when both are missing.
         let last = *prefer.last().expect("len > 0 checked above");
-        Err(availability.require(last).err().unwrap_or_else(|| {
-            BackendUnavailable {
+        Err(availability
+            .require(last)
+            .err()
+            .unwrap_or_else(|| BackendUnavailable {
                 backend: last,
                 detail: "backend marked available but require() returned Ok".into(),
                 install_hint: None,
-            }
-        }))
+            }))
     }
 }
 
@@ -141,9 +145,17 @@ mod tests {
         BackendProbe {
             backend,
             available,
-            socket_path: if available { Some(PathBuf::from("/x")) } else { None },
+            socket_path: if available {
+                Some(PathBuf::from("/x"))
+            } else {
+                None
+            },
             detail: "test".into(),
-            install_hint: if available { None } else { Some(format!("install {backend:?}")) },
+            install_hint: if available {
+                None
+            } else {
+                Some(format!("install {backend:?}"))
+            },
         }
     }
 
@@ -178,9 +190,11 @@ mod tests {
     #[test]
     fn pick_none_available_returns_last_preference_hint() {
         let avail = availability(false, false, false);
-        let result = Inlined::pick(&avail, &[Backend::Docker, Backend::Containerd], |_| {
-            unreachable!()
-        });
+        let result = Inlined::pick(
+            &avail,
+            &[Backend::Docker, Backend::Containerd],
+            |_| unreachable!(),
+        );
         let err = match result {
             Ok(_) => panic!("expected BackendUnavailable"),
             Err(e) => e,

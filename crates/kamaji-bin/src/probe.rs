@@ -18,7 +18,7 @@
 //!   (no probe declared ↔ "trust the workload's existence as readiness").
 //!
 //! Yubaba drives cadence by re-issuing
-//! [`constable_proto::WardenToConstable::Probe`]; this module answers one
+//! [`kamaji_proto::YubabaToKamaji::Probe`]; this module answers one
 //! probe per call. `Healthcheck.interval` / `initial_delay` /
 //! `failure_threshold` live in Yubaba's policy layer.
 //!
@@ -31,6 +31,16 @@
 //! request shape is "GET <path> HTTP/1.1, read enough to extract the status
 //! line". Probes are localhost-or-bridge anyway — no TLS, no redirect chains,
 //! no proxy logic.
+//!
+//! @yah:ticket(R592-B6, "Flaky test: http_get_starting_when_port_refused races connection-reset vs connection-refused under parallel load")
+//! @yah:at(2026-07-03T01:03:37Z)
+//! @yah:status(review)
+//! @yah:parent(R592)
+//! @yah:severity(minor)
+//! @yah:next("Pre-existing flake (predates R592-T1; that refactor never touched probe.rs). Under full-workspace parallel cargo test on macOS the probe occasionally sees 'Connection reset by peer (os error 54)' instead of refused and maps to Unhealthy, failing the Starting assertion at probe.rs:501. Passes 3/3 in isolation. Fix: either bind-then-drop a listener to guarantee a dead port race-free, or accept reset as Starting-equivalent in the starting-window branch.")
+//! @yah:verify("for i in 1..20: cargo test -p kamaji-bin --lib --all-features (full parallel suite) with zero probe flakes")
+//! @yah:tier(Thief)
+//! @yah:handoff("DONE (verify-clean). Root cause: connection teardown AFTER a successful connect(), not at connect. Under full-workspace parallel load on macOS, connect() to a just-dropped loopback port races to succeed, then request write / first read gets ECONNRESET (os 54) -> fell through to HttpError::Io => Unhealthy, failing the Starting|Timeout assertion at probe.rs.\n\nFix (probe.rs production classifier, NOT the test): is_not_serving(kind)=Refused|Reset|Aborted|BrokenPipe + pre_response_err(), threaded through connect + write_all + flush + first read. Teardown BEFORE any response byte => Starting; teardown AFTER partial bytes stays Io => Unhealthy (truncated); well-formed non-2xx unaffected. Renamed HttpError::NotListening -> NotServing. Same predicate applied to run_tcp_connect (identical latent flake). Hardens real probing: workload mid-startup RSTing early connections now reads Starting not Unhealthy.\n\nVerify: 30x full parallel cargo test -p kamaji-bin --lib --all-features => 0 flakes (was ~35%). 23/23 probe unit tests green; full lib suite 188 passed. No test assertions changed.")
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -99,7 +109,7 @@ async fn run_http_get(
 ) -> ProbeStatus {
     match timeout(deadline, http_get_once(addr, path)).await {
         Ok(Ok(status)) => classify_http(status, expect_status),
-        Ok(Err(HttpError::ConnectRefused)) => ProbeStatus::Starting,
+        Ok(Err(HttpError::NotServing)) => ProbeStatus::Starting,
         Ok(Err(HttpError::Io(e))) => ProbeStatus::Unhealthy {
             reason: format!("http probe i/o error: {e}"),
         },
@@ -123,19 +133,51 @@ fn classify_http(status: u16, expect: Option<u16>) -> ProbeStatus {
 
 #[derive(Debug)]
 enum HttpError {
-    ConnectRefused,
+    /// The endpoint could not be reached as a serving HTTP peer *before any
+    /// response byte arrived* — a refused/reset/aborted connect, or the
+    /// connection torn down while we were still sending the request or waiting
+    /// for the first byte. Indistinguishable from "not up yet", so it maps to
+    /// `ProbeStatus::Starting`.
+    NotServing,
     Io(std::io::Error),
     MalformedResponse(String),
 }
 
+/// True when a connect-or-early-exchange I/O error means "no endpoint is
+/// serving HTTP here yet" rather than a genuine post-response fault.
+///
+/// `ConnectionRefused` is the clean case (kernel RST, no listener). But a
+/// workload mid-startup — or a listen socket being torn down/rebound under
+/// load — can also: RST/abort the SYN itself (`ConnectionReset` /
+/// `ConnectionAborted` at connect), or *complete* the handshake and then RST
+/// the request write or the first read (`ConnectionReset` / `BrokenPipe`
+/// mid-exchange, before any response byte). To a health probe every one of
+/// these is the same fact: we never received an HTTP response, so the workload
+/// is not ready. Folding them into `Starting` — but only before the first
+/// response byte — also removes a real test flake: a just-dropped loopback
+/// listener races connect-succeeds-then-read-resets under parallel load
+/// (R592-B6). A teardown *after* partial response bytes stays an `Io` error
+/// (truncated response → `Unhealthy`), and a well-formed non-2xx is unaffected.
+fn is_not_serving(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        kind,
+        ConnectionRefused | ConnectionReset | ConnectionAborted | BrokenPipe
+    )
+}
+
+/// Map an I/O error seen *before the first response byte* to `NotServing` when
+/// it is a connection teardown, else a genuine `Io` fault.
+fn pre_response_err(e: std::io::Error) -> HttpError {
+    if is_not_serving(e.kind()) {
+        HttpError::NotServing
+    } else {
+        HttpError::Io(e)
+    }
+}
+
 async fn http_get_once(addr: SocketAddr, path: &str) -> Result<u16, HttpError> {
-    let mut stream = TcpStream::connect(addr).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::ConnectionRefused {
-            HttpError::ConnectRefused
-        } else {
-            HttpError::Io(e)
-        }
-    })?;
+    let mut stream = TcpStream::connect(addr).await.map_err(pre_response_err)?;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: kamaji-probe\r\n\
          Accept: */*\r\nConnection: close\r\n\r\n",
@@ -145,8 +187,8 @@ async fn http_get_once(addr: SocketAddr, path: &str) -> Result<u16, HttpError> {
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(HttpError::Io)?;
-    stream.flush().await.map_err(HttpError::Io)?;
+        .map_err(pre_response_err)?;
+    stream.flush().await.map_err(pre_response_err)?;
 
     // Read the status line. We don't need to consume the body — a probe only
     // cares about the response code, and the workload will see the connection
@@ -154,10 +196,14 @@ async fn http_get_once(addr: SocketAddr, path: &str) -> Result<u16, HttpError> {
     let mut head = [0u8; 64];
     let mut filled = 0usize;
     loop {
-        let n = stream
-            .read(&mut head[filled..])
-            .await
-            .map_err(HttpError::Io)?;
+        let n = match stream.read(&mut head[filled..]).await {
+            Ok(n) => n,
+            // A teardown with no bytes in hand is the startup race — the peer
+            // accepted then reset before serving. Once we hold partial bytes a
+            // reset is a truncated response, which is a real fault (`Io`).
+            Err(e) if filled == 0 => return Err(pre_response_err(e)),
+            Err(e) => return Err(HttpError::Io(e)),
+        };
         if n == 0 {
             break;
         }
@@ -195,17 +241,14 @@ fn parse_status_line(buf: &[u8]) -> Result<u16, HttpError> {
     let code = parts
         .next()
         .ok_or_else(|| HttpError::MalformedResponse("missing status code".into()))?;
-    code.parse::<u16>().map_err(|_| {
-        HttpError::MalformedResponse(format!("status code {code:?} not a u16"))
-    })
+    code.parse::<u16>()
+        .map_err(|_| HttpError::MalformedResponse(format!("status code {code:?} not a u16")))
 }
 
 async fn run_tcp_connect(addr: SocketAddr, deadline: Duration) -> ProbeStatus {
     match timeout(deadline, TcpStream::connect(addr)).await {
         Ok(Ok(_)) => ProbeStatus::Ready,
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            ProbeStatus::Starting
-        }
+        Ok(Err(e)) if is_not_serving(e.kind()) => ProbeStatus::Starting,
         Ok(Err(e)) => ProbeStatus::Unhealthy {
             reason: format!("tcp connect failed: {e}"),
         },
@@ -338,10 +381,7 @@ mod tests {
 
     #[test]
     fn classify_http_expect_match_is_ready() {
-        assert!(matches!(
-            classify_http(418, Some(418)),
-            ProbeStatus::Ready
-        ));
+        assert!(matches!(classify_http(418, Some(418)), ProbeStatus::Ready));
     }
 
     #[test]
@@ -412,11 +452,7 @@ mod tests {
             if let Ok((mut sock, _)) = listener.accept().await {
                 // Drain the request — best-effort.
                 let mut buf = [0u8; 1024];
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(200),
-                    sock.read(&mut buf),
-                )
-                .await;
+                let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
                 let _ = sock.write_all(reply).await;
                 let _ = sock.shutdown().await;
             }
@@ -614,7 +650,10 @@ mod tests {
             addr: loopback(0),
         };
         let status = run_probe(Some(&target)).await;
-        assert!(matches!(status, ProbeStatus::Unhealthy { .. }), "got {status:?}");
+        assert!(
+            matches!(status, ProbeStatus::Unhealthy { .. }),
+            "got {status:?}"
+        );
     }
 
     // ── run_probe: None target ─────────────────────────────────────────────────

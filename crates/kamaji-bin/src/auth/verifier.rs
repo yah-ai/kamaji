@@ -12,6 +12,20 @@
 //!
 //! Layer 2 (scope + `owns:[...]` membership) is F3 — this module exposes the
 //! parsed [`McpClaims`] and stops there.
+//!
+//! @yah:ticket(R592-F3, "Golden-token vectors: one PASETO v4.public envelope, shared fixtures every minter and verifier must pass")
+//! @yah:status(review)
+//! @yah:assignee(agent:claude)
+//! @yah:at(2026-07-02T20:26:03Z)
+//! @yah:phase(P2)
+//! @yah:parent(R592)
+//! @yah:next("Minters: cheers-server (SessionAuthority secret minter), cheers-mock (oss/kamaji/crates/cheers-mock), yubaba local service-principal minter (oss/yubaba/crates/yubaba/src/cheers_client.rs — READ ONLY, lane is peer-active: replicate its envelope in the fixtures, add a next-line on R592 for its in-crate test later). Verifiers: kamaji-bin auth/verifier.rs (+jwks.rs), cloud-admin (crates/yah/cloud-admin).")
+//! @yah:next("Shape: deterministic fixture set (pinned test seed) of golden tokens + JWKS JSON — valid cases plus invalid: expired, wrong aud, wrong iss, tampered sig, unknown kid, footer/kid games. Home fixtures in oss/cheers/crates/cheers-test-support (exists for exactly this). Tests in cheers-server, cheers-verify, cheers-mock, kamaji-bin all consume the SAME files by path or include_str.")
+//! @yah:next("Envelope to pin: sub/iss/aud/scope/exp/kid/jti shapes + the 64-byte secret layout (32 seed + 32 pub) + iss==aud self-scoping rule — see R427 handoff/gotcha notes in oss/yubaba/crates/yubaba/src/identity.rs header.")
+//! @yah:verify("cd oss/cheers && cargo test -p cheers-test-support -p cheers-server -p cheers-verify; cd ../kamaji && cargo test -p kamaji-bin && cargo test -p cheers-mock")
+//! @yah:tier(Warrior)
+//! @yah:handoff("Delivered: golden-token fixture suite in oss/cheers/crates/cheers-test-support (15 committed files: valid_user + valid_svc + 6 invalid-envelope cases + JWKS; pinned seed 01..20, FIXTURE_NOW=1.7e9, no wall clock anywhere; regeneration test re-mints byte-identical from seed). Consumer tests: cheers-server, cheers-verify, cheers-mock, kamaji-bin (9 new). ALL GREEN both workspaces. HEADLINE FINDING -> R592-B7 (blocker): two non-interoperable PASETO conventions in production; cheers-server mint_mcp tokens fail kamaji-bin with MissingKid; cheers-mock diverges from the real minter it mocks. Secondary -> R592-B8: cloud-admin has no iss/aud validation at all. Both resolved under R592-B7 (2026-07-02).")
+//!
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +71,13 @@ impl AuthVerifier {
     /// - Cache present + AS unreachable → serve from stale cache with a warn.
     /// - No cache + AS unreachable → [`AuthError::BootFetchFatal`].
     pub async fn boot(config: AuthConfig) -> Result<Self, AuthError> {
+        // Fail closed BEFORE any network fetch: a plaintext (`http://`,
+        // non-loopback) issuer means the JWKS would be fetched over a channel
+        // an on-path attacker can rewrite — a key-substitution → token-forgery
+        // vector. `refresh()` reuses this same validated config, so gating boot
+        // covers every fetch path.
+        config.validate_issuer()?;
+
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -97,12 +118,13 @@ impl AuthVerifier {
             }
             None => {
                 // No cache. First-start fetch is fatal if it fails.
-                let doc = fetch_jwks(&http, &config)
-                    .await
-                    .map_err(|e| AuthError::BootFetchFatal {
-                        cache_path: config.cache_path.clone(),
-                        source: Box::new(e),
-                    })?;
+                let doc =
+                    fetch_jwks(&http, &config)
+                        .await
+                        .map_err(|e| AuthError::BootFetchFatal {
+                            cache_path: config.cache_path.clone(),
+                            source: Box::new(e),
+                        })?;
                 let next = JwksCache::from_doc(doc)?;
                 next.write_atomic(&config.cache_path).await?;
                 next
@@ -160,10 +182,11 @@ impl AuthVerifier {
         // incompatible with W159 §Canonical claim schema's i64 `exp`/`iat`.
         // The signature + footer-binding check is identical between the two
         // entry points (the high level wraps this one).
-        let trusted = PublicToken::verify(&pubkey, &untrusted, None, None).map_err(|e| match e {
-            pasetors::errors::Error::TokenValidation => VerifyError::SignatureMismatch,
-            other => VerifyError::Malformed(format!("{other:?}")),
-        })?;
+        let trusted =
+            PublicToken::verify(&pubkey, &untrusted, None, None).map_err(|e| match e {
+                pasetors::errors::Error::TokenValidation => VerifyError::SignatureMismatch,
+                other => VerifyError::Malformed(format!("{other:?}")),
+            })?;
 
         let claims: McpClaims = serde_json::from_str(trusted.payload())
             .map_err(|e| VerifyError::BadClaims(e.to_string()))?;
@@ -254,7 +277,6 @@ async fn fetch_jwks(http: &reqwest::Client, config: &AuthConfig) -> Result<JwksD
     Ok(doc)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,8 +319,7 @@ mod tests {
         // claims to be strings (W159 wants i64 `exp`/`iat`).
         let payload_bytes = serde_json::to_vec(&payload).expect("serialize payload");
         let footer_bytes = format!(r#"{{"kid":"{kid}"}}"#).into_bytes();
-        PublicToken::sign(secret, &payload_bytes, Some(&footer_bytes), None)
-            .expect("sign succeeds")
+        PublicToken::sign(secret, &payload_bytes, Some(&footer_bytes), None).expect("sign succeeds")
     }
 
     fn good_payload(
@@ -507,13 +528,8 @@ mod tests {
             &["cloud:read"],
         );
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let token = PublicToken::sign(
-            &kp.secret,
-            &payload_bytes,
-            Some(br#"{"other":"x"}"#),
-            None,
-        )
-        .unwrap();
+        let token =
+            PublicToken::sign(&kp.secret, &payload_bytes, Some(br#"{"other":"x"}"#), None).unwrap();
         let err = verifier.verify(&token, 1_800_000_000).await.unwrap_err();
         assert!(
             matches!(err, VerifyError::Malformed(ref m) if m.starts_with("footer:")),
@@ -566,11 +582,8 @@ mod tests {
     async fn boot_no_cache_no_as_is_fatal() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_path = tmp.path().join("jwks.json");
-        let config = AuthConfig::new(
-            "http://127.0.0.1:1/",
-            "https://kamaji.test",
-        )
-        .with_cache_path(cache_path);
+        let config = AuthConfig::new("http://127.0.0.1:1/", "https://kamaji.test")
+            .with_cache_path(cache_path);
         let result = AuthVerifier::boot(config).await;
         // `Result::unwrap_err` requires `T: Debug`; avoid that bound on
         // `AuthVerifier` by matching the result form directly.
@@ -578,6 +591,193 @@ mod tests {
             Err(AuthError::BootFetchFatal { .. }) => {}
             Err(other) => panic!("expected BootFetchFatal, got {other:?}"),
             Ok(_) => panic!("expected boot failure with no cache + unreachable AS"),
+        }
+    }
+
+    // ── R592-F3 golden-token fixtures ───────────────────────────────────────
+    //
+    // Shared with cheers-server / cheers-verify / cheers-mock / yubaba's
+    // minter. Committed under
+    // oss/cheers/crates/cheers-test-support/fixtures/ — see that crate's
+    // src/fixtures.rs for the pinned Ed25519 seed, the `FIXTURE_NOW` clock
+    // strategy, and the regeneration test that keeps these bytes honest.
+    // Path-referenced via `include_str!` rather than a Cargo dependency:
+    // kamaji-bin lives in a separate Cargo workspace, and cheers-test-support
+    // pulls cheers-core/-server/-verify + turso — too heavy for kamaji-bin's
+    // dev profile just to read nine token strings and a JWKS doc.
+    //
+    // These fixtures are pre-signed (not minted in this test) — this module
+    // proves kamaji-bin's PRODUCTION verifier accepts/rejects the exact same
+    // bytes cheers-mock and yubaba's minter agree on, independent of whatever
+    // local keypair `keypair()` generates for the tests above.
+    mod golden_fixtures {
+        use super::*;
+        use crate::auth::claims::AuthStrength;
+
+        const GOLDEN_JWKS_JSON: &str =
+            include_str!("../../../../../cheers/crates/cheers-test-support/fixtures/jwks.json");
+        const GOLDEN_VALID_USER_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/valid_user.token"
+        );
+        const GOLDEN_VALID_SVC_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/valid_svc.token"
+        );
+        const GOLDEN_EXPIRED_TOKEN: &str =
+            include_str!("../../../../../cheers/crates/cheers-test-support/fixtures/expired.token");
+        const GOLDEN_WRONG_AUD_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/wrong_aud.token"
+        );
+        const GOLDEN_WRONG_ISS_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/wrong_iss.token"
+        );
+        const GOLDEN_TAMPERED_SIG_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/tampered_sig.token"
+        );
+        const GOLDEN_UNKNOWN_KID_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/unknown_kid.token"
+        );
+        const GOLDEN_NO_FOOTER_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/no_footer.token"
+        );
+        const GOLDEN_FOOTER_MISSING_KID_TOKEN: &str = include_str!(
+            "../../../../../cheers/crates/cheers-test-support/fixtures/footer_missing_kid.token"
+        );
+
+        const GOLDEN_ISS: &str = "https://cheers.fixture.test";
+        const GOLDEN_AUD: &str = "https://kamaji.fixture.test";
+        const GOLDEN_NOW: i64 = 1_700_000_000;
+
+        /// Boot an `AuthVerifier` from the golden JWKS fixture. Mirrors
+        /// `build_verifier_with_doc` above, parameterized on `expected_aud`
+        /// since the golden fixtures carry their own `fixture://`-style
+        /// issuer/audience rather than this file's `cheers.test`/`kamaji.test`.
+        async fn build_golden_verifier(expected_aud: &str) -> AuthVerifier {
+            let doc: JwksDoc =
+                serde_json::from_str(GOLDEN_JWKS_JSON).expect("golden jwks.json parses");
+            let tmp = tempfile::tempdir().unwrap();
+            let cache_path = tmp.path().join("jwks.json");
+            let cache = JwksCache::from_doc(doc).unwrap();
+            cache.write_atomic(&cache_path).await.unwrap();
+            let config = AuthConfig::new(GOLDEN_ISS, expected_aud).with_cache_path(cache_path);
+            std::mem::forget(tmp);
+            AuthVerifier::boot(config).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn golden_valid_user_token_verifies() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let claims = verifier
+                .verify(GOLDEN_VALID_USER_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .expect("golden valid_user fixture must verify");
+            assert_eq!(claims.sub, "user:alice-fixture");
+            assert_eq!(claims.scope, vec!["cloud:read", "cloud:deploy"]);
+            assert_eq!(claims.camp_id.as_deref(), Some("camp-fixture-1"));
+            assert_eq!(
+                claims.act.as_ref().expect("act present").sub,
+                "svc:agent-claude-fixture"
+            );
+            assert!(claims
+                .owns
+                .as_ref()
+                .expect("owns present")
+                .contains("service", "svc-fixture-a"));
+            assert_eq!(claims.auth_strength, Some(AuthStrength::UserFresh));
+        }
+
+        #[tokio::test]
+        async fn golden_valid_svc_token_verifies_self_scoped() {
+            // yubaba's ownership-write pattern: `aud == iss` (cheers verifying
+            // its own routes), so the verifier here is configured with
+            // expected_aud == the issuer, not a kamaji resource URI.
+            let verifier = build_golden_verifier(GOLDEN_ISS).await;
+            let claims = verifier
+                .verify(GOLDEN_VALID_SVC_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .expect("golden valid_svc fixture must verify");
+            assert_eq!(claims.sub, "svc:yubaba-fixture-1");
+            assert_eq!(claims.scope, vec!["ownership:write"]);
+            assert!(claims.owns.is_none());
+            assert!(claims.camp_id.is_none());
+        }
+
+        #[tokio::test]
+        async fn golden_expired_token_is_rejected() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let err = verifier
+                .verify(GOLDEN_EXPIRED_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, VerifyError::Expired { .. }), "got {err:?}");
+        }
+
+        #[tokio::test]
+        async fn golden_wrong_aud_token_is_rejected() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let err = verifier
+                .verify(GOLDEN_WRONG_AUD_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, VerifyError::BadAudience { .. }),
+                "got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn golden_wrong_iss_token_is_rejected() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let err = verifier
+                .verify(GOLDEN_WRONG_ISS_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, VerifyError::BadIssuer { .. }), "got {err:?}");
+        }
+
+        #[tokio::test]
+        async fn golden_tampered_sig_token_is_rejected() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let err = verifier
+                .verify(GOLDEN_TAMPERED_SIG_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, VerifyError::SignatureMismatch), "got {err:?}");
+        }
+
+        #[tokio::test]
+        async fn golden_unknown_kid_token_is_rejected() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let err = verifier
+                .verify(GOLDEN_UNKNOWN_KID_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, VerifyError::UnknownKid(ref kid) if kid == "ghost-kid-not-in-jwks"),
+                "got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn golden_no_footer_token_is_rejected() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let err = verifier
+                .verify(GOLDEN_NO_FOOTER_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, VerifyError::MissingKid), "got {err:?}");
+        }
+
+        #[tokio::test]
+        async fn golden_footer_missing_kid_token_is_rejected() {
+            let verifier = build_golden_verifier(GOLDEN_AUD).await;
+            let err = verifier
+                .verify(GOLDEN_FOOTER_MISSING_KID_TOKEN.trim(), GOLDEN_NOW)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, VerifyError::Malformed(ref m) if m.starts_with("footer:")),
+                "got {err:?}"
+            );
         }
     }
 }

@@ -321,18 +321,14 @@ mod linux {
         // pre-exec failure. CLOEXEC on child_write means a successful exec
         // closes the writer end → parent sees EOF and treats it as success.
         let cloexec = OFlag::O_CLOEXEC;
-        let (parent_read, parent_write) =
-            pipe2(cloexec).map_err(syscall("pipe2(parent)"))?;
-        let (child_read, child_write) =
-            pipe2(cloexec).map_err(syscall("pipe2(child)"))?;
+        let (parent_read, parent_write) = pipe2(cloexec).map_err(syscall("pipe2(parent)"))?;
+        let (child_read, child_write) = pipe2(cloexec).map_err(syscall("pipe2(child)"))?;
         // Stdout / stderr fan-in pipes (R406-T10). Parent retains the read
         // ends inside [`NativeChild`]; the deploy path hands them to
         // [`crate::journal::forward_reader`] for line-buffered journald
         // fan-in.
-        let (stdout_read, stdout_write) =
-            pipe2(cloexec).map_err(syscall("pipe2(stdout)"))?;
-        let (stderr_read, stderr_write) =
-            pipe2(cloexec).map_err(syscall("pipe2(stderr)"))?;
+        let (stdout_read, stdout_write) = pipe2(cloexec).map_err(syscall("pipe2(stdout)"))?;
+        let (stderr_read, stderr_write) = pipe2(cloexec).map_err(syscall("pipe2(stderr)"))?;
 
         // Pre-build argv/env C strings in the parent — these allocate, so we
         // can't do them post-fork.
@@ -378,11 +374,12 @@ mod linux {
                 // Open the pidfd immediately — the kernel guarantees no pid
                 // reuse while we still hold a process reference (we haven't
                 // reaped yet), so this is race-free.
-                let pidfd = crate::pidfd::pidfd_open(child.as_raw() as u32)
-                    .map_err(|e| SpawnError::Syscall {
+                let pidfd = crate::pidfd::pidfd_open(child.as_raw() as u32).map_err(|e| {
+                    SpawnError::Syscall {
                         syscall: "pidfd_open",
                         source: std::io::Error::other(e),
-                    })?;
+                    }
+                })?;
 
                 // Wait for the child's pre-exec status byte; 0 == "exec'd",
                 // anything else means the child hit a SpawnError before exec.
@@ -679,7 +676,13 @@ mod tests {
         let mut spec = base_spec();
         spec.user = Some("1000".into());
         let plan = SandboxPlan::from_spec(&spec).unwrap();
-        assert_eq!(plan.user, Some(UserGroup { uid: 1000, gid: 1000 }));
+        assert_eq!(
+            plan.user,
+            Some(UserGroup {
+                uid: 1000,
+                gid: 1000
+            })
+        );
     }
 
     #[test]
@@ -687,7 +690,13 @@ mod tests {
         let mut spec = base_spec();
         spec.user = Some("1000:2000".into());
         let plan = SandboxPlan::from_spec(&spec).unwrap();
-        assert_eq!(plan.user, Some(UserGroup { uid: 1000, gid: 2000 }));
+        assert_eq!(
+            plan.user,
+            Some(UserGroup {
+                uid: 1000,
+                gid: 2000
+            })
+        );
     }
 
     #[test]

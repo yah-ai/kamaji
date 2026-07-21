@@ -1,19 +1,19 @@
 use std::time::Duration;
 
 use kamaji_proto::{
-    decode_frame, encode_frame, AckKind, ConstableToWarden, DrainBudget, ProtocolVersion,
-    RequestId, WardenToConstable, WorkloadId,
+    decode_frame, encode_frame, AckKind, DrainBudget, KamajiToYubaba, ProtocolVersion, RequestId,
+    WorkloadId, YubabaToKamaji,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 
-async fn read_one_reply(stream: &mut UnixStream) -> ConstableToWarden {
+async fn read_one_reply(stream: &mut UnixStream) -> KamajiToYubaba {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
-        match decode_frame::<ConstableToWarden>(&buf) {
+        match decode_frame::<KamajiToYubaba>(&buf) {
             Ok((msg, _)) => return msg,
             Err(kamaji_proto::Error::Truncated { .. }) => {
                 let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut tmp))
@@ -57,26 +57,26 @@ async fn end_to_end_hello_list_and_stop_skeleton() {
     let mut client = client.expect("server never bound the UDS");
 
     // Hello → Welcome.
-    let frame = encode_frame(&WardenToConstable::Hello {
+    let frame = encode_frame(&YubabaToKamaji::Hello {
         version: ProtocolVersion::CURRENT,
     })
     .unwrap();
     client.write_all(&frame).await.unwrap();
     match read_one_reply(&mut client).await {
-        ConstableToWarden::Welcome { version, .. } => {
+        KamajiToYubaba::Welcome { version, .. } => {
             assert_eq!(version, ProtocolVersion::CURRENT)
         }
         other => panic!("expected Welcome, got {other:?}"),
     }
 
     // List → empty WorkloadList (no backend yet).
-    let frame = encode_frame(&WardenToConstable::List {
+    let frame = encode_frame(&YubabaToKamaji::List {
         request_id: RequestId(1),
     })
     .unwrap();
     client.write_all(&frame).await.unwrap();
     match read_one_reply(&mut client).await {
-        ConstableToWarden::WorkloadList {
+        KamajiToYubaba::WorkloadList {
             request_id,
             entries,
         } => {
@@ -90,14 +90,14 @@ async fn end_to_end_hello_list_and_stop_skeleton() {
     // the absence of the workload satisfies the end-state). Backend-attached
     // teardown is exercised in the yubaba↔kamaji integration test once
     // R406-T9 lands the containerd backend.
-    let frame = encode_frame(&WardenToConstable::Stop {
+    let frame = encode_frame(&YubabaToKamaji::Stop {
         request_id: RequestId(2),
         id: WorkloadId::new("does-not-exist"),
     })
     .unwrap();
     client.write_all(&frame).await.unwrap();
     match read_one_reply(&mut client).await {
-        ConstableToWarden::Ack { request_id, kind } => {
+        KamajiToYubaba::Ack { request_id, kind } => {
             assert_eq!(request_id, RequestId(2));
             assert_eq!(kind, AckKind::Stop);
         }
@@ -107,7 +107,7 @@ async fn end_to_end_hello_list_and_stop_skeleton() {
     // Drain { id="does-not-exist" } → DrainAck { accepted: false }.
     // The Drain dispatch is wired through enforce_drain (R406-T7); for a
     // workload not in the registry it short-circuits without touching pidfd.
-    let frame = encode_frame(&WardenToConstable::Drain {
+    let frame = encode_frame(&YubabaToKamaji::Drain {
         request_id: RequestId(3),
         id: WorkloadId::new("does-not-exist"),
         budget: DrainBudget {
@@ -118,7 +118,7 @@ async fn end_to_end_hello_list_and_stop_skeleton() {
     .unwrap();
     client.write_all(&frame).await.unwrap();
     match read_one_reply(&mut client).await {
-        ConstableToWarden::DrainAck {
+        KamajiToYubaba::DrainAck {
             request_id,
             id,
             accepted,
@@ -128,7 +128,10 @@ async fn end_to_end_hello_list_and_stop_skeleton() {
             assert_eq!(id, WorkloadId::new("does-not-exist"));
             assert!(!accepted, "unknown workload must surface as not-accepted");
             let r = reason.expect("reason populated");
-            assert!(r.contains("unknown"), "reason should mention 'unknown', got: {r}");
+            assert!(
+                r.contains("unknown"),
+                "reason should mention 'unknown', got: {r}"
+            );
         }
         other => panic!("expected DrainAck, got {other:?}"),
     }

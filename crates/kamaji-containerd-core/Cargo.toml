@@ -1,0 +1,29 @@
+[package]
+name = "kamaji-containerd-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared containerd backend core for Kamaji (R592-T1) — OCI runtime-spec building, image/rootfs resolution, and task-status querying live here exactly once so the inlined (crates/kamaji) and sibling-daemon (crates/kamaji-bin) deployment shapes cannot drift apart."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Mirrors the `containerd-integration` feature on `kamaji` and `kamaji-bin` —
+# this crate's whole surface is containerd-client-shaped, so one feature
+# gates all of it (see `#![cfg(feature = "containerd-integration")]` at the
+# top of src/lib.rs). Callers forward their own `containerd-integration`
+# feature onto this crate's identically-named one.
+containerd-integration = ["dep:containerd-client", "dep:sha2"]
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+
+# containerd gRPC client (optional — only with containerd-integration feature).
+containerd-client = { version = "0.9", optional = true }
+# sha256 for OCI layer chainID computation (snapshot prepare) — containerd-integration only.
+sha2 = { version = "0.10", optional = true }

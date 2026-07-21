@@ -9,6 +9,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::error::AuthError;
+
 /// Required + default-tunable knobs for the verifier.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
@@ -59,6 +61,33 @@ impl AuthConfig {
         self
     }
 
+    /// Reject a `cheers_issuer` (and therefore the derived [`Self::jwks_url`])
+    /// that would be fetched over plaintext HTTP against a non-loopback host.
+    ///
+    /// A cleartext JWKS endpoint is a MITM key-substitution → token-forgery
+    /// vector: an on-path attacker swaps the published Ed25519 keys and mints
+    /// tokens kamaji will accept. `https://…` is always allowed; `http://…` is
+    /// allowed ONLY when the host is loopback (`127.0.0.1`, `[::1]`,
+    /// `localhost`) so local dev against the in-process mock issuer keeps
+    /// working. Anything else returns [`AuthError::InsecureIssuer`].
+    ///
+    /// Enforced by [`super::AuthVerifier::boot`] before any network fetch.
+    pub fn validate_issuer(&self) -> Result<(), AuthError> {
+        if let Some(rest) = self.cheers_issuer.strip_prefix("https://") {
+            // Require a non-empty authority so a bare `https://` can't slip by.
+            if !authority_host(rest).is_empty() {
+                return Ok(());
+            }
+        } else if let Some(rest) = self.cheers_issuer.strip_prefix("http://") {
+            if is_loopback_host(authority_host(rest)) {
+                return Ok(());
+            }
+        }
+        Err(AuthError::InsecureIssuer {
+            issuer: self.cheers_issuer.clone(),
+        })
+    }
+
     /// URL for fetching the JWKS doc.
     pub fn jwks_url(&self) -> String {
         let mut url = self.cheers_issuer.trim_end_matches('/').to_string();
@@ -76,6 +105,29 @@ impl AuthConfig {
         url.push_str("/.well-known/oauth-protected-resource");
         url
     }
+}
+
+/// Extract the bare host from a URL authority — everything after the scheme's
+/// `://`. Strips any `userinfo@`, path/query/fragment, port, and IPv6 brackets
+/// so [`is_loopback_host`] sees `127.0.0.1` / `::1` / `localhost` directly.
+fn authority_host(after_scheme: &str) -> &str {
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Drop optional `user[:pass]@` userinfo.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal `[::1]:port` — host is everything up to the closing `]`.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // IPv4 / DNS name — strip an optional `:port`.
+    authority.split(':').next().unwrap_or(authority)
+}
+
+/// Loopback hosts for which plaintext `http://` is tolerated (local dev only).
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
 fn default_cache_path() -> PathBuf {
@@ -135,5 +187,55 @@ mod tests {
             c.resource_metadata_url(),
             "https://kamaji.example/.well-known/oauth-protected-resource"
         );
+    }
+
+    #[test]
+    fn rejects_plaintext_non_loopback_issuer() {
+        // A cleartext JWKS against a routable host is a MITM key-substitution
+        // vector — must be refused before any fetch.
+        for issuer in [
+            "http://cheers.example",
+            "http://cheers.example/",
+            "http://10.0.0.5:8080",
+            "http://user@cheers.example",
+        ] {
+            let c = AuthConfig::new(issuer, "https://kamaji.example");
+            assert!(
+                matches!(c.validate_issuer(), Err(AuthError::InsecureIssuer { .. })),
+                "should reject {issuer}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_non_http_scheme() {
+        for issuer in ["cheers.example", "ftp://cheers.example", "https://"] {
+            let c = AuthConfig::new(issuer, "https://kamaji.example");
+            assert!(
+                matches!(c.validate_issuer(), Err(AuthError::InsecureIssuer { .. })),
+                "should reject {issuer}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_https_issuer() {
+        let c = AuthConfig::new("https://cheers.example", "https://kamaji.example");
+        assert!(c.validate_issuer().is_ok());
+    }
+
+    #[test]
+    fn accepts_http_loopback_issuer() {
+        // Local-dev exception: plaintext is fine when the host can't be
+        // intercepted on the wire. Covers the mock issuer's `http://127.0.0.1`.
+        for issuer in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1",
+            "http://[::1]:9000/",
+            "http://localhost:3000",
+        ] {
+            let c = AuthConfig::new(issuer, "https://kamaji.example");
+            assert!(c.validate_issuer().is_ok(), "should accept {issuer}");
+        }
     }
 }

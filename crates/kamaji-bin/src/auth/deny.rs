@@ -71,6 +71,15 @@ pub enum DenyKind {
     /// 403 — token verified, but lacks the scope or resource ownership the
     /// request requires.
     InsufficientScope,
+    /// 401 — a signature-valid token was presented from a connection whose
+    /// machine identity (NodeId) is NOT enrolled to the token's subject (W268
+    /// §token binding). Kept as its own variant purely for the local audit
+    /// journal — on the wire it is *deliberately indistinguishable* from
+    /// [`Self::InvalidToken`] (same 401, same `invalid_token` error code) so a
+    /// caller holding an exfiltrated-but-otherwise-valid token learns nothing:
+    /// no oracle separating "wrong machine" from "garbage token". See
+    /// [`Deny::token_binding`].
+    TokenBinding,
 }
 
 impl Deny {
@@ -102,25 +111,60 @@ impl Deny {
         }
     }
 
+    /// 401 — token binding failed: a signature-valid token was presented from
+    /// a connection whose NodeId is not enrolled to the token subject (W268
+    /// §token binding; enforced by [`super::policy::enforce`] when a method's
+    /// [`Requirement`](super::policy::Requirement) demands it).
+    ///
+    /// The wire shape is *intentionally* a generic `invalid_token` 401. The
+    /// machine-parseable fields an automated client branches on — status code,
+    /// RFC 6750 `error` code, and JSON body — are identical to every other
+    /// unusable-token rejection, so a client keying on those cannot tell a
+    /// binding failure apart from a malformed/expired/bad-signature token. The
+    /// `error_description` is set to a deliberately generic `"invalid token"`
+    /// rather than naming binding, so it does not confirm to the caller that
+    /// they hold an otherwise-valid credential — an attacker presenting a stolen
+    /// token from an unenrolled machine is left with "useless off-device" and no
+    /// binding-specific hint. (Note: this crate's other 401s carry *specific*
+    /// descriptions per W159 — full description-uniformity across all 401s is
+    /// out of scope here; binding just avoids adding a binding-named one.) The
+    /// distinct [`DenyKind::TokenBinding`] rides only in-process, letting the
+    /// audit journal flag off-device presentation (an active-exfiltration
+    /// signal) apart from ordinary malformed-token noise.
+    pub fn token_binding() -> Self {
+        Self {
+            kind: DenyKind::TokenBinding,
+            realm: DEFAULT_REALM.into(),
+            // Deliberately generic — NOT "binding failed" — to avoid handing
+            // the caller a human-readable oracle. The real reason lives in the
+            // DenyKind for the local audit trail, not on the wire.
+            description: Some("invalid token".into()),
+            scope: None,
+            resource: None,
+        }
+    }
+
     /// Override the realm. Defaults to [`DEFAULT_REALM`] otherwise.
     pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
         self.realm = realm.into();
         self
     }
 
-    /// HTTP status code.
+    /// HTTP status code. `TokenBinding` reports 401 identically to
+    /// `InvalidToken` — the variants differ only for the audit journal.
     pub fn status_code(&self) -> u16 {
         match self.kind {
-            DenyKind::InvalidToken => 401,
+            DenyKind::InvalidToken | DenyKind::TokenBinding => 401,
             DenyKind::InsufficientScope => 403,
         }
     }
 
     /// Short OAuth error code, RFC 6750 §3.1: `invalid_token` /
-    /// `insufficient_scope`.
+    /// `insufficient_scope`. `TokenBinding` maps to `invalid_token` so it is
+    /// indistinguishable on the wire from any other unusable-token rejection.
     pub fn error_code(&self) -> &'static str {
         match self.kind {
-            DenyKind::InvalidToken => "invalid_token",
+            DenyKind::InvalidToken | DenyKind::TokenBinding => "invalid_token",
             DenyKind::InsufficientScope => "insufficient_scope",
         }
     }
@@ -219,8 +263,7 @@ fn quoted(value: &str) -> String {
 mod tests {
     use super::*;
 
-    const METADATA_URL: &str =
-        "https://kamaji.example/.well-known/oauth-protected-resource";
+    const METADATA_URL: &str = "https://kamaji.example/.well-known/oauth-protected-resource";
 
     #[test]
     fn invalid_token_matches_w159_example() {
@@ -256,8 +299,7 @@ mod tests {
 
     #[test]
     fn insufficient_scope_without_resource() {
-        let deny: Deny =
-            Deny::insufficient_scope(Some("camp:admin"), Option::<&str>::None);
+        let deny: Deny = Deny::insufficient_scope(Some("camp:admin"), Option::<&str>::None);
         assert_eq!(
             deny.json_body(),
             r#"{"error":"insufficient_scope","scope":"camp:admin"}"#
@@ -291,6 +333,26 @@ mod tests {
             assert_eq!(deny.error_code(), "invalid_token");
             assert!(deny.description.is_some());
         }
+    }
+
+    #[test]
+    fn token_binding_is_wire_indistinguishable_from_invalid_token() {
+        // W268 §token binding: a stolen-but-valid token presented from an
+        // unenrolled node must not be tellable apart from a garbage token.
+        let binding = Deny::token_binding();
+        assert_eq!(binding.kind, DenyKind::TokenBinding); // distinct in-process
+        assert_eq!(binding.status_code(), 401);
+        assert_eq!(binding.error_code(), "invalid_token");
+        assert_eq!(binding.json_body(), r#"{"error":"invalid_token"}"#);
+
+        // Same wire bytes as a generic invalid_token carrying the same generic
+        // description — no oracle in status, error code, body, or header.
+        let generic = Deny::invalid_token("invalid token");
+        assert_eq!(
+            binding.www_authenticate(METADATA_URL),
+            generic.www_authenticate(METADATA_URL)
+        );
+        assert_eq!(binding.json_body(), generic.json_body());
     }
 
     #[test]

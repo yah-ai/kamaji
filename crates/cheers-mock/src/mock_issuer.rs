@@ -540,4 +540,55 @@ mod tests {
             "ttl {ttl} outside W159 band"
         );
     }
+
+    // ── R592-F3 golden-token fixture shape ──────────────────────────────────
+    //
+    // Shared with cheers-server / cheers-verify / kamaji-bin / yubaba's
+    // minter. Committed under
+    // oss/cheers/crates/cheers-test-support/fixtures/ — see that crate's
+    // src/fixtures.rs for the pinned Ed25519 seed + regeneration test.
+    // Path-referenced via `include_str!` (cheers-mock lives in a separate
+    // Cargo workspace; no new dependency needed just to read one JSON file).
+    //
+    // MockIssuer always generates a FRESH random keypair per spawn (there's
+    // no way to inject the pinned fixture key without changing production
+    // code, which is out of scope here), so this can't assert byte-identical
+    // tokens against the committed `valid_user.token`. What it CAN — and
+    // does — assert is the thing R592-F3 actually asks of cheers-mock: that
+    // minting the EXACT golden claim values through cheers-mock's own
+    // envelope mechanism (flat top-level JSON + footer kid, low-level
+    // `PublicToken::sign`) round-trips those values losslessly, proving
+    // cheers-mock's wire shape matches the golden fixture's shape field for
+    // field, independent of which key signs it.
+    const GOLDEN_VALID_USER_CLAIMS_JSON: &str = include_str!(
+        "../../../../cheers/crates/cheers-test-support/fixtures/valid_user.claims.json"
+    );
+
+    #[tokio::test]
+    async fn minted_envelope_matches_golden_claim_shape() {
+        let issuer = MockIssuer::spawn(MockConfig::default()).await.unwrap();
+        let golden_claims: Value = serde_json::from_str(GOLDEN_VALID_USER_CLAIMS_JSON)
+            .expect("golden valid_user.claims.json parses");
+
+        let token = issuer.mint(&golden_claims).expect("mint succeeds");
+
+        let untrusted =
+            UntrustedToken::<pasetors::token::Public, V4>::try_from(token.as_str()).unwrap();
+        let pubkey_bytes = pubkey_array(&issuer.keypair);
+        let pubkey = AsymmetricPublicKey::<V4>::from(&pubkey_bytes).unwrap();
+        let trusted = PublicToken::verify(&pubkey, &untrusted, None, None).unwrap();
+        let round_tripped: Value = serde_json::from_str(trusted.payload()).unwrap();
+
+        // Losslessly round-tripped — same claim shape, field for field, as
+        // what the golden fixture pins (cheers-mock adds/drops nothing).
+        assert_eq!(round_tripped, golden_claims);
+
+        // And the envelope mechanism matches: kid rides in the footer, same
+        // as kamaji-bin's verifier / yubaba's minter expect.
+        let footer = untrusted.untrusted_footer();
+        let footer_str = std::str::from_utf8(footer).unwrap();
+        assert!(footer_str.contains(&format!(r#""kid":"{}""#, issuer.kid())));
+
+        issuer.shutdown().await;
+    }
 }

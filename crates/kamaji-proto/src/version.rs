@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 /// Wire protocol version. Bumped on any backward-incompatible change to the
 /// message enums.
 ///
-/// Both peers exchange [`crate::WardenToConstable::Hello`] /
-/// [`crate::ConstableToWarden::Welcome`] at connection start so a rolling
+/// Both peers exchange [`crate::YubabaToKamaji::Hello`] /
+/// [`crate::KamajiToYubaba::Welcome`] at connection start so a rolling
 /// cluster can decode multiple versions during upgrades — the receiver picks
 /// the highest version it supports that the sender also offers.
 ///

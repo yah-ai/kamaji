@@ -18,8 +18,8 @@ async fn boots_and_verifies_against_mock() {
 
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("jwks.json");
-    let config = AuthConfig::new(mock.issuer_url(), "https://kamaji.test")
-        .with_cache_path(cache.clone());
+    let config =
+        AuthConfig::new(mock.issuer_url(), "https://kamaji.test").with_cache_path(cache.clone());
 
     // First-start: cache is empty so boot makes the real HTTP fetch against
     // the mock's `/.well-known/jwks.json`. Failure here means the mock's
@@ -60,8 +60,7 @@ async fn boot_can_serve_from_cache_after_mock_dies() {
 
     let tmp = tempfile::tempdir().unwrap();
     let cache = tmp.path().join("jwks.json");
-    let config = AuthConfig::new(&issuer_url, "https://kamaji.test")
-        .with_cache_path(cache.clone());
+    let config = AuthConfig::new(&issuer_url, "https://kamaji.test").with_cache_path(cache.clone());
     let _v1 = AuthVerifier::boot(config).await.expect("first boot");
     assert!(cache.exists());
 
@@ -71,8 +70,7 @@ async fn boot_can_serve_from_cache_after_mock_dies() {
     drop(_v1);
     mock.shutdown().await;
 
-    let config = AuthConfig::new(&issuer_url, "https://kamaji.test")
-        .with_cache_path(cache.clone());
+    let config = AuthConfig::new(&issuer_url, "https://kamaji.test").with_cache_path(cache.clone());
     let v2 = AuthVerifier::boot(config)
         .await
         .expect("second boot must succeed from cache");

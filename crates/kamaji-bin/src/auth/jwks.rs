@@ -278,10 +278,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert!(matches!(
-            JwksCache::from_doc(doc),
-            Err(AuthError::Parse(_))
-        ));
+        assert!(matches!(JwksCache::from_doc(doc), Err(AuthError::Parse(_))));
     }
 
     #[test]

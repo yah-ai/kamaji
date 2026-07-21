@@ -38,6 +38,7 @@
 //! @yah:verify("cargo test -p kamaji --locked")
 //! @yah:verify("cargo check -p kamaji --locked --features containerd-integration")
 
+pub mod audit;
 pub mod auth;
 pub mod cgroup;
 #[cfg(feature = "containerd-integration")]
@@ -49,6 +50,10 @@ pub mod pidfd;
 pub mod probe;
 pub mod server;
 
+pub use audit::{
+    AuditRecord, CheersForwarder, DeniedSampler, ForwarderConfig, ForwarderHandle, JsonlWriter,
+    Outcome as AuditOutcome, SamplerConfig, WriterConfig,
+};
 pub use auth::{
     ActorClaim, AuthConfig, AuthError, AuthStrength, AuthVerifier, JwksCache, JwksDoc, McpClaims,
     OwnsClaim, VerifyError,
@@ -70,3 +75,7 @@ pub use server::{
     serve, serve_with_ctx, serve_with_shutdown, DrainableHandle, Registry, ServerCtx,
     CONSTABLE_VERSION,
 };
+
+/// Keep-alive native bundle backend (R599-F10). Only with `bundle-serving`.
+#[cfg(feature = "bundle-serving")]
+pub use server::{BundleBackend, DEFAULT_BUNDLE_PORT};

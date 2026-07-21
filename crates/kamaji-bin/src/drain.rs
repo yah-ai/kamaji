@@ -15,7 +15,7 @@
 //! handshake; the workload-side channel (signal-only floor here, structured
 //! stdio/HTTP under R406-T11) is layered above this enforcer.
 //!
-//! [`ProtocolVersion`]: constable_proto::ProtocolVersion
+//! [`ProtocolVersion`]: kamaji_proto::ProtocolVersion
 //!
 //! ## State machine
 //!
@@ -57,6 +57,26 @@
 //! reaps via `waitid(P_PIDFD, …)` itself, so a parallel reaper task would
 //! either race or hit `ECHILD`. The full lifecycle wiring lands in R406-T8;
 //! tests in this module take direct ownership of a freshly-opened pidfd.
+//!
+//! @yah:relay(R612, "kamaji-bin test hygiene: deflake drain SIGTERM-escalation timing tests")
+//! @yah:at(2026-07-20T03:52:37Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//!
+//! @yah:ticket(R612-B1, "Deflake sigterm_ignoring_workload_is_force_killed — SIGTERM-vs-budget race under host load")
+//! @yah:status(review)
+//! @yah:at(2026-07-20T04:14:22Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R612)
+//! @yah:severity(low)
+//! @yah:next("Tier: Thief — rote timing-tolerance fix in one test, no design work.")
+//! @yah:next("Widen the drain budget in the test (e.g. flush_ms=500/checkpoint_ms=500) so the SIGKILL-escalation window is deterministic under CI load, OR make enforce_drain's outcome classification robust to a workload that is reaped by SIGTERM after the flush deadline has passed (treat post-deadline Signaled(15) exits as ForceKilled-equivalent since the SIGKILL is what unblocked the wait). Prefer the latter if the race is in classify logic, not just the timeout constant.")
+//! @yah:next("Re-run 10x on a loaded Linux box (oss/kamaji: cargo test -p kamaji-bin --features containerd-integration drain::linux) to confirm 0 flakes before archiving.")
+//! @yah:gotcha("Linux-only test (drain.rs:390, mod linux gated on target_os=linux) — not reproducible on darwin dev hosts. Fails ~2/5 re-runs under heavy host load: got DrainOutcome::Flushed{Signaled(15)} instead of ForceKilled. Budget is flush_ms=100/checkpoint_ms=100 (200ms total); under load the SIGKILL-escalation race is lost and the shell is reaped by an earlier signal path inside the flush window.")
+//! @yah:handoff("Root cause was the trap-installation race, not a timeout constant or classify bug: `sh -c 'trap \"\" TERM; sleep 30'` has a window between exec(sh) and the `trap` builtin running where SIGTERM defaults to terminate. Under host load, slow shell startup widens that window, so drain's immediate SIGTERM kills the shell with Signaled(15) at ~0ms → classified Flushed. Neither next()-option applied: option 2 (post-deadline Signaled(15)→ForceKilled) was semantically wrong since the exit is pre-deadline and the workload genuinely responded.")
+//! @yah:handoff("Fix (drain.rs tests): replaced the shell workload with `/bin/sleep 30` spawned via a new `spawn_configured` helper that sets SIGTERM→SIG_IGN in a pre_exec hook. SIG_IGN survives execve(2) (unlike caught handlers), so sleep ignores SIGTERM from its first instruction — zero race. Budget elapses → SIGKILL (unignorable) → deterministic ForceKilled. Budget left at 100/100; assertions unchanged.")
+//! @yah:verify("cargo check --target aarch64-unknown-linux-musl -p kamaji-bin --tests — passes (done on darwin host).")
+//! @yah:verify("SIGN-OFF (needs Linux host — cannot run on darwin): cd oss/kamaji && for i in $(seq 10); do cargo test -p kamaji-bin drain::linux::tests::sigterm_ignoring_workload_is_force_killed -- --exact --nocapture; done — expect 0 flakes under host load.")
 
 use std::time::Duration;
 
@@ -124,7 +144,7 @@ pub enum DrainError {
 ///
 /// `_workload_id` is currently informational (used for tracing); it will
 /// become load-bearing once the server pushes structured
-/// [`constable_proto::ConstableToWarden::DrainCompleted`] events back to
+/// [`kamaji_proto::KamajiToYubaba::DrainCompleted`] events back to
 /// Yubaba (R406-T8).
 #[cfg(target_os = "linux")]
 pub async fn enforce_drain(
@@ -225,8 +245,8 @@ mod linux {
             "drain: SIGTERM sent",
         );
 
-        let async_fd = AsyncFd::with_interest(pidfd, Interest::READABLE)
-            .map_err(DrainError::AsyncRegister)?;
+        let async_fd =
+            AsyncFd::with_interest(pidfd, Interest::READABLE).map_err(DrainError::AsyncRegister)?;
 
         // Step 2: await child exit, bounded by the combined budget.
         let wait_window = budget_to_duration(budget);
@@ -266,8 +286,7 @@ mod linux {
                 // D-state-in-driver case — we still report ForceKilled either way.
                 let async_fd = AsyncFd::with_interest(pidfd, Interest::READABLE)
                     .map_err(DrainError::AsyncRegister)?;
-                let _ =
-                    tokio::time::timeout(SIGKILL_SAFETY_WINDOW, async_fd.readable()).await;
+                let _ = tokio::time::timeout(SIGKILL_SAFETY_WINDOW, async_fd.readable()).await;
 
                 // Best-effort reap. If waitid fails after SIGKILL the child is
                 // still gone from our supervision; we surface ForceKilled so
@@ -327,6 +346,7 @@ mod linux {
         //! and the off-Linux Unsupported stub.
 
         use std::os::fd::OwnedFd;
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
         use std::time::Duration;
 
@@ -336,11 +356,39 @@ mod linux {
         use crate::pidfd::pidfd_open;
 
         fn spawn_with_pidfd(prog: &str, args: &[&str]) -> (u32, OwnedFd) {
-            let child = Command::new(prog)
-                .args(args)
+            spawn_configured(prog, args, false)
+        }
+
+        /// Spawn a child and open a pidfd on it. When `ignore_sigterm` is set,
+        /// the child has `SIGTERM` reset to `SIG_IGN` in a `pre_exec` hook,
+        /// *before* `execve`. `SIG_IGN` dispositions survive `execve(2)` (only
+        /// caught handlers reset to default), so the exec'd program ignores
+        /// SIGTERM from its very first instruction — no trap-installation
+        /// window for the drain's immediate SIGTERM to slip through. That race
+        /// is exactly what made the shell-`trap`-based variant flake under host
+        /// load (R612-B1): a slow shell startup let the SIGTERM land before
+        /// `trap '' TERM` ran, killing the shell with `Signaled(15)` inside the
+        /// flush window and mis-reporting `Flushed`.
+        fn spawn_configured(prog: &str, args: &[&str], ignore_sigterm: bool) -> (u32, OwnedFd) {
+            let mut cmd = Command::new(prog);
+            cmd.args(args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::null());
+            if ignore_sigterm {
+                // SAFETY: `signal(2)` is async-signal-safe, which is the only
+                // constraint on a post-fork/pre-exec hook. We touch no other
+                // shared state.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            let child = cmd
                 .spawn()
                 .unwrap_or_else(|e| panic!("spawn {prog} failed: {e}"));
             let pid = child.id();
@@ -389,16 +437,15 @@ mod linux {
 
         #[tokio::test]
         async fn sigterm_ignoring_workload_is_force_killed() {
-            // A shell child that traps SIGTERM and then sleeps. Kamaji's
-            // budget elapses; SIGKILL escalation reaps it.
-            //
-            // Using `sh -c 'trap "" TERM; sleep 30'`. The trap with empty
-            // handler ignores SIGTERM in the shell; the `sleep 30` child is
-            // still SIGTERM-able but the shell parent re-execs sleep so the
-            // direct pidfd we have is the shell — which is the ignoring
-            // process. Good test shape.
-            let (_pid, pidfd) =
-                spawn_with_pidfd("/bin/sh", &["-c", "trap '' TERM; sleep 30"]);
+            // A workload that ignores SIGTERM from birth: `/bin/sleep 30`
+            // spawned with `SIGTERM` set to `SIG_IGN` in a pre-exec hook.
+            // Kamaji's budget elapses without effect; SIGKILL escalation reaps
+            // it. We spawn sleep directly (not `sh -c 'trap …'`) so there is no
+            // trap-installation window — the earlier shell variant flaked under
+            // host load when the drain's immediate SIGTERM raced ahead of the
+            // shell's `trap '' TERM`, killing the shell with Signaled(15)
+            // inside the flush window and reporting Flushed (R612-B1).
+            let (_pid, pidfd) = spawn_configured("/bin/sleep", &["30"], /* ignore_sigterm */ true);
             let budget = DrainBudget {
                 flush_ms: 100,
                 checkpoint_ms: 100,
@@ -535,5 +582,4 @@ mod tests {
             Duration::from_millis(u32::MAX as u64),
         );
     }
-
 }

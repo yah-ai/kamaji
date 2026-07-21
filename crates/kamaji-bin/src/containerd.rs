@@ -30,32 +30,31 @@
 //! - Container IDs derive from the [`WorkloadId`] passed in `Deploy` (stable
 //!   across Kamaji restarts so reconciliation can match).
 //! - Each call returns `Result<_, BackendError>`; the server layer maps
-//!   these to `ConstableToWarden::Error { code, message }` for the wire.
+//!   these to `KamajiToYubaba::Error { code, message }` for the wire.
 
 #![cfg(feature = "containerd-integration")]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use kamaji_proto::{WorkloadEntry, WorkloadId, WorkloadState};
 use containerd_client::{
     services::v1::{
-        container::Runtime as ContainerRuntime, containers_client::ContainersClient,
-        content_client::ContentClient, images_client::ImagesClient,
-        snapshots::{
-            snapshots_client::SnapshotsClient, MountsRequest, PrepareSnapshotRequest,
-            RemoveSnapshotRequest,
-        },
-        tasks_client::TasksClient, version_client::VersionClient, Container,
-        CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest, DeleteTaskRequest,
-        GetContainerRequest, GetImageRequest, KillRequest, ListContainersRequest,
-        ReadContentRequest, StartRequest,
+        container::Runtime as ContainerRuntime,
+        containers_client::ContainersClient,
+        snapshots::{snapshots_client::SnapshotsClient, RemoveSnapshotRequest},
+        tasks_client::TasksClient,
+        version_client::VersionClient,
+        Container, CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest,
+        DeleteTaskRequest, GetContainerRequest, KillRequest, ListContainersRequest, StartRequest,
     },
-    tonic::{self, transport::Channel, Request},
+    tonic::{transport::Channel, Request},
     with_namespace,
 };
+use kamaji_containerd_core as kcc;
+use kamaji_proto::{WorkloadEntry, WorkloadId, WorkloadState};
 use thiserror::Error;
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
@@ -63,26 +62,11 @@ use workload_spec::{EnvValue, WorkloadSpec};
 
 use crate::journal::{LogSink, Stream};
 
-/// Default containerd UDS — matches the production cloud-tier deploy. The
-/// kamaji.service systemd unit binds-mounts this path in the yubaba.slice.
-pub const DEFAULT_SOCKET: &str = "/run/containerd/containerd.sock";
-
-/// Single containerd namespace for every yah-managed container.
-///
-/// Containerd's per-namespace listing means another orchestrator (k3s, etc.)
-/// on the same host won't see our containers and vice versa. Stable so
-/// reconciliation across Kamaji restarts can re-discover surviving
-/// children.
-pub const YAH_NAMESPACE: &str = "yah";
-
-/// `/var/log/yah/<namespace>/<container-id>/{stdout,stderr}.fifo`.
-///
-/// Each workload gets a per-stream FIFO. Containerd's shim opens these for
-/// write as the container's stdout/stderr; Kamaji opens them for read
-/// (via [`tokio::net::unix::pipe::Receiver`]) and runs a
-/// [`crate::journal::forward_reader`] per stream to fan log lines into
-/// journald (R406-T10).
-pub const LOG_BASE: &str = "/var/log/yah";
+// Socket path / namespace / log-base constants, OCI-spec building,
+// image/rootfs resolution, and task-status querying are shared with the
+// inlined `kamaji` crate's containerd backend via `kamaji-containerd-core`
+// (R592-T1) — see that crate for the single definitions re-exported here.
+pub use kamaji_containerd_core::{DEFAULT_SOCKET, LOG_BASE, YAH_NAMESPACE};
 
 /// Errors surfaced by the backend. The server layer maps these to wire
 /// `ErrorCode` variants.
@@ -124,6 +108,12 @@ pub struct ContainerdBackend {
     /// so deploy and teardown can mutate from inside async fns without
     /// requiring `&mut self`.
     tracked: Arc<Mutex<HashMap<WorkloadId, WorkloadTracking>>>,
+    /// Socket custodian for passway workloads (R600-F9). kamaji binds+holds a
+    /// passway workload's listen socket at deploy and hands the fd to each
+    /// process generation, so a cert reload can hot-swap the passway process
+    /// without ever closing the listener — no dropped connections. Lives for
+    /// the daemon's lifetime, so the held fd survives passway restarts.
+    custodian: Arc<kamaji::socket_custody::SocketCustodian>,
 }
 
 impl ContainerdBackend {
@@ -135,16 +125,14 @@ impl ContainerdBackend {
     /// Connect to an explicit socket path. Use for Colima on dev hosts
     /// (`~/.colima/default/containerd.sock`).
     pub async fn connect_at(socket: impl AsRef<std::path::Path>) -> Result<Self> {
-        let path = socket.as_ref().to_path_buf();
-        let channel = containerd_client::connect(&path)
-            .await
-            .with_context(|| format!("connecting to containerd at {}", path.display()))?;
+        let channel = kcc::connect(socket).await?;
         Ok(Self {
             channel,
             namespace: YAH_NAMESPACE.to_string(),
             log_base: PathBuf::from(LOG_BASE),
             log_sink: Arc::new(NoopSink),
             tracked: Arc::new(Mutex::new(HashMap::new())),
+            custodian: Arc::new(kamaji::socket_custody::SocketCustodian::new()),
         })
     }
 
@@ -169,104 +157,27 @@ impl ContainerdBackend {
     }
 
     fn containers_client(&self) -> ContainersClient<Channel> {
-        ContainersClient::new(self.channel.clone())
+        kcc::containers_client(&self.channel)
     }
 
     fn tasks_client(&self) -> TasksClient<Channel> {
-        TasksClient::new(self.channel.clone())
-    }
-
-    fn images_client(&self) -> ImagesClient<Channel> {
-        ImagesClient::new(self.channel.clone())
+        kcc::tasks_client(&self.channel)
     }
 
     fn version_client(&self) -> VersionClient<Channel> {
-        VersionClient::new(self.channel.clone())
-    }
-
-    fn content_client(&self) -> ContentClient<Channel> {
-        ContentClient::new(self.channel.clone())
+        kcc::version_client(&self.channel)
     }
 
     fn snapshots_client(&self) -> SnapshotsClient<Channel> {
-        SnapshotsClient::new(self.channel.clone())
-    }
-
-    /// Read a content-store blob fully into memory by digest.
-    async fn read_blob(&self, digest: &str) -> Result<Vec<u8>> {
-        let req = ReadContentRequest {
-            digest: digest.to_string(),
-            offset: 0,
-            size: 0,
-        };
-        let req = with_namespace!(req, self.namespace);
-        let mut stream = self
-            .content_client()
-            .read(req)
-            .await
-            .with_context(|| format!("reading content blob {digest}"))?
-            .into_inner();
-        let mut buf = Vec::new();
-        while let Some(chunk) = stream.message().await? {
-            buf.extend_from_slice(&chunk.data);
-        }
-        Ok(buf)
-    }
-
-    /// Resolve an image's rootfs `diff_ids` by walking
-    /// (optional index →) manifest → config in the content store. Handles
-    /// both single-platform manifests and multi-platform indexes (picks the
-    /// linux/amd64 entry — the only platform we run on the cloud tier today).
-    async fn image_diff_ids(&self, target_digest: &str) -> Result<Vec<String>> {
-        let blob = self.read_blob(target_digest).await?;
-        let doc: serde_json::Value = serde_json::from_slice(&blob)
-            .with_context(|| format!("parsing image target {target_digest} as JSON"))?;
-
-        // Index / manifest-list → pick the linux/amd64 manifest, then recurse.
-        if let Some(manifests) = doc.get("manifests").and_then(|m| m.as_array()) {
-            let pick = manifests
-                .iter()
-                .find(|m| {
-                    let p = m.get("platform");
-                    let arch = p.and_then(|p| p.get("architecture")).and_then(|a| a.as_str());
-                    let os = p.and_then(|p| p.get("os")).and_then(|o| o.as_str());
-                    arch == Some("amd64") && os == Some("linux")
-                })
-                .or_else(|| manifests.first())
-                .and_then(|m| m.get("digest"))
-                .and_then(|d| d.as_str())
-                .ok_or_else(|| anyhow::anyhow!("image index {target_digest} has no usable manifest"))?;
-            return Box::pin(self.image_diff_ids(pick)).await;
-        }
-
-        // Manifest → config blob → rootfs.diff_ids.
-        let config_digest = doc
-            .get("config")
-            .and_then(|c| c.get("digest"))
-            .and_then(|d| d.as_str())
-            .ok_or_else(|| anyhow::anyhow!("image manifest {target_digest} has no config descriptor"))?;
-        let config_blob = self.read_blob(config_digest).await?;
-        let config: serde_json::Value = serde_json::from_slice(&config_blob)
-            .with_context(|| format!("parsing image config {config_digest}"))?;
-        let diff_ids = config
-            .get("rootfs")
-            .and_then(|r| r.get("diff_ids"))
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| anyhow::anyhow!("image config {config_digest} has no rootfs.diff_ids"))?
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect::<Vec<_>>();
-        if diff_ids.is_empty() {
-            anyhow::bail!("image config {config_digest} has empty rootfs.diff_ids");
-        }
-        Ok(diff_ids)
+        kcc::snapshots_client(&self.channel)
     }
 
     /// Prepare an active overlayfs snapshot for `container_id` rooted at the
     /// image's committed layer chain, returning the rootfs mounts to hand to
     /// `CreateTaskRequest`. Without this the task gets an empty rootfs and runc
-    /// fails to exec the entrypoint (R563 REMAINING 2 — parity with
-    /// kamaji-core::containerd::prepare_rootfs).
+    /// fails to exec the entrypoint. Delegates to `kamaji-containerd-core`
+    /// (R592-T1) — identical logic to the inlined `kamaji` crate's
+    /// containerd backend.
     ///
     /// Idempotent: a redeploy whose snapshot already exists falls back to
     /// `Mounts` (read the existing active snapshot's mounts) instead of erroring.
@@ -275,37 +186,13 @@ impl ContainerdBackend {
         container_id: &str,
         image_target_digest: &str,
     ) -> Result<Vec<containerd_client::types::Mount>> {
-        let diff_ids = self.image_diff_ids(image_target_digest).await?;
-        let parent = chain_id(&diff_ids);
-
-        let prepare = PrepareSnapshotRequest {
-            snapshotter: "overlayfs".to_string(),
-            key: container_id.to_string(),
-            parent,
-            labels: HashMap::new(),
-        };
-        let prepare = with_namespace!(prepare, self.namespace);
-        match self.snapshots_client().prepare(prepare).await {
-            Ok(resp) => Ok(resp.into_inner().mounts),
-            Err(status) if status.code() == tonic::Code::AlreadyExists => {
-                // Snapshot already active (idempotent redeploy) — read its mounts.
-                let req = MountsRequest {
-                    snapshotter: "overlayfs".to_string(),
-                    key: container_id.to_string(),
-                };
-                let req = with_namespace!(req, self.namespace);
-                let resp = self
-                    .snapshots_client()
-                    .mounts(req)
-                    .await
-                    .with_context(|| {
-                        format!("reading existing snapshot mounts for {container_id}")
-                    })?;
-                Ok(resp.into_inner().mounts)
-            }
-            Err(status) => Err(anyhow::anyhow!(status)
-                .context(format!("preparing rootfs snapshot for {container_id}"))),
-        }
+        kcc::prepare_rootfs(
+            &self.channel,
+            &self.namespace,
+            container_id,
+            image_target_digest,
+        )
+        .await
     }
 
     fn log_dir(&self, container_id: &str) -> PathBuf {
@@ -314,19 +201,42 @@ impl ContainerdBackend {
 
     /// Full image reference string used as the containerd image key.
     /// Digest is structurally required (R438-T3) and always pinned alongside
-    /// the human-readable tag.
+    /// the human-readable tag. Delegates to `kamaji-containerd-core`
+    /// (R592-T1).
     fn image_ref(spec: &WorkloadSpec) -> String {
-        let img = &spec.image;
-        format!("{}/{}:{}@{}", img.registry, img.repository, img.tag, img.digest)
+        kcc::image_ref(spec)
     }
 
     /// Deploy a workload. The `id` is what Kamaji's registry keys on and
-    /// what surfaces in `ConstableToWarden::WorkloadStarted` / lifecycle
+    /// what surfaces in `KamajiToYubaba::WorkloadStarted` / lifecycle
     /// events. Returns the OS pid containerd reports for the new task.
-    pub async fn deploy(
+    ///
+    /// A passway (custody) workload — one declaring `PASSWAY_UPGRADE_SOCK` —
+    /// is routed through [`deploy_custody`](Self::deploy_custody): kamaji binds
+    /// and holds its listen socket, so a later cert reload can hot-swap the
+    /// process with **zero dropped connections** (R600-F9). Ordinary workloads
+    /// take the plain path (no pod placement, no custody).
+    pub async fn deploy(&self, id: &WorkloadId, spec: &WorkloadSpec) -> Result<u32, BackendError> {
+        if kcc::upgrade_sock_dir(spec).is_some() {
+            return self.deploy_custody(id, spec).await;
+        }
+        self.deploy_generation(id, spec, &kcc::PodOptions::default(), &[])
+            .await
+    }
+
+    /// Create + start one containerd generation of `spec` under container id
+    /// `id.as_str()`, with pod placement `pod` and extra process env
+    /// `extra_env` (e.g. `PASSWAY_UPGRADE=true` for a custody passway). This is
+    /// the shared body behind [`deploy`](Self::deploy),
+    /// [`deploy_custody`](Self::deploy_custody), and
+    /// [`graceful_upgrade`](Self::graceful_upgrade); it tears down any prior
+    /// same-id generation first (idempotent redeploy).
+    async fn deploy_generation(
         &self,
         id: &WorkloadId,
         spec: &WorkloadSpec,
+        pod: &kcc::PodOptions,
+        extra_env: &[String],
     ) -> Result<u32, BackendError> {
         validate_spec_for_constable(spec)?;
         let container_id = id.as_str().to_string();
@@ -336,40 +246,26 @@ impl ContainerdBackend {
         // descriptor digest — we walk that (manifest → config → diff_ids) to
         // prepare the rootfs snapshot below. Callers (yubaba admission,
         // R040-F11's bootstrap) are expected to have pre-pulled the image via
-        // `ctr images pull` or the MachineProvider bootstrap path.
-        let image_target_digest = {
-            let mut imgs = self.images_client();
-            let req = GetImageRequest {
-                name: image_ref.clone(),
-            };
-            let req = with_namespace!(req, self.namespace);
-            let image = imgs
-                .get(req)
+        // `ctr images pull` or the MachineProvider bootstrap path. Delegates
+        // to `kamaji-containerd-core` (R592-T1) — identical logic to the
+        // inlined `kamaji` crate's containerd backend.
+        let image_target_digest =
+            kcc::resolve_image_target_digest(&self.channel, &self.namespace, &image_ref)
                 .await
-                .map_err(|e| {
-                    BackendError::Containerd(anyhow::anyhow!(
-                        "image not found in containerd: {image_ref} — pre-pull required ({e})"
-                    ))
-                })?
-                .into_inner()
-                .image
-                .ok_or_else(|| {
-                    BackendError::Containerd(anyhow::anyhow!(
-                        "containerd returned no image record for {image_ref}"
-                    ))
-                })?;
-            image
-                .target
-                .ok_or_else(|| {
-                    BackendError::Containerd(anyhow::anyhow!(
-                        "image {image_ref} has no target descriptor"
-                    ))
-                })?
-                .digest
-        };
+                .map_err(BackendError::Containerd)?;
 
-        // OCI spec — capabilities, mounts, namespaces, cgroup path.
-        let oci_spec = build_oci_spec(spec);
+        // Image OCI config (ENTRYPOINT/CMD/ENV/WORKDIR/USER) to merge into the
+        // process spec per docker/OCI convention (R590-B8). Best-effort: an
+        // image without a readable config just contributes nothing — the
+        // workload then runs with its spec-only argv/env, the prior behavior.
+        let image_config =
+            kcc::image_oci_config(&self.channel, &self.namespace, &image_target_digest)
+                .await
+                .ok();
+
+        // OCI spec — capabilities, mounts, namespaces, cgroup path, plus any
+        // custody pod placement (shared upgrade-sock bind mount) and extra env.
+        let oci_spec = kcc::build_oci_spec_with(spec, extra_env, image_config.as_ref(), pod);
         let spec_bytes = serde_json::to_vec(&oci_spec)
             .context("serializing OCI spec")
             .map_err(BackendError::Containerd)?;
@@ -390,10 +286,12 @@ impl ContainerdBackend {
         let stdout_fifo = log_dir.join("stdout.fifo");
         let stderr_fifo = log_dir.join("stderr.fifo");
 
-        // Idempotent redeploy: tear down any prior container with the same id
-        // before recreating. teardown is itself idempotent (missing -> Ok)
-        // and also unlinks any stale FIFOs / aborts prior forwarders.
-        let _ = self.teardown(id).await;
+        // Idempotent redeploy: reap any prior container with the same id
+        // before recreating. reap_container is idempotent (missing -> Ok) and
+        // unlinks stale FIFOs / aborts prior forwarders — and, unlike the public
+        // teardown, keeps any held custody socket so a custody redeploy /
+        // graceful recycle doesn't drop kamaji's listener (R600-F9).
+        let _ = self.reap_container(id).await;
 
         ensure_fifo(&stdout_fifo)
             .with_context(|| format!("mkfifo {}", stdout_fifo.display()))
@@ -404,6 +302,39 @@ impl ContainerdBackend {
 
         let stdout_path = stdout_fifo.to_string_lossy().into_owned();
         let stderr_path = stderr_fifo.to_string_lossy().into_owned();
+
+        // Spawn the journald forwarders BEFORE CreateTask: the shim opens
+        // the FIFOs' write ends *during task creation* with a plain O_WRONLY
+        // open, which blocks until a reader exists — with no forwarder yet,
+        // task creation deadlocks and containerd kills it at its deadline
+        // ("opening w/o fifo ... context deadline exceeded"; found live on
+        // us-east-001, first real-shim run of this path). The forwarders
+        // open their read end O_RDWR, so starting them early is safe: they
+        // simply idle until the shim connects. Tracking is inserted now so
+        // a failed create's redeploy tears the forwarders down via the
+        // idempotent teardown above.
+        let stdout_handle = spawn_forwarder(
+            self.log_sink.clone(),
+            id.clone(),
+            Stream::Stdout,
+            &stdout_fifo,
+        )?;
+        let stderr_handle = spawn_forwarder(
+            self.log_sink.clone(),
+            id.clone(),
+            Stream::Stderr,
+            &stderr_fifo,
+        )?;
+        {
+            let mut tracked = self.tracked.lock().expect("tracked mutex poisoned");
+            tracked.insert(
+                id.clone(),
+                WorkloadTracking {
+                    forwarders: vec![stdout_handle, stderr_handle],
+                    fifo_paths: vec![stdout_fifo.clone(), stderr_fifo.clone()],
+                },
+            );
+        }
 
         // Create the container record.
         {
@@ -434,7 +365,7 @@ impl ContainerdBackend {
 
         // Prepare the rootfs snapshot from the image's committed layer chain.
         // Without this the task gets an empty rootfs and runc can't exec the
-        // entrypoint (R563 REMAINING 2 — parity with kamaji-core).
+        // entrypoint (shared with the inlined shape via kamaji-containerd-core, R592-T1).
         let rootfs_mounts = self
             .prepare_rootfs(&container_id, &image_target_digest)
             .await
@@ -476,32 +407,9 @@ impl ContainerdBackend {
                 .map_err(BackendError::Containerd)?;
         }
 
-        // Spawn the journald forwarders. Open the read side AFTER StartRequest
-        // so containerd's shim has already opened the write end — the
-        // O_RDWR flag belt-and-braces this against an EPOLLHUP-on-no-writer
-        // glitch even if the open order races.
-        let stdout_handle = spawn_forwarder(
-            self.log_sink.clone(),
-            id.clone(),
-            Stream::Stdout,
-            &stdout_fifo,
-        )?;
-        let stderr_handle = spawn_forwarder(
-            self.log_sink.clone(),
-            id.clone(),
-            Stream::Stderr,
-            &stderr_fifo,
-        )?;
-        {
-            let mut tracked = self.tracked.lock().expect("tracked mutex poisoned");
-            tracked.insert(
-                id.clone(),
-                WorkloadTracking {
-                    forwarders: vec![stdout_handle, stderr_handle],
-                    fifo_paths: vec![stdout_fifo.clone(), stderr_fifo.clone()],
-                },
-            );
-        }
+        // (Journald forwarders were spawned before CreateTask above — the
+        // shim's write-only FIFO open during task creation needs a live
+        // reader or it deadlocks.)
 
         info!(
             container_id = %container_id,
@@ -512,13 +420,256 @@ impl ContainerdBackend {
         Ok(pid)
     }
 
+    /// Custody deploy of a passway workload (R600-F9). kamaji binds+holds the
+    /// listen socket, starts passway in **upgrade mode** (so it never binds the
+    /// address itself), and hands it the held fd. Because kamaji owns the
+    /// socket, a later [`graceful_upgrade`](Self::graceful_upgrade) can swap the
+    /// passway process without the listener ever closing.
+    ///
+    /// The sibling daemon has no `MeshAssignment`, so the custodial listener is
+    /// bound in the **host** netns — which is exactly right for the F5 passway
+    /// ingress (host-networked, the only in-tree custody consumer). A
+    /// non-host-networked passway is rejected: there is no netns to bind in here.
+    async fn deploy_custody(
+        &self,
+        id: &WorkloadId,
+        spec: &WorkloadSpec,
+    ) -> Result<u32, BackendError> {
+        if !spec.wants_host_network() {
+            return Err(BackendError::InvalidSpec(format!(
+                "passway custody workload {} is not host-networked; the sibling \
+                 daemon can only bind the custodial listener in the host netns \
+                 (isolated-netns custody is not wired here)",
+                id.as_str()
+            )));
+        }
+        let bind_addr = kcc::passway_listen_addr(spec);
+
+        // 1. kamaji binds the listen socket (host netns) and holds the fd.
+        self.custody_bind_and_hold(id.as_str(), &bind_addr).await?;
+
+        // 2. Start passway in upgrade mode with the shared upgrade-sock mount.
+        let pod = self.passway_pod_options(spec).await?;
+        let pid = match self
+            .deploy_generation(
+                id,
+                spec,
+                &pod,
+                &[format!("{}=true", kcc::PASSWAY_UPGRADE_ENV)],
+            )
+            .await
+        {
+            Ok(pid) => pid,
+            Err(e) => {
+                self.custodian.release(id.as_str());
+                return Err(e);
+            }
+        };
+
+        // 3. Hand the held listen fd to the waiting passway.
+        if let Err(e) = self.custody_hand_off(id, spec).await {
+            let _ = self.teardown(id).await;
+            self.custodian.release(id.as_str());
+            return Err(e);
+        }
+
+        info!(
+            container_id = %id.as_str(),
+            bind = %bind_addr,
+            "kamaji: custody deploy — passway adopted the kamaji-held listen socket"
+        );
+        Ok(pid)
+    }
+
+    /// Zero-downtime cert reload for a passway workload (R600-F9 / W273). kamaji
+    /// already holds the listening socket (bound at [`deploy_custody`]), so the
+    /// swap keeps the socket open the whole time — connections arriving during
+    /// the swap queue in the kernel accept backlog rather than being reset.
+    ///
+    /// Single-container-id rotation (kamaji is the sole fd sender):
+    /// 1. `SIGQUIT` the running passway — it drains in-flight connections and
+    ///    exits. The socket stays open (kamaji holds it).
+    /// 2. Reap the old generation, then start a fresh one under the **same** id
+    ///    in upgrade mode (picking up the re-rendered cert mount).
+    /// 3. `hand_off` the still-held listen fd to the new process; it adopts the
+    ///    socket and serves the queued + new connections.
+    ///
+    /// Unlike the inlined backend's coexisting two-generation handoff (which
+    /// additionally avoids the brief accept-latency blip), this favours the
+    /// simpler single-id model on the hardened daemon — correctness (no dropped
+    /// connections) comes from kamaji owning the socket, not from overlap.
+    /// Falls back to a connection-dropping redeploy for a non-passway workload
+    /// or when custody isn't held (e.g. after a daemon restart).
+    pub async fn graceful_upgrade(
+        &self,
+        id: &WorkloadId,
+        spec: &WorkloadSpec,
+    ) -> Result<u32, BackendError> {
+        if kcc::upgrade_sock_dir(spec).is_none() {
+            warn!(
+                container_id = %id.as_str(),
+                "graceful_upgrade: not a passway workload; connection-dropping redeploy"
+            );
+            return self.deploy(id, spec).await;
+        }
+        if !self.custodian.holds(id.as_str()) {
+            // No held socket (never custody-deployed, or the daemon restarted).
+            // A fresh custody deploy rebinds it — necessarily a redeploy.
+            info!(
+                container_id = %id.as_str(),
+                "graceful_upgrade: no held socket; custody-deploying fresh"
+            );
+            return self.deploy(id, spec).await;
+        }
+
+        // 1. Drain the running passway (SIGQUIT), give it its stop grace.
+        if let Err(e) = self.sigquit(id.as_str()).await {
+            warn!(
+                container_id = %id.as_str(),
+                error = %e,
+                "graceful_upgrade: SIGQUIT of outgoing passway failed; continuing to reap+respawn"
+            );
+        }
+        let grace = Duration::from_millis(spec.stop_policy.grace_period.0);
+        tokio::time::sleep(grace).await;
+
+        // 2. Reap the old generation and start a fresh one under the same id in
+        //    upgrade mode. deploy_generation tears the old container down first.
+        //    NB: this must NOT release custody — kamaji keeps the socket.
+        let pod = self.passway_pod_options(spec).await?;
+        let pid = self
+            .deploy_generation(
+                id,
+                spec,
+                &pod,
+                &[format!("{}=true", kcc::PASSWAY_UPGRADE_ENV)],
+            )
+            .await?;
+
+        // 3. Hand the still-held listen fd to the new passway.
+        self.custody_hand_off(id, spec).await?;
+
+        info!(
+            container_id = %id.as_str(),
+            pid = pid,
+            "kamaji: graceful cert-reload upgrade complete (zero dropped connections)"
+        );
+        Ok(pid)
+    }
+
+    /// Pod placement for a passway custody workload: the shared upgrade-sock
+    /// host directory bind-mounted at the socket's container-side parent, so
+    /// kamaji can `connect()` from the host mount namespace to hand off the fd.
+    /// Single-id rotation reaps the old generation before starting the new one,
+    /// so one directory per ident is race-free (slot `A`).
+    async fn passway_pod_options(&self, spec: &WorkloadSpec) -> Result<kcc::PodOptions, BackendError> {
+        let Some(sock_dir) = kcc::upgrade_sock_dir(spec) else {
+            return Ok(kcc::PodOptions::default());
+        };
+        let host_dir = kcc::shared_upgrade_hostdir(&spec.expose.mesh.identity.0, kcc::PodSlot::A);
+        tokio::fs::create_dir_all(&host_dir)
+            .await
+            .with_context(|| format!("creating shared upgrade dir {}", host_dir.display()))
+            .map_err(BackendError::Containerd)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                tokio::fs::set_permissions(&host_dir, std::fs::Permissions::from_mode(0o700)).await;
+        }
+        Ok(kcc::PodOptions {
+            // Host-networked ingress → host netns is the custodian; no join.
+            join_netns: None,
+            shared_dir: Some((host_dir.to_string_lossy().into_owned(), sock_dir)),
+        })
+    }
+
+    /// Bind the custodial listener for `ident` on `bind_addr` (host netns) and
+    /// hold it. The bind can block, so it runs on a blocking thread.
+    async fn custody_bind_and_hold(&self, ident: &str, bind_addr: &str) -> Result<(), BackendError> {
+        let cust = self.custodian.clone();
+        let ident = ident.to_string();
+        let bind = bind_addr.to_string();
+        let bind_for_ctx = bind.clone();
+        tokio::task::spawn_blocking(move || cust.bind_and_hold(&ident, &bind, None))
+            .await
+            .map_err(|e| BackendError::Containerd(anyhow::anyhow!("bind task join: {e}")))?
+            .with_context(|| format!("binding custodial listener {bind_for_ctx}"))
+            .map_err(BackendError::Containerd)?;
+        Ok(())
+    }
+
+    /// Hand kamaji's held listen fd for `id` to the passway waiting on its
+    /// upgrade sock (started in `PASSWAY_UPGRADE=true` mode). The connect-retry
+    /// + `sendmsg` can block, so it runs on a blocking thread.
+    async fn custody_hand_off(&self, id: &WorkloadId, spec: &WorkloadSpec) -> Result<(), BackendError> {
+        let host_sock = self.host_upgrade_sock(spec).ok_or_else(|| {
+            BackendError::InvalidSpec(format!(
+                "passway workload {} declares no upgrade sock",
+                id.as_str()
+            ))
+        })?;
+        let cust = self.custodian.clone();
+        let ident = spec.expose.mesh.identity.0.clone();
+        let ident_for_ctx = ident.clone();
+        tokio::task::spawn_blocking(move || cust.hand_off(&ident, &host_sock))
+            .await
+            .map_err(|e| BackendError::Containerd(anyhow::anyhow!("hand_off task join: {e}")))?
+            .with_context(|| format!("handing listen fd to workload {ident_for_ctx}"))
+            .map_err(BackendError::Containerd)?;
+        Ok(())
+    }
+
+    /// Host-side path of the upgrade socket passway binds (the shared dir joined
+    /// with the socket basename) — what kamaji `connect()`s to for the handoff.
+    fn host_upgrade_sock(&self, spec: &WorkloadSpec) -> Option<PathBuf> {
+        let base = kcc::upgrade_sock_basename(spec)?;
+        Some(kcc::shared_upgrade_hostdir(&spec.expose.mesh.identity.0, kcc::PodSlot::A).join(base))
+    }
+
+    /// Send `SIGQUIT` (pingora's graceful-drain signal) to a container's init
+    /// process. `all: false` targets PID 1 (the passway process) so it drains
+    /// rather than group-killing. kamaji is the sole sender of this signal.
+    async fn sigquit(&self, container_id: &str) -> Result<(), BackendError> {
+        let mut tasks = self.tasks_client();
+        let req = KillRequest {
+            container_id: container_id.to_string(),
+            exec_id: String::new(),
+            signal: 3, // SIGQUIT
+            all: false,
+        };
+        let req = with_namespace!(req, self.namespace);
+        tasks
+            .kill(req)
+            .await
+            .with_context(|| format!("SIGQUIT {container_id}"))
+            .map_err(BackendError::Containerd)?;
+        Ok(())
+    }
+
     /// Idempotent teardown — kill, delete task, delete container, and stop
     /// any per-workload journald forwarder tasks plus unlink their FIFOs
     /// (R406-T10). Missing containers and missing tasks both surface as
-    /// `Ok(())`. Tracking-side cleanup runs even when the container itself
-    /// is absent, so a redeploy that mkfifo's into a stale path on disk
-    /// doesn't EEXIST-fail.
+    /// `Ok(())`.
+    ///
+    /// Also releases any custodial listen socket held for this workload
+    /// (R600-F9) — a hard teardown means the workload is going away, so the
+    /// socket should close too. This is why deploy / graceful use the private
+    /// [`reap_container`](Self::reap_container) (which keeps custody) for their
+    /// internal same-id recycle, and only the public Stop path lands here.
     pub async fn teardown(&self, id: &WorkloadId) -> Result<(), BackendError> {
+        self.custodian.release(id.as_str());
+        self.reap_container(id).await
+    }
+
+    /// Reap the container/task/snapshot + journald forwarders for `id`, WITHOUT
+    /// touching custody. Used by the idempotent-redeploy path in
+    /// [`deploy_generation`](Self::deploy_generation) and the graceful
+    /// cert-reload recycle, both of which must keep kamaji's held listen socket
+    /// alive across the process swap. Tracking-side cleanup runs even when the
+    /// container itself is absent, so a redeploy that mkfifo's into a stale path
+    /// on disk doesn't EEXIST-fail.
+    async fn reap_container(&self, id: &WorkloadId) -> Result<(), BackendError> {
         let container_id = id.as_str().to_string();
 
         // Stop forwarders + unlink FIFOs first — this is idempotent and
@@ -613,7 +764,7 @@ impl ContainerdBackend {
 
     /// List every yah-managed container in containerd's `"yah"` namespace.
     /// Returns `WorkloadEntry` (the on-wire shape) so the server layer can
-    /// fold this list into `ConstableToWarden::WorkloadList` without an
+    /// fold this list into `KamajiToYubaba::WorkloadList` without an
     /// intermediate conversion.
     pub async fn list(&self) -> Result<Vec<WorkloadEntry>, BackendError> {
         let mut ctrs = self.containers_client();
@@ -635,11 +786,14 @@ impl ContainerdBackend {
             // Default to Starting until the task is created; map the task
             // status to a proto WorkloadState once it exists.
             let (state, pid) = match get_task_status(&mut tasks, &self.namespace, &c.id).await {
-                Ok(Some((code, pid))) => (map_task_state(code), Some(pid)),
+                Ok(Some((code, pid, exit_status))) => {
+                    (map_task_state(code, exit_status), Some(pid))
+                }
                 Ok(None) => (WorkloadState::Pending, None),
                 Err(_) => (WorkloadState::Failed, None),
             };
             entries.push(WorkloadEntry {
+                mesh_ident: c.labels.get("yah.mesh-ident").cloned(),
                 id: WorkloadId::new(c.id),
                 state,
                 pid,
@@ -729,9 +883,7 @@ fn spawn_forwarder(
         .map_err(BackendError::Containerd)?;
     let workload_label = workload.as_str().to_string();
     let join = tokio::spawn(async move {
-        if let Err(e) =
-            crate::journal::forward_reader(sink, workload, stream, recv).await
-        {
+        if let Err(e) = crate::journal::forward_reader(sink, workload, stream, recv).await {
             tracing::warn!(
                 workload = %workload_label,
                 stream = stream.label(),
@@ -765,18 +917,36 @@ fn labels_for(spec: &WorkloadSpec, id: &WorkloadId) -> HashMap<String, String> {
     labels.insert("yah.ident".to_string(), id.as_str().to_string());
     labels.insert("yah.name".to_string(), spec.name.clone());
     labels.insert("yah.tier".to_string(), spec.tier.0.clone());
+    // R590-B9: the mesh identity (`expose.mesh.identity`) is the handle
+    // Yubaba's `/workloads/{ident}/state` keys on, and it can differ from the
+    // container id (`id`) — a forge workload is `name = forge-<uuid>` (the
+    // DNS-safe container id) but `mesh.identity = forge.<uuid>`. Stamp it so
+    // `list()` can surface it on `WorkloadEntry.mesh_ident` and yubaba can
+    // match a polled ident against it. `id` stays the drain/stop key.
+    labels.insert(
+        "yah.mesh-ident".to_string(),
+        spec.expose.mesh.identity.0.clone(),
+    );
     labels
 }
 
-/// Translate a containerd task status code to a wire `WorkloadState`.
+/// Translate a containerd task status code (+ its exit status) to a wire
+/// `WorkloadState`.
 ///
 /// Containerd codes per the protobuf definition:
 ///   0 = Unknown, 1 = Created, 2 = Running, 3 = Stopped, 4 = Paused, 5 = Pausing
-fn map_task_state(code: i32) -> WorkloadState {
+///
+/// R590-B12: a STOPPED task covers BOTH a clean exit and a failed one —
+/// containerd's status code doesn't distinguish them. Split on the process
+/// `exit_status`: 0 → [`WorkloadState::Exited`], non-zero → [`WorkloadState::Failed`].
+/// Without this a failed remote build (non-zero exit) surfaced as `Exited`, so
+/// the qed CLI reported it green.
+fn map_task_state(code: i32, exit_status: u32) -> WorkloadState {
     match code {
         1 => WorkloadState::Pending,
         2 => WorkloadState::Running,
-        3 => WorkloadState::Exited,
+        3 if exit_status == 0 => WorkloadState::Exited,
+        3 => WorkloadState::Failed,
         4 | 5 => WorkloadState::Draining,
         _ => WorkloadState::Failed,
     }
@@ -784,29 +954,28 @@ fn map_task_state(code: i32) -> WorkloadState {
 
 /// One round-trip to fetch a container's task status. Returns `Ok(None)` if
 /// the container exists but has no task (e.g. created-but-not-started).
+/// Delegates to `kamaji-containerd-core` (R592-T1) — identical logic to the
+/// inlined `kamaji` crate's containerd backend (which discards the pid this
+/// shape needs for `WorkloadEntry.pid`).
+///
+/// This shape's pre-R592-T1 semantics folded both "no task" and the
+/// anomalous status-without-process reply into `None` (→ `Pending` at the
+/// call site); preserved here.
 async fn get_task_status(
     tasks: &mut TasksClient<Channel>,
     namespace: &str,
     container_id: &str,
-) -> anyhow::Result<Option<(i32, u32)>> {
-    use containerd_client::services::v1::GetRequest;
-    let req = GetRequest {
-        container_id: container_id.to_string(),
-        exec_id: String::new(),
-    };
-    let req = with_namespace!(req, namespace);
-    match tasks.get(req).await {
-        Ok(resp) => {
-            let inner = resp.into_inner();
-            let process = inner.process;
-            match process {
-                Some(p) => Ok(Some((p.status, p.pid))),
-                None => Ok(None),
-            }
-        }
-        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("task get failed: {e}")),
-    }
+) -> anyhow::Result<Option<(i32, u32, u32)>> {
+    Ok(
+        match kcc::get_task_status(tasks, namespace, container_id).await? {
+            kcc::TaskProbe::Status {
+                code,
+                pid,
+                exit_status,
+            } => Some((code, pid, exit_status)),
+            kcc::TaskProbe::NoTask | kcc::TaskProbe::MissingProcess => None,
+        },
+    )
 }
 
 /// Validate the spec before dispatching to containerd. Mirrors the parity
@@ -849,132 +1018,20 @@ fn validate_spec_for_constable(spec: &WorkloadSpec) -> Result<(), BackendError> 
     Ok(())
 }
 
-/// Build the OCI runtime spec. Centralises the WorkloadSpec → OCI mapping
-/// so both backends (this one, and the future docker-socket backend used in
-/// pond) apply the same enforcement — capabilities default-drop, no-new-
-/// privileges, cgroup path under `/yah/<name>`, tmpfs `/tmp` + `/dev`.
-/// Compute the OCI rootfs chainID from a layer set's `diff_ids`, matching
-/// containerd's `identity.ChainID`: fold sha256 over `"{prev} {next}"` of the
-/// full `sha256:...` digest strings. The committed snapshot of an unpacked
-/// image is keyed by this chainID — it's the `parent` for the active snapshot
-/// a task runs on (R563 REMAINING 2 — parity with kamaji-core::containerd).
-fn chain_id(diff_ids: &[String]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut iter = diff_ids.iter();
-    let mut chain = match iter.next() {
-        Some(first) => first.clone(),
-        None => return String::new(),
-    };
-    for next in iter {
-        let mut hasher = Sha256::new();
-        hasher.update(format!("{chain} {next}").as_bytes());
-        chain = format!("sha256:{:x}", hasher.finalize());
-    }
-    chain
-}
-
-fn build_oci_spec(spec: &WorkloadSpec) -> serde_json::Value {
-    let env: Vec<String> = spec
-        .env
-        .iter()
-        .filter_map(|e| match &e.value {
-            EnvValue::Literal { value } => Some(format!("{}={}", e.name, value)),
-            _ => None, // validate_spec_for_constable rejects these
-        })
-        .collect();
-
-    let process = serde_json::json!({
-        "terminal": false,
-        "user": { "uid": 0, "gid": 0 },
-        "args": spec.command.clone().unwrap_or_default(),
-        "env": env,
-        "cwd": spec.workdir.as_ref()
-            .and_then(|p| p.to_str())
-            .unwrap_or("/"),
-        // Default-deny capabilities — workloads that need elevated caps
-        // declare them in a future spec field. CAP_NET_BIND_SERVICE is kept
-        // so low-port HTTP listeners work without an explicit opt-in (the
-        // expectation in W154 §"Runtime parity contract").
-        "capabilities": {
-            "bounding":  ["CAP_NET_BIND_SERVICE"],
-            "effective": ["CAP_NET_BIND_SERVICE"],
-            "permitted": ["CAP_NET_BIND_SERVICE"],
-            "ambient":   [],
-        },
-        "rlimits": [{
-            "type": "RLIMIT_NOFILE",
-            "hard": 1024_u32,
-            "soft": 1024_u32,
-        }],
-        "noNewPrivileges": true,
-    });
-
-    // Namespaces: every workload is isolated by default. Host networking is a
-    // guarded opt-in (yah.network=host on tier=infra — enforced upstream in
-    // validate_spec_for_constable): we simply OMIT the network namespace so
-    // runc leaves the container in the host's netns. The container then binds
-    // host ports directly, which is how a single-tenant runner box lets an
-    // on-host Cloudflare tunnel reach 127.0.0.1:<port> without CNI/bridge
-    // plumbing. pid/ipc/uts/mount stay isolated regardless.
-    let mut namespaces = vec![serde_json::json!({ "type": "pid" })];
-    if !spec.wants_host_network() {
-        namespaces.push(serde_json::json!({ "type": "network" }));
-    }
-    namespaces.push(serde_json::json!({ "type": "ipc" }));
-    namespaces.push(serde_json::json!({ "type": "uts" }));
-    namespaces.push(serde_json::json!({ "type": "mount" }));
-
-    // /sys: a fresh `sysfs` mount requires owning the network namespace, which
-    // fails when the container shares the host netns (host networking). Match
-    // what runc does in that case — bind-mount the host /sys read-only instead.
-    // Isolated netns gets a fresh sysfs; host netns gets a recursive ro bind of
-    // /sys (R563 REMAINING 2 — parity with kamaji-core::containerd).
-    let sys_mount = if spec.wants_host_network() {
-        serde_json::json!({
-            "destination": "/sys", "type": "bind", "source": "/sys",
-            "options": ["rbind","nosuid","noexec","nodev","ro"]
-        })
-    } else {
-        serde_json::json!({
-            "destination": "/sys", "type": "sysfs", "source": "sysfs",
-            "options": ["nosuid","noexec","nodev","ro"]
-        })
-    };
-
-    serde_json::json!({
-        "ociVersion": "1.0.2",
-        "process": process,
-        "root": { "path": "rootfs", "readonly": false },
-        "hostname": &spec.name,
-        "mounts": [
-            { "destination": "/proc",  "type": "proc",   "source": "proc",   "options": [] },
-            { "destination": "/dev",   "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","strictatime","mode=755","size=65536k"] },
-            sys_mount,
-            { "destination": "/tmp",   "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev","mode=1777"] },
-        ],
-        "linux": {
-            "namespaces": namespaces,
-            "resources": {
-                "memory": { "limit": (spec.resources.memory_mb as i64) * 1024 * 1024 },
-                "cpu": { "shares": spec.resources.cpu_shares as u64 },
-            },
-            "cgroupsPath": format!("/yah/{}", spec.name),
-        },
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use workload_spec::{
-        EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, MeshLookup, Millis,
-        ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TierTag,
+        EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, MeshLookup, Millis, NamespaceId,
+        ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag,
     };
 
     fn make_spec(name: &str) -> WorkloadSpec {
         WorkloadSpec {
             schema_version: SchemaVersion::V1,
             name: name.into(),
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
             image: ImageRef {
                 registry: "ghcr.io".into(),
                 repository: "example/svc".into(),
@@ -996,13 +1053,14 @@ mod tests {
             secrets: vec![],
             volumes: vec![],
             resources: ResourceLimits {
-                cpu_shares: 1024,
+                cpu_millis: 1024,
                 memory_mb: 512,
                 ephemeral_storage_mb: 128,
             },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
+            archetype: None,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: Millis::from_secs(5),
@@ -1069,15 +1127,11 @@ mod tests {
         validate_spec_for_constable(&spec).unwrap();
     }
 
-    #[test]
-    fn oci_spec_drops_capabilities_to_net_bind_only() {
-        let spec = make_spec("svc");
-        let oci = build_oci_spec(&spec);
-        let caps = &oci["process"]["capabilities"];
-        assert_eq!(caps["bounding"], serde_json::json!(["CAP_NET_BIND_SERVICE"]));
-        assert_eq!(caps["ambient"], serde_json::json!([]));
-        assert_eq!(oci["process"]["noNewPrivileges"], serde_json::json!(true));
-    }
+    // The pure build_oci_spec-shape assertions (network isolation, /sys mount
+    // strategy, capability set) now live once in `kamaji-containerd-core`'s
+    // own test module (R592-T1) — this crate keeps only the assertions below
+    // that are specific to this shape's call site (no extra env; validation
+    // gating).
 
     /// Helper: set the host-network opt-in annotation.
     fn with_host_network(mut spec: WorkloadSpec) -> WorkloadSpec {
@@ -1086,75 +1140,6 @@ mod tests {
             workload_spec::HOST_NETWORK_VALUE.into(),
         );
         spec
-    }
-
-    fn netns_present(oci: &serde_json::Value) -> bool {
-        oci["linux"]["namespaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n["type"] == "network")
-    }
-
-    #[test]
-    fn oci_spec_isolates_network_by_default() {
-        let oci = build_oci_spec(&make_spec("svc"));
-        assert!(netns_present(&oci), "default workload must get an isolated netns");
-    }
-
-    #[test]
-    fn oci_spec_host_network_omits_netns() {
-        let oci = build_oci_spec(&with_host_network(make_spec("svc")));
-        assert!(
-            !netns_present(&oci),
-            "yah.network=host must omit the network namespace so the container shares the host netns"
-        );
-        // The other namespaces stay isolated — only networking is shared.
-        let types: Vec<&str> = oci["linux"]["namespaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n["type"].as_str().unwrap())
-            .collect();
-        for ns in ["pid", "ipc", "uts", "mount"] {
-            assert!(types.contains(&ns), "namespace {ns} must remain isolated");
-        }
-    }
-
-    /// Find the `/sys` entry in the OCI mounts list.
-    fn sys_mount(oci: &serde_json::Value) -> serde_json::Value {
-        oci["mounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["destination"] == "/sys")
-            .expect("/sys mount must be present")
-            .clone()
-    }
-
-    #[test]
-    fn oci_spec_default_sys_is_fresh_sysfs() {
-        // Isolated netns owns its own sysfs — a fresh `sysfs` mount works.
-        let sys = sys_mount(&build_oci_spec(&make_spec("svc")));
-        assert_eq!(sys["type"], "sysfs");
-        assert_eq!(sys["source"], "sysfs");
-    }
-
-    #[test]
-    fn oci_spec_host_network_binds_host_sys_ro() {
-        // Sharing the host netns means a fresh sysfs would fail (it needs to
-        // own the netns); runc bind-mounts the host /sys read-only instead.
-        let sys = sys_mount(&build_oci_spec(&with_host_network(make_spec("svc"))));
-        assert_eq!(sys["type"], "bind");
-        assert_eq!(sys["source"], "/sys");
-        let opts: Vec<&str> = sys["options"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|o| o.as_str().unwrap())
-            .collect();
-        assert!(opts.contains(&"rbind"), "host /sys bind must be recursive");
-        assert!(opts.contains(&"ro"), "host /sys bind must be read-only");
     }
 
     #[test]
@@ -1184,9 +1169,11 @@ mod tests {
                 kind: MeshLookup::Url,
             },
         });
-        // build_oci_spec is a pure mapper — it does NOT validate. It just
-        // filters non-literal env. validate_spec_for_constable runs first.
-        let oci = build_oci_spec(&spec);
+        // The OCI mapper is pure — it does NOT validate. It just filters
+        // non-literal env. validate_spec_for_constable runs first. (The local
+        // build_oci_spec wrapper was inlined to kcc::build_oci_spec_with when the
+        // custody path needed pod placement + extra env; R600-F9.)
+        let oci = kcc::build_oci_spec_with(&spec, &[], None, &kcc::PodOptions::default());
         let env = oci["process"]["env"].as_array().unwrap();
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].as_str().unwrap(), "FOO=bar");
@@ -1199,17 +1186,25 @@ mod tests {
         assert_eq!(labels.get("yah.ident").map(|s| s.as_str()), Some("svc"));
         assert_eq!(labels.get("yah.name").map(|s| s.as_str()), Some("svc"));
         assert_eq!(labels.get("yah.tier").map(|s| s.as_str()), Some("public"));
+        // R590-B9: the mesh identity is stamped for the state-poll read path.
+        assert_eq!(
+            labels.get("yah.mesh-ident").map(|s| s.as_str()),
+            Some("svc")
+        );
     }
 
     #[test]
     fn map_task_state_covers_known_codes() {
-        assert_eq!(map_task_state(1), WorkloadState::Pending);
-        assert_eq!(map_task_state(2), WorkloadState::Running);
-        assert_eq!(map_task_state(3), WorkloadState::Exited);
-        assert_eq!(map_task_state(4), WorkloadState::Draining);
-        assert_eq!(map_task_state(5), WorkloadState::Draining);
-        assert_eq!(map_task_state(0), WorkloadState::Failed);
-        assert_eq!(map_task_state(99), WorkloadState::Failed);
+        assert_eq!(map_task_state(1, 0), WorkloadState::Pending);
+        assert_eq!(map_task_state(2, 0), WorkloadState::Running);
+        // R590-B12: STOPPED splits on exit_status — clean vs failed.
+        assert_eq!(map_task_state(3, 0), WorkloadState::Exited);
+        assert_eq!(map_task_state(3, 1), WorkloadState::Failed);
+        assert_eq!(map_task_state(3, 137), WorkloadState::Failed);
+        assert_eq!(map_task_state(4, 0), WorkloadState::Draining);
+        assert_eq!(map_task_state(5, 0), WorkloadState::Draining);
+        assert_eq!(map_task_state(0, 0), WorkloadState::Failed);
+        assert_eq!(map_task_state(99, 0), WorkloadState::Failed);
     }
 
     // ── R406-T10: FIFO log fan-in ─────────────────────────────────────────────
@@ -1241,10 +1236,7 @@ mod tests {
         let path = tmp.path().join("not_a_fifo");
         std::fs::write(&path, b"hi").unwrap();
         let err = ensure_fifo(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("not a FIFO"),
-            "err: {err}"
-        );
+        assert!(err.to_string().contains("not a FIFO"), "err: {err}");
     }
 
     /// End-to-end forwarder path: open a FIFO, spawn the forwarder, simulate
@@ -1300,8 +1292,7 @@ mod tests {
         handle.abort();
 
         let entries = sink.entries();
-        let lines: Vec<&[u8]> =
-            entries.iter().map(|(_, _, l)| l.as_slice()).collect();
+        let lines: Vec<&[u8]> = entries.iter().map(|(_, _, l)| l.as_slice()).collect();
         assert!(lines.contains(&b"hello".as_slice()), "got: {lines:?}");
         assert!(lines.contains(&b"world".as_slice()), "got: {lines:?}");
         let (wid, stream, _) = &entries[0];
@@ -1353,4 +1344,3 @@ mod tests {
         );
     }
 }
-

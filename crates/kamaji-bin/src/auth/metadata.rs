@@ -63,10 +63,7 @@ impl ProtectedResourceMetadata {
     pub fn from_config(config: &AuthConfig) -> Self {
         Self {
             resource: config.expected_aud.trim_end_matches('/').to_string(),
-            authorization_servers: vec![config
-                .cheers_issuer
-                .trim_end_matches('/')
-                .to_string()],
+            authorization_servers: vec![config.cheers_issuer.trim_end_matches('/').to_string()],
             scopes_supported: SCOPE_VOCABULARY.iter().map(|s| s.to_string()).collect(),
             bearer_methods_supported: vec!["header".to_string()],
         }
@@ -157,7 +154,10 @@ mod tests {
             "\"scopes_supported\":",
             "\"bearer_methods_supported\":",
         ] {
-            assert!(json.contains(required), "missing field {required} in {json}");
+            assert!(
+                json.contains(required),
+                "missing field {required} in {json}"
+            );
         }
     }
 

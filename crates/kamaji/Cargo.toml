@@ -13,19 +13,40 @@ path = "src/lib.rs"
 [features]
 # Production containerd gRPC backend. Mirrors the yubaba feature of the same
 # name — when yubaba's `containerd-integration` is on, this one is forwarded.
-containerd-integration = ["dep:containerd-client", "dep:prost-types", "dep:sha2"]
+# Forwards onto kamaji-containerd-core's identically-named feature (R592-T1 —
+# shared OCI-spec-building / image-resolution / task-status core with
+# kamaji-bin, so the two deployment shapes cannot drift apart again).
+containerd-integration = [
+    "dep:containerd-client",
+    "dep:prost-types",
+    "dep:kamaji-containerd-core",
+    "kamaji-containerd-core/containerd-integration",
+    # kamaji is the socket-custodian for passway's zero-downtime cert reload
+    # (R600-F9): it binds+holds the listen fd and hands it to each passway
+    # generation, so the containerd backend needs the custody primitive.
+    "socket-custody",
+]
 
 # Docker-CLI backend for pond / OrbStack. No extra Rust deps (shells out).
 docker-integration = []
 
 # Native fork+exec backend (W199's "ideal native-backend case"; R490-F2's
 # supervision path for mesofact-dev). Host binaries only — no image pull.
-native-integration = ["dep:libc"]
+# Pulls in socket-custody: the native backend is the first consumer (R599-F6
+# JIT + R600 cert-rotation both drive the kamaji-held listen socket).
+native-integration = ["dep:libc", "socket-custody"]
+
+# Socket-custodian primitive (R599-F9): kamaji binds+holds a workload's listen
+# socket (optionally in a mesh netns) and hands the fd to the workload process
+# over its pingora upgrade socket via SCM_RIGHTS. Shared core under R599-F6
+# (JIT lazy-fork) and R600-F9 (cert-rotation zero-downtime). Linux-gated netns
+# entry; the fd-handoff wire path is POSIX (unit-testable off-Linux).
+socket-custody = ["dep:nix"]
 
 # In-memory FakeRuntime for unit testing. Excluded from release binaries.
 testing = []
 
-# Sibling-deployment client: postcard-over-UDS ConstableClient for callers
+# Sibling-deployment client: postcard-over-UDS KamajiClient for callers
 # that talk to a separate kamaji.service process (W199 §The move shape 2).
 # Inlined deployments don't need this; gating it keeps the dep-light shape of
 # the inlined-only desktop build.
@@ -41,24 +62,39 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "fs", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["io-util"] }
 tracing = "0.1"
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
-# sha256 for OCI layer chainID computation (snapshot prepare) — containerd-integration only.
-sha2 = { version = "0.10", optional = true }
+# Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
+# resolution, task-status querying. One home for both kamaji and kamaji-bin.
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.20", default-features = false }
 
 # SIGTERM for the native backend's graceful stop (optional — native-integration).
 libc = { version = "0.2", optional = true }
 
+# Socket-custodian fd-handoff + netns entry (optional — socket-custody feature).
+# Pinned to 0.29 (matches kamaji-bin) so the SCM_RIGHTS sendmsg mirrors the
+# exact shape pingora 0.8.1's transfer_fd uses — see socket_custody.rs.
+nix = { version = "0.29", optional = true, features = ["socket", "sched", "uio"] }
+
 # Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
-kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.16" }
+kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.20" }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "signal"] }
+# Receiver side of the zero-downtime E2E test mirrors pingora's Fds::get_from_sock.
+nix = { version = "0.29", features = ["socket", "uio"] }
 
 [[example]]
 name = "native_supervise"
 required-features = ["native-integration"]
+
+# Zero-downtime custody E2E (R599-F9 / R600-F9): a self-re-exec'ing driver that
+# spawns real "workload" receiver processes, so it owns its own main (no libtest
+# harness). Linux + socket-custody only; a no-op main elsewhere.
+[[test]]
+name = "socket_custody_zero_downtime_linux"
+harness = false
