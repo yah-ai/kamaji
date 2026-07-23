@@ -143,8 +143,9 @@ pub fn send_listener_fds(upgrade_sock: &Path, binds: &[(&str, RawFd)]) -> io::Re
         .join(" ");
     let raw_fds: Vec<RawFd> = binds.iter().map(|(_, fd)| *fd).collect();
 
-    let addr = UnixAddr::new(upgrade_sock)
-        .map_err(|e| io::Error::other(format!("upgrade sock addr {}: {e}", upgrade_sock.display())))?;
+    let addr = UnixAddr::new(upgrade_sock).map_err(|e| {
+        io::Error::other(format!("upgrade sock addr {}: {e}", upgrade_sock.display()))
+    })?;
 
     let sock = socket(
         AddressFamily::Unix,
@@ -256,11 +257,13 @@ impl SocketCustodian {
         };
 
         let mut held = self.held.lock().unwrap();
-        let entry = held.entry(ident.to_string()).or_insert_with(|| HeldSockets {
-            binds: Vec::new(),
-            #[cfg(target_os = "linux")]
-            _netns: None,
-        });
+        let entry = held
+            .entry(ident.to_string())
+            .or_insert_with(|| HeldSockets {
+                binds: Vec::new(),
+                #[cfg(target_os = "linux")]
+                _netns: None,
+            });
         if entry.binds.iter().any(|(b, _)| b == bind_addr) {
             return Err(io::Error::other(format!(
                 "socket custodian already holds {bind_addr} for workload {ident}"
@@ -287,7 +290,9 @@ impl SocketCustodian {
     pub fn hand_off(&self, ident: &str, upgrade_sock: &Path) -> io::Result<()> {
         let held = self.held.lock().unwrap();
         let entry = held.get(ident).ok_or_else(|| {
-            io::Error::other(format!("socket custodian holds nothing for workload {ident}"))
+            io::Error::other(format!(
+                "socket custodian holds nothing for workload {ident}"
+            ))
         })?;
         let binds: Vec<(&str, RawFd)> = entry
             .binds
@@ -309,6 +314,26 @@ impl SocketCustodian {
             .unwrap()
             .get(ident)
             .map(|h| h.binds.iter().map(|(b, _)| b.clone()).collect())
+    }
+
+    /// The raw listener fd(s) currently held for `ident`, in bind order, for the
+    /// JIT lifecycle (R599-F6): readiness-polling the socket (kamaji watches for
+    /// a pending connection without accepting) and socket-activation fd-passing
+    /// (kamaji dup2's the fd onto the forked child's fd 3). `None` if nothing is
+    /// held for `ident`.
+    ///
+    /// The custodian keeps ownership — it holds the [`OwnedFd`]s and keeps them
+    /// open until [`release`](Self::release) (or drop). The returned [`RawFd`]s
+    /// are therefore valid only while the workload remains held, and the caller
+    /// must **not** close them; borrowing them for `AsyncFd` readiness or a
+    /// `dup2` fd-handoff is exactly the intended use. Symmetric with
+    /// [`held_binds`](Self::held_binds), which returns the matching keys.
+    pub fn held_raw_fds(&self, ident: &str) -> Option<Vec<RawFd>> {
+        self.held
+            .lock()
+            .unwrap()
+            .get(ident)
+            .map(|h| h.binds.iter().map(|(_, fd)| fd.as_raw_fd()).collect())
     }
 }
 
@@ -379,14 +404,13 @@ mod tests {
         });
 
         // Kamaji sends the held fd over the upgrade sock.
-        send_listener_fds(
-            &sock_path,
-            &[(key.as_str(), listener_fd.as_raw_fd())],
-        )
-        .unwrap();
+        send_listener_fds(&sock_path, &[(key.as_str(), listener_fd.as_raw_fd())]).unwrap();
 
         let (got_keys, got_fds) = recv.join().unwrap();
-        assert_eq!(got_keys, key_expect, "bind-address key must survive verbatim");
+        assert_eq!(
+            got_keys, key_expect,
+            "bind-address key must survive verbatim"
+        );
         assert_eq!(got_fds.len(), 1, "exactly one fd transferred");
 
         // The received fd must be the SAME listening socket (same local port).

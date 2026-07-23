@@ -509,8 +509,8 @@ impl ContainerdRuntime {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&host_dir, std::fs::Permissions::from_mode(0o700))
-                .await;
+            let _ =
+                tokio::fs::set_permissions(&host_dir, std::fs::Permissions::from_mode(0o700)).await;
         }
         Ok(kcc::PodOptions {
             // Host-networked passway (the F5 ingress) uses the host netns as

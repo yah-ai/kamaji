@@ -33,22 +33,22 @@
 //!   `kill_on_drop` is intentionally off.
 //!
 //! @yah:ticket(R599-F6, "On-demand JIT lifecycle: kamaji holds the listen socket, forks on first connection (fd-passing), reaps after idle TTL")
+//! @yah:status(review)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
-//! @yah:at(2026-07-20T05:30:40Z)
+//! @yah:at(2026-07-22T00:21:00Z)
 //! @yah:phase(P2)
 //! @yah:parent(R599)
-//! @yah:next("REBASED 2026-07-16 (R600-S8 spike): the socket-custodian core — kamaji binds+holds the listen socket and passes the fd via SCM_RIGHTS — is now extracted to R599-F9 (bundle-independent, shared with R600-F9 cert-rotation). This ticket is now JUST the JIT lifecycle POLICY on top of that primitive: lazy fork-on-first-connection (socket-activation) + idle-TTL reap. depends_on R599-F9 (the custodian) AND R599-F4 (the mesofact workload variant carrying lifecycle=on-demand).")
-//! @yah:next("On top of R599-F9: kamaji holds the workload's listen fd permanently (so passway/upstream records never change); with ZERO live process, on a new connection fork the mesofact-serve runtime and hand it the fd (same SCM_RIGHTS handoff, or plain LISTEN_FDS since mesofact-serve is our binary); after idle_ttl with no connections, reap. Crash-during-idle costs nothing (W272 §3).")
 //! @yah:depends_on(R599-F4)
 //! @yah:depends_on(R599-F9)
-//! @yah:handoff("RUNTIME-CONTRACT HALF LANDED (in the R599-F3 crate, mesofact-dev; builds V8-free). mesofact-serve now (a) ADOPTS a handed-over listen socket via systemd LISTEN_FDS/LISTEN_PID (socket_activation_listener in serve.rs) — the fd kamaji's SocketCustodian binds+holds, so the socket + accept queue outlive each forked runtime; and (b) SELF-REAPS after --idle-ttl <secs> with zero in-flight requests (Server::serve_on_listener + IdleTracker middleware + idle_reaper in lib.rs), so kamaji stays out of the data path (no-impressive-mesh) and just re-forks on the next connection. Verified: lib tests serve_on_listener_adopts_the_given_socket + jit_idle_ttl_self_reaps_after_last_request (95 pass ssr / 49 no-ssr); a real binary run self-reaped at exactly idle_ttl with clean exit 0. mesofact-dev files carry prose 'Part of R599-F6' pointers only (mesofact is a subcamp — no 2nd @yah block); this native.rs block stays canonical.")
-//! @yah:handoff("REMAINING = the kamaji-side JIT POLICY (this ticket's native.rs anchor). Contract is now concrete: on deploy of a BundleLifecycle::OnDemand workload, custodian.bind_and_hold(ident, listen_addr, netns); spawn a task that watches the held OwnedFd for POLLIN via tokio AsyncFd::readable WITHOUT accepting; on a pending connection fork mesofact-serve passing the held fd as child fd 3 (CommandExt::pre_exec dup2→3 + clear CLOEXEC, env LISTEN_FDS=1 / LISTEN_PID=child) with --idle-ttl from OnDemand.idle_ttl; when the child self-exits on idle, DON'T release the socket — re-arm the readable-watch. Crash-during-idle costs nothing. Reaching this end-to-end also needs the F4-backend deploy path (deploy_mesofact_bundle, currently BackendRefused).")
-//! @yah:next("KAMAJI HALF (native.rs): implement poll-fork-rearm on the held custodian fd — socket_custody::SocketCustodian (bind_and_hold/held_binds) + tokio AsyncFd for readiness (poll, don't accept; the child accepts). Pass the held fd as child fd 3 via std::os::unix::process::CommandExt::pre_exec (dup2 to 3, clear FD_CLOEXEC) + LISTEN_FDS=1/LISTEN_PID env; re-arm the watch on child exit. E2E test: connect → child forks + serves → idle → child reaps → reconnect re-forks, zero dropped connections.")
-//! @yah:next("The mesofact-serve JIT runtime contract it drives (LISTEN_FDS adoption + --idle-ttl self-reap) is DONE and testable now — build on it; don't re-solve idle detection kamaji-side (the runtime owns it, deliberately).")
-//! @yah:handoff("RUNTIME-CONTRACT HALF LANDED (in the R599-F3 crate, mesofact-dev; builds V8-free). mesofact-serve now (a) ADOPTS a handed-over listen socket via systemd LISTEN_FDS/LISTEN_PID (socket_activation_listener in serve.rs) — the fd kamaji's SocketCustodian binds+holds, so the socket + accept queue outlive each forked runtime; and (b) SELF-REAPS after --idle-ttl <secs> with zero in-flight requests (Server::serve_on_listener + IdleTracker middleware + idle_reaper in lib.rs), so kamaji stays out of the data path (no-impressive-mesh) and just re-forks on the next connection. Verified: lib tests serve_on_listener_adopts_the_given_socket + jit_idle_ttl_self_reaps_after_last_request (95 pass ssr / 49 no-ssr); a real binary run self-reaped at exactly idle_ttl with clean exit 0. mesofact-dev files carry prose 'Part of R599-F6' pointers only (mesofact is a subcamp — no 2nd @yah block); this native.rs block stays canonical.")
-//! @yah:handoff("REMAINING = the kamaji-side JIT POLICY (this ticket's native.rs anchor). Contract is now concrete: on deploy of a BundleLifecycle::OnDemand workload, custodian.bind_and_hold(ident, listen_addr, netns); spawn a task that watches the held OwnedFd for POLLIN via tokio AsyncFd::readable WITHOUT accepting; on a pending connection fork mesofact-serve passing the held fd as child fd 3 (CommandExt::pre_exec dup2→3 + clear CLOEXEC, env LISTEN_FDS=1 / LISTEN_PID=child) with --idle-ttl from OnDemand.idle_ttl; when the child self-exits on idle, DON'T release the socket — re-arm the readable-watch. Crash-during-idle costs nothing. Reaching this end-to-end also needs the F4-backend deploy path (deploy_mesofact_bundle, currently BackendRefused).")
-//! @yah:next("KAMAJI HALF (native.rs): implement poll-fork-rearm on the held custodian fd — socket_custody::SocketCustodian (bind_and_hold/held_binds) + tokio AsyncFd for readiness (poll, don't accept; the child accepts). Pass the held fd as child fd 3 via std::os::unix::process::CommandExt::pre_exec (dup2 to 3, clear FD_CLOEXEC) + LISTEN_FDS=1/LISTEN_PID env; re-arm the watch on child exit. E2E test: connect → child forks + serves → idle → child reaps → reconnect re-forks, zero dropped connections.")
-//! @yah:next("The mesofact-serve JIT runtime contract it drives (LISTEN_FDS adoption + --idle-ttl self-reap) is DONE and testable now — build on it; don't re-solve idle detection kamaji-side (the runtime owns it, deliberately).")
+//! @yah:handoff("DONE + verified (both halves). JIT on-demand lifecycle landed; the implementation lives in oss/kamaji/crates/kamaji/src/jit.rs (this native.rs block stays the canonical anchor per one-block-per-ID; jit.rs + kamaji-bin server.rs carry prose 'Part of R599-F6' pointers only, no 2nd @yah block).")
+//! @yah:handoff("kamaji crate: new jit::JitRuntime = poll-fork-rearm on the custodian-held listener. bind_and_hold via SocketCustodian; watch the held fd for readiness via tokio AsyncFd WITHOUT accepting (kamaji stays out of the data path); on a pending connection fork the serve runtime passing the held fd as child fd 3 (pre_exec dup2->3 + clear FD_CLOEXEC, env LISTEN_FDS=1); re-arm on child exit and NEVER release the socket, so connections queued across a reap/re-fork are served by the next child (zero-dropped). Added SocketCustodian::held_raw_fds accessor (socket_custody.rs).")
+//! @yah:handoff("kamaji-bin server.rs: deploy_mesofact_bundle now routes by lifecycle -- KeepAlive->native (R599-F10), OnDemand->new deploy_bundle_on_demand->JitRuntime. Shared materialize+serve-bin-resolution extracted to materialize_and_resolve_serve. --idle-ttl baked into the JIT spec; RestartPolicy::Never (the JIT supervisor owns re-forking; an idle self-reap is not a crash). NO probe target registered for on-demand (a 1s TcpConnect probe would connect+fork every interval, defeating the idle reap). BundleBackend gained `jit`; List merges both runtimes, Stop routes teardown to both (both idempotent).")
+//! @yah:handoff("GOTCHA: LISTEN_PID is deliberately UNSET. mesofact-serve's socket_activation_listener adopts fd 3 whenever LISTEN_PID is absent; setting it to the child's own pid would require an async-signal-unsafe setenv inside the post-fork pre_exec hook (the pid isn't known before fork). Inherits R599-F10's loopback-port + one-bundle-per-node limit (mesh-IP-plane binding needs Deploy to carry a MeshAssignment -- shared follow-up, not F6-specific).")
+//! @yah:next("FOLLOW-UP (shared with R599-F10, not F6-specific): loopback-port + one-bundle-per-node limit. On-demand binds 127.0.0.1:<bind_port> just like keep-alive; mesh-IP-plane binding + multiple bundles per node needs the UDS Deploy envelope to carry a MeshAssignment (bind IP + per-workload port). File if/when a node must host >1 bundle.")
+//! @yah:next("COVERAGE NOTE: the full fork->serve->reap->re-fork mechanics are proven by the kamaji-crate E2E (tests/jit_lazy_fork.rs) with a real socket-activating child; the kamaji-bin bundle-serving test covers deploy/list(idle)/stop only, because a shell serve stand-in can't adopt fd 3 as a TCP listener. A bin-path fork E2E would need a real socket-activating serve bin (mesofact-serve, separate subcamp).")
+//! @yah:verify("cargo test -p kamaji --features native-integration (27 lib + tests/jit_lazy_fork E2E: idle->connect->fork->serve->idle->reap->reconnect->re-fork, 0 dropped connections; non-flaky over repeated runs)")
+//! @yah:verify("cargo test -p kamaji-bin --features bundle-serving (196 pass, incl server::tests::bundle_serving::ondemand_deploy_binds_and_appears_in_list_idle); default build unchanged (193 pass)")
+//! @yah:verify("cargo clippy -p kamaji --features native-integration --tests + -p kamaji-bin --features bundle-serving: clean (only pre-existing warnings in object-store/pidfd)")
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -148,8 +148,9 @@ impl NativeRuntime {
     }
 }
 
-/// Resolve the argv from entrypoint + command (container semantics).
-fn argv(spec: &WorkloadSpec) -> Result<Vec<String>> {
+/// Resolve the argv from entrypoint + command (container semantics). Shared with
+/// the JIT lifecycle ([`crate::jit`]), which forks the same serve binaries.
+pub(crate) fn argv(spec: &WorkloadSpec) -> Result<Vec<String>> {
     let mut argv: Vec<String> = Vec::new();
     if let Some(entry) = &spec.entrypoint {
         argv.extend(entry.iter().cloned());
@@ -749,10 +750,15 @@ impl Kamaji for NativeRuntime {
         // 1. Start the replacement in upgrade mode. It connects to the shared
         //    upgrade socket and receives the old process's listening fds instead
         //    of binding fresh.
-        let mut replacement =
-            spawn_child(&self.state_dir, spec, mesh.mesh_ip, &[("PASSWAY_UPGRADE", "true")], false)
-                .await
-                .context("spawning graceful-upgrade replacement")?;
+        let mut replacement = spawn_child(
+            &self.state_dir,
+            spec,
+            mesh.mesh_ip,
+            &[("PASSWAY_UPGRADE", "true")],
+            false,
+        )
+        .await
+        .context("spawning graceful-upgrade replacement")?;
         let new_pid = replacement.pid;
 
         // 2. Let the replacement settle (connect + take over listeners). If it
@@ -981,7 +987,10 @@ mod tests {
                 break;
             }
         }
-        assert!(failed, "OnFailure should give up as Failed after max_attempts");
+        assert!(
+            failed,
+            "OnFailure should give up as Failed after max_attempts"
+        );
 
         runtime.teardown_workload(&ident).await.unwrap();
     }
@@ -1055,7 +1064,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(gone, "old process (pid {old_pid}) should be gone after SIGQUIT");
+        assert!(
+            gone,
+            "old process (pid {old_pid}) should be gone after SIGQUIT"
+        );
 
         runtime
             .teardown_workload(&spec.expose.mesh.identity)
@@ -1067,7 +1079,10 @@ mod tests {
     async fn graceful_upgrade_with_no_running_instance_is_a_deploy() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = NativeRuntime::new(tmp.path());
-        let spec = native_spec("native-upgrade-fresh", vec!["/bin/sleep".into(), "30".into()]);
+        let spec = native_spec(
+            "native-upgrade-fresh",
+            vec!["/bin/sleep".into(), "30".into()],
+        );
         let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
 
         // No prior instance — a graceful upgrade degenerates to a deploy.

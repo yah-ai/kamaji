@@ -73,6 +73,14 @@ pub mod docker;
 #[cfg(feature = "native-integration")]
 pub mod native;
 
+/// On-demand ("serverless") JIT lifecycle (R599-F6): kamaji holds a workload's
+/// listen socket via the [`socket_custody`] custodian, forks the serve runtime
+/// on the first connection (systemd-style socket activation), and reaps it after
+/// an idle TTL. Built on the native fork+exec machinery, so gated on the same
+/// `native-integration` feature (which pulls in `socket-custody`).
+#[cfg(feature = "native-integration")]
+pub mod jit;
+
 /// Socket-custodian primitive (R599-F9): kamaji binds+holds a workload's listen
 /// socket and hands the fd to the workload process over its pingora upgrade
 /// socket. Shared core under R599-F6 (JIT) and R600-F9 (cert-rotation).

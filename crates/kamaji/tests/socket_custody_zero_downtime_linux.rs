@@ -23,7 +23,9 @@ fn main() {
 
 #[cfg(not(all(target_os = "linux", feature = "socket-custody")))]
 fn main() {
-    eprintln!("SKIP: socket_custody_zero_downtime_linux runs on Linux with --features socket-custody");
+    eprintln!(
+        "SKIP: socket_custody_zero_downtime_linux runs on Linux with --features socket-custody"
+    );
 }
 
 #[cfg(all(target_os = "linux", feature = "socket-custody"))]
@@ -86,8 +88,13 @@ mod imp {
         let mut payload = [0u8; 2048];
         let mut iov = [std::io::IoSliceMut::new(&mut payload)];
         let mut cmsg = nix::cmsg_space!([RawFd; 8]);
-        let msg = recvmsg::<UnixAddr>(stream.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::empty())
-            .expect("recvmsg");
+        let msg = recvmsg::<UnixAddr>(
+            stream.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg),
+            MsgFlags::empty(),
+        )
+        .expect("recvmsg");
         let mut fds = Vec::new();
         for c in msg.cmsgs().expect("cmsgs") {
             if let ControlMessageOwned::ScmRights(v) = c {
@@ -113,7 +120,8 @@ mod imp {
         // Workload A takes over the socket.
         let sock_a = dir.path().join("upgrade-a.sock");
         let mut a = spawn_receiver(&self_exe, &sock_a, "A");
-        cust.hand_off("svc", &sock_a).expect("hand fd to workload A");
+        cust.hand_off("svc", &sock_a)
+            .expect("hand fd to workload A");
         wait_until_served(b'A', Duration::from_secs(5));
 
         // Start a relentless client: every connect must succeed (the socket is
@@ -145,13 +153,22 @@ mod imp {
         };
 
         // Confirm A is actively serving the live traffic.
-        wait_for_flag(&saw_a, Duration::from_secs(5), "workload A never served live traffic");
+        wait_for_flag(
+            &saw_a,
+            Duration::from_secs(5),
+            "workload A never served live traffic",
+        );
 
         // ── The swap ── Workload B adopts the SAME fd; then A is killed.
         let sock_b = dir.path().join("upgrade-b.sock");
         let mut b = spawn_receiver(&self_exe, &sock_b, "B");
-        cust.hand_off("svc", &sock_b).expect("hand fd to workload B");
-        wait_for_flag(&saw_b, Duration::from_secs(5), "workload B never adopted the socket");
+        cust.hand_off("svc", &sock_b)
+            .expect("hand fd to workload B");
+        wait_for_flag(
+            &saw_b,
+            Duration::from_secs(5),
+            "workload B never adopted the socket",
+        );
 
         // Kill the original workload — the socket must stay up (kamaji holds it).
         let _ = a.kill();
@@ -181,7 +198,10 @@ mod imp {
             post_kill_failures_after, post_kill_failures_before,
             "connect failures appeared AFTER killing workload A — socket did not survive the swap"
         );
-        assert!(saw_a.load(Ordering::Relaxed), "workload A never served (setup failure)");
+        assert!(
+            saw_a.load(Ordering::Relaxed),
+            "workload A never served (setup failure)"
+        );
         assert!(
             saw_b.load(Ordering::Relaxed),
             "workload B never served — the fd handoff to the replacement failed"
@@ -190,7 +210,11 @@ mod imp {
         eprintln!("zero-downtime custody verified: swap A→B with 0 dropped connections");
     }
 
-    fn spawn_receiver(exe: &std::path::Path, sock: &std::path::Path, marker: &str) -> std::process::Child {
+    fn spawn_receiver(
+        exe: &std::path::Path,
+        sock: &std::path::Path,
+        marker: &str,
+    ) -> std::process::Child {
         std::process::Command::new(exe)
             .env("CUSTODY_ROLE", "receiver")
             .env("CUSTODY_UPGRADE_SOCK", sock)
@@ -221,7 +245,10 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        panic!("no workload served marker {:?} within {:?}", want as char, timeout);
+        panic!(
+            "no workload served marker {:?} within {:?}",
+            want as char, timeout
+        );
     }
 
     fn wait_for_flag(flag: &Arc<AtomicBool>, timeout: Duration, msg: &str) {

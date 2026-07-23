@@ -23,7 +23,7 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SOCKET: &str = "/run/kamaji/kamaji.sock";
-const ABOUT: &str = "kamaji — Yubaba's sibling process supervisor.\n\nReads workload-control messages from Yubaba over a unix domain socket and dispatches them to the containerd backend (R406-T9), the native fork+exec path (R406-T5/T6), or the keep-alive mesofact bundle backend (R599-F10). Run with --containerd-socket to enable container workloads, and --bundle-cache-dir + --bundle-bucket to serve published W272 mesofact bundles.";
+const ABOUT: &str = "kamaji — Yubaba's sibling process supervisor.\n\nReads workload-control messages from Yubaba over a unix domain socket and dispatches them to the containerd backend (R406-T9), the docker/OrbStack backend (R626-F1), the native fork+exec path (R406-T5/T6), or the keep-alive mesofact bundle backend (R599-F10). Run with --containerd-socket (cloud tier) or --docker (pond / dev host) to enable container workloads, and --bundle-cache-dir + --bundle-origin to serve published W272 mesofact bundles.";
 
 struct Args {
     socket: PathBuf,
@@ -33,13 +33,18 @@ struct Args {
     /// the native supervisor's per-workload log captures in `<root>/state/`.
     bundle_cache_dir: Option<PathBuf>,
     /// R2 bucket holding the published bundle store (blobs + manifests).
-    bundle_bucket: Option<String>,
+    bundle_origin: Option<String>,
     /// Loopback port served bundles bind. Falls back to `$KAMAJI_BUNDLE_PORT`,
     /// then the compiled-in default. Only consumed by the bundle backend; the
     /// no-feature build still *parses* it (so `--bundle-port` isn't an "unknown
     /// argument") but has nothing to apply it to.
     #[cfg_attr(not(feature = "bundle-serving"), allow(dead_code))]
     bundle_port: Option<u16>,
+    /// Attach the docker/OrbStack backend for `Deploy { Container }` (R626-F1).
+    /// `Some("")` means "use the ambient `DOCKER_HOST`" (bare `--docker`);
+    /// `Some(host)` pins an explicit daemon. `None` leaves docker unattached.
+    #[cfg_attr(not(feature = "docker-integration"), allow(dead_code))]
+    docker_host: Option<String>,
 }
 
 fn parse_args() -> std::result::Result<Args, ParseError> {
@@ -54,12 +59,23 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
     // the account id from $CF_ACCOUNT_ID, matching every other R2 call site.
     let mut bundle_cache_dir: Option<PathBuf> =
         std::env::var_os("KAMAJI_BUNDLE_CACHE_DIR").map(PathBuf::from);
-    let mut bundle_bucket: Option<String> = std::env::var("KAMAJI_BUNDLE_BUCKET").ok();
+    let mut bundle_origin: Option<String> = std::env::var("KAMAJI_BUNDLE_ORIGIN").ok();
     let mut bundle_port: Option<u16> = match std::env::var("KAMAJI_BUNDLE_PORT") {
         Ok(v) => Some(
             v.parse()
                 .map_err(|_| ParseError::BadValue("KAMAJI_BUNDLE_PORT"))?,
         ),
+        Err(_) => None,
+    };
+
+    // R626-F1: docker backend opt-in. `KAMAJI_DOCKER=1` attaches with the
+    // ambient DOCKER_HOST; `KAMAJI_DOCKER=<host>` pins a daemon. Deliberately
+    // NOT keyed off a bare `$DOCKER_HOST` — nearly every dev host sets that,
+    // and a supervisor must not adopt a daemon nobody asked it to supervise.
+    let mut docker_host: Option<String> = match std::env::var("KAMAJI_DOCKER") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => None,
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some(String::new()),
+        Ok(v) => Some(v),
         Err(_) => None,
     };
 
@@ -86,10 +102,10 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--bundle-cache-dir"))?,
                 );
             }
-            "--bundle-bucket" => {
-                bundle_bucket = Some(
+            "--bundle-origin" => {
+                bundle_origin = Some(
                     iter.next()
-                        .ok_or(ParseError::MissingValue("--bundle-bucket"))?,
+                        .ok_or(ParseError::MissingValue("--bundle-origin"))?,
                 );
             }
             "--bundle-port" => {
@@ -98,6 +114,14 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--bundle-port"))?
                         .parse()
                         .map_err(|_| ParseError::BadValue("--bundle-port"))?,
+                );
+            }
+            // Bare `--docker` inherits DOCKER_HOST; `--docker-host URL` pins one.
+            "--docker" => docker_host = Some(String::new()),
+            "--docker-host" => {
+                docker_host = Some(
+                    iter.next()
+                        .ok_or(ParseError::MissingValue("--docker-host"))?,
                 );
             }
             "--help" | "-h" => return Err(ParseError::HelpRequested),
@@ -109,8 +133,9 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         socket,
         containerd_socket,
         bundle_cache_dir,
-        bundle_bucket,
+        bundle_origin,
         bundle_port,
+        docker_host,
     })
 }
 
@@ -126,8 +151,8 @@ fn print_help() {
     println!("{ABOUT}");
     println!();
     println!(
-        "Usage: kamaji [--socket PATH] [--containerd-socket PATH]\n              \
-         [--bundle-cache-dir PATH] [--bundle-bucket NAME] [--bundle-port PORT]"
+        "Usage: kamaji [--socket PATH] [--containerd-socket PATH] [--docker | --docker-host URL]\n              \
+         [--bundle-cache-dir PATH] [--bundle-origin URL] [--bundle-port PORT]"
     );
     println!();
     println!("Options:");
@@ -136,12 +161,19 @@ fn print_help() {
     );
     println!("      --containerd-socket PATH  containerd UDS to dispatch Container workloads to");
     println!("                                (default: $CONTAINERD_SOCK, else container deploys are refused)");
+    println!("      --docker                  supervise Container workloads on a Docker-compatible");
+    println!("                                daemon (OrbStack, dockerd, podman) using the ambient");
+    println!("                                $DOCKER_HOST (default: off; $KAMAJI_DOCKER=1 also enables)");
+    println!("      --docker-host URL         as --docker, against an explicit daemon, e.g.");
+    println!("                                unix:///var/run/docker.sock");
     println!("      --bundle-cache-dir PATH   node bundle root for serving published W272 mesofact");
     println!("                                bundles: <root>/bundles, <root>/runtimes, <root>/state");
     println!("                                (default: $KAMAJI_BUNDLE_CACHE_DIR, else serve-bundle");
     println!("                                deploys are refused)");
-    println!("      --bundle-bucket NAME      R2 bucket holding the published bundle store");
-    println!("                                (default: $KAMAJI_BUNDLE_BUCKET; required with");
+    println!("      --bundle-origin URL       public HTTPS origin serving the published bundle");
+    println!("                                store, e.g. https://cdn.yah.dev — unauthenticated;");
+    println!("                                blobs are content-addressed and digest-verified");
+    println!("                                (default: $KAMAJI_BUNDLE_ORIGIN; required with");
     println!("                                --bundle-cache-dir)");
     println!("      --bundle-port PORT        loopback port served bundles bind on 127.0.0.1");
     println!(
@@ -258,15 +290,67 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
         );
     }
 
+    // ── docker / OrbStack backend (R626-F1) ──────────────────────────────────
+    // The pond / dev-host counterpart to containerd. Attached only on explicit
+    // opt-in; when both are attached, containerd serves Container deploys.
+    #[cfg(feature = "docker-integration")]
+    {
+        use kamaji::Kamaji as _;
+        ctx = if let Some(host) = &args.docker_host {
+            let backend = if host.is_empty() {
+                kamaji::docker::DockerRuntime::new()
+            } else {
+                kamaji::docker::DockerRuntime::with_host(host.clone())
+            };
+            // Fail at startup, not on the first deploy: an operator who asked
+            // for docker should learn immediately that the daemon is unreachable.
+            let health = backend.health().await?;
+            if !health.ok {
+                anyhow::bail!(
+                    "docker backend requested but the daemon is unreachable{}{}",
+                    if host.is_empty() {
+                        " (ambient DOCKER_HOST)".to_string()
+                    } else {
+                        format!(" at {host}")
+                    },
+                    health
+                        .detail
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default()
+                );
+            }
+            tracing::info!(
+                docker_host = if host.is_empty() { "<inherited>" } else { host },
+                version = health.version.as_deref().unwrap_or("<unknown>"),
+                "docker backend attached"
+            );
+            ctx.with_docker(backend)
+        } else {
+            tracing::info!(
+                "no --docker; Deploy {{ Container }} will not use a docker daemon. \
+                 Pass --docker (or --docker-host URL) to supervise containers on \
+                 a Docker-compatible daemon such as OrbStack."
+            );
+            ctx
+        };
+    }
+    #[cfg(not(feature = "docker-integration"))]
+    if args.docker_host.is_some() {
+        anyhow::bail!(
+            "--docker / --docker-host require the kamaji binary be built with \
+             --features docker-integration"
+        );
+    }
+
     // ── keep-alive mesofact bundle backend (R599-F10) ────────────────────────
     #[cfg(feature = "bundle-serving")]
     {
         ctx = attach_bundle_backend(ctx, args).await?;
     }
     #[cfg(not(feature = "bundle-serving"))]
-    if args.bundle_cache_dir.is_some() || args.bundle_bucket.is_some() {
+    if args.bundle_cache_dir.is_some() || args.bundle_origin.is_some() {
         anyhow::bail!(
-            "--bundle-cache-dir / --bundle-bucket require the kamaji binary be built with \
+            "--bundle-cache-dir / --bundle-origin require the kamaji binary be built with \
              --features bundle-serving"
         );
     }
@@ -276,14 +360,23 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
 
 /// Attach the R599-F10 bundle backend when the node is configured for it.
 ///
-/// Requires `--bundle-cache-dir` (the node bundle root) plus the R2 coordinates
-/// of the published bundle store: `--bundle-bucket` and `$CF_ACCOUNT_ID`.
-/// Credentials come from the yah keystore with env fallback via
-/// [`R2ObjectStore::from_vault`] — never from argv. With no cache dir configured
-/// this warns and leaves `ctx.bundle = None`, so a serve-bundle deploy keeps
-/// returning the existing `BackendRefused`.
+/// Requires `--bundle-cache-dir` (the node bundle root) plus `--bundle-origin`,
+/// the public HTTPS origin serving the published bundle store.
 ///
-/// [`R2ObjectStore::from_vault`]: yah_object_store::R2ObjectStore::from_vault
+/// **The node holds no credentials** (R599-T5). The read leg of a
+/// content-addressed store does not need one: `materialize_bundle` verifies the
+/// manifest hashes to the requested digest and that every blob hashes to its
+/// recorded blake3, so integrity comes from the content address rather than the
+/// transport — a hostile origin cannot inject bytes. Authentication would buy
+/// only confidentiality, which published bundles do not need, at the cost of a
+/// write-capable secret on every box in the fleet. Publishing stays on the
+/// publisher via the credentialed `R2ObjectStore`. See
+/// [`HttpReadOnlyObjectStore`] for the full rationale.
+///
+/// With no cache dir configured this warns and leaves `ctx.bundle = None`, so a
+/// serve-bundle deploy keeps returning the existing `BackendRefused`.
+///
+/// [`HttpReadOnlyObjectStore`]: yah_object_store::HttpReadOnlyObjectStore
 #[cfg(feature = "bundle-serving")]
 async fn attach_bundle_backend(
     ctx: kamaji_bin::ServerCtx,
@@ -295,23 +388,17 @@ async fn attach_bundle_backend(
         tracing::warn!(
             "no --bundle-cache-dir; Deploy {{ MesofactStatic + serve_bundle }} will refuse with \
              BackendRefused. Pass --bundle-cache-dir /var/lib/yah/kamaji/bundles plus \
-             --bundle-bucket (and $CF_ACCOUNT_ID) for the production path."
+             --bundle-origin https://cdn.yah.dev for the production path."
         );
         return Ok(ctx);
     };
 
-    let Some(bucket) = args.bundle_bucket.clone() else {
+    let Some(origin) = args.bundle_origin.clone() else {
         anyhow::bail!(
-            "--bundle-cache-dir requires --bundle-bucket (or $KAMAJI_BUNDLE_BUCKET) — the R2 \
-             bucket holding the published bundle store to materialize from"
+            "--bundle-cache-dir requires --bundle-origin (or $KAMAJI_BUNDLE_ORIGIN) — the public \
+             HTTPS origin serving the published bundle store, e.g. https://cdn.yah.dev"
         );
     };
-    let account_id = std::env::var("CF_ACCOUNT_ID").map_err(|_| {
-        anyhow::anyhow!(
-            "--bundle-cache-dir requires $CF_ACCOUNT_ID (the Cloudflare account id owning the \
-             R2 bundle bucket)"
-        )
-    })?;
 
     // W272 §2: the node cache lives under kamaji's state dir. One root holds
     // materialized bundles (<root>/bundles), stock serve-runtime assets
@@ -324,16 +411,16 @@ async fn attach_bundle_backend(
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating bundle state dir {}", state_dir.display()))?;
 
-    // R2ObjectStore owns a `reqwest::blocking::Client`, which panics if it is
-    // constructed inside a tokio runtime context — build it on the blocking pool.
-    // Same discipline as yubaba's reconciler::bundle_store publish leg.
+    // Like R2ObjectStore, this owns a `reqwest::blocking::Client`, which panics
+    // if constructed inside a tokio runtime context — build it on the blocking
+    // pool. Same discipline as yubaba's reconciler::bundle_store publish leg.
     let store = tokio::task::spawn_blocking({
-        let bucket = bucket.clone();
-        move || yah_object_store::R2ObjectStore::from_vault(account_id, bucket)
+        let origin = origin.clone();
+        move || yah_object_store::HttpReadOnlyObjectStore::new(origin)
     })
     .await
-    .context("R2 bundle-store construction task panicked")?
-    .context("building R2ObjectStore for the node bundle store")?;
+    .context("bundle-store construction task panicked")?
+    .context("building the read-only bundle origin store")?;
 
     let mut backend =
         kamaji_bin::BundleBackend::new(std::sync::Arc::new(store), &cache_dir, &state_dir);
@@ -342,9 +429,10 @@ async fn attach_bundle_backend(
     }
     tracing::info!(
         cache_dir = %cache_dir.display(),
-        bucket = %bucket,
+        origin = %origin,
         bind_port = backend.bind_port,
-        "bundle backend attached (keep-alive serve_bundle workloads)"
+        "bundle backend attached (keep-alive serve_bundle workloads; \
+         unauthenticated content-addressed origin)"
     );
     Ok(ctx.with_bundle_backend(backend))
 }

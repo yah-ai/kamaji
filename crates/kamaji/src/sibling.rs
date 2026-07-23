@@ -214,6 +214,47 @@ impl KamajiClient {
         }
     }
 
+    /// `YubabaToKamaji::Deploy` with an arbitrary [`Workload`] envelope.
+    ///
+    /// The general form of a deploy: the caller picks the variant, so this
+    /// carries `Workload::MesofactStatic` (the W272 bundle path, R599) as
+    /// readily as `Workload::Container`. [`Kamaji::deploy_workload`] is the
+    /// container-shaped convenience wrapper over this.
+    ///
+    /// Admission — validation, mesh-IP allocation, secret materialization,
+    /// ownership rows — stays on yubaba's side of this call. Kamaji supervises
+    /// what it is handed; it does not re-litigate whether the workload should
+    /// run.
+    ///
+    /// [`Kamaji::deploy_workload`]: crate::Kamaji::deploy_workload
+    pub async fn deploy_envelope(
+        &self,
+        id: &WorkloadId,
+        workload: &workload_spec::Workload,
+    ) -> Result<(), ClientError> {
+        let request_id = self.next_request_id();
+        let reply = self
+            .request(
+                YubabaToKamaji::Deploy {
+                    request_id,
+                    id: id.clone(),
+                    spec: workload.clone(),
+                },
+                request_id,
+            )
+            .await?;
+        match reply {
+            KamajiToYubaba::Ack {
+                request_id: rid,
+                kind: kamaji_proto::AckKind::Deploy,
+            } => {
+                check_rid(request_id, rid)?;
+                Ok(())
+            }
+            other => Err(ClientError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
     /// `YubabaToKamaji::Stop` — SIGTERM-with-grace floor. Returns when
     /// Kamaji acks the stop request; the workload may still be reaping
     /// when this returns.
@@ -435,35 +476,14 @@ impl crate::Kamaji for KamajiClient {
     ) -> anyhow::Result<crate::DeployResult> {
         let id = WorkloadId::new(&spec.name);
         let workload_envelope = workload_spec::Workload::Container(spec.clone());
-        let request_id = self.next_request_id();
-        let reply = self
-            .request(
-                YubabaToKamaji::Deploy {
-                    request_id,
-                    id: id.clone(),
-                    spec: workload_envelope,
-                },
-                request_id,
-            )
+        self.deploy_envelope(&id, &workload_envelope)
             .await
             .map_err(|e| anyhow::anyhow!("kamaji deploy_workload: {e}"))?;
-        match reply {
-            KamajiToYubaba::Ack {
-                request_id: rid,
-                kind: kamaji_proto::AckKind::Deploy,
-            } => {
-                check_rid(request_id, rid)
-                    .map_err(|e| anyhow::anyhow!("kamaji deploy ack: {e}"))?;
-                Ok(crate::DeployResult {
-                    container_id: id.0,
-                    mesh_ip: mesh.mesh_ip,
-                    task_pid: 0,
-                })
-            }
-            other => Err(anyhow::anyhow!(
-                "kamaji deploy_workload: unexpected reply {other:?}"
-            )),
-        }
+        Ok(crate::DeployResult {
+            container_id: id.0,
+            mesh_ip: mesh.mesh_ip,
+            task_pid: 0,
+        })
     }
 
     async fn list_workloads(&self) -> anyhow::Result<Vec<crate::WorkloadState>> {

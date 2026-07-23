@@ -62,14 +62,14 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "fs", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["io-util"] }
 tracing = "0.1"
-workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.21" }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.20", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.21", default-features = false }
 
 # SIGTERM for the native backend's graceful stop (optional — native-integration).
 libc = { version = "0.2", optional = true }
@@ -80,7 +80,7 @@ libc = { version = "0.2", optional = true }
 nix = { version = "0.29", optional = true, features = ["socket", "sched", "uio"] }
 
 # Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
-kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.20" }
+kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.21" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -97,4 +97,13 @@ required-features = ["native-integration"]
 # harness). Linux + socket-custody only; a no-op main elsewhere.
 [[test]]
 name = "socket_custody_zero_downtime_linux"
+harness = false
+
+# On-demand JIT lifecycle E2E (R599-F6): a self-re-exec'ing driver that forks a
+# real serve child which adopts the kamaji-held socket via LISTEN_FDS, serves,
+# and self-reaps on idle. Proves lazy fork-on-connection + idle reap + re-fork
+# with zero dropped connections. Owns its own main (drives a tokio runtime + a
+# std child role). Unix + native-integration only; a no-op main elsewhere.
+[[test]]
+name = "jit_lazy_fork"
 harness = false

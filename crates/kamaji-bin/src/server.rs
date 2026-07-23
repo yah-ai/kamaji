@@ -79,6 +79,46 @@
 //! @yah:gotcha("DRAIN IS NOT WIRED for bundle workloads — deliberate: the NativeRuntime single-owns the child, so registering a pidfd DrainableHandle would double-own the process and race the supervisor's reaper. A Drain of a bundle workload returns DrainAck{accepted:false,\"unknown workload\"}; teardown is via Stop. Documented in the deploy_mesofact_bundle doc comment. Wiring structured drain for native workloads is a follow-up if/when it's needed.")
 //! @yah:gotcha("BIND IS LOOPBACK, ONE BUNDLE PER NODE: listens on 127.0.0.1:<port> (DEFAULT_BUNDLE_PORT=8080), mirroring the existing passway→127.0.0.1:8080 testbed shape. MesofactServeBundle carries no port and the UDS Deploy carries no MeshAssignment, so mesh-IP-plane binding + multi-bundle-per-node needs Deploy to carry a MeshAssignment — that is the follow-up, not done here.")
 //! @yah:gotcha("OnDemand/JIT still refuses cleanly (points at R599-F6) — out of scope by design.")
+//!
+//! @yah:ticket(R599-B11, "GET /workloads double-lists a bundle workload: stale Pending registry row alongside the Running native row")
+//! @yah:status(review)
+//! @yah:assignee(agent:claude)
+//! @yah:at(2026-07-22T18:56:18Z)
+//! @yah:parent(R599)
+//! @yah:severity(low)
+//! @yah:tier(Thief)
+//! @yah:gotcha("Observed live on east 2026-07-21 immediately after the first successful bundle deploy: GET http://100.64.0.3:7443/workloads returns TWO rows for the same workload — {id:'yah-marketing', mesh_ident:null, pid:null, state:'Pending'} AND {id:'yah-marketing', mesh_ident:'yah-marketing', pid:67749, state:'Running'}. The Running row is correct. R599-F10's List merges native bundle workloads with the in-memory registry, and the registry's admission-time Pending row is never reconciled away once the native backend reports the process Running, so the merge emits both.")
+//! @yah:next("OPS FOLLOW-UP (not code, and NOT done by this ticket): the stale containerd container named yah-marketing still exists on east. This fix makes /workloads report correctly despite it, but the container should still be reaped — it holds the id and will keep tripping the new warn!. This is the residue R599-T5 (delete the nginx/tar-pipe/python stand-ins) did not remove; check whether T5's cleanup missed containerd containers generally.")
+//! @yah:next("The ticket's verify (\"after a bundle deploy, GET /workloads returns exactly one row\") was NOT run against the live cluster — no node access from this session. It is covered by unit tests reproducing the observed row shape. Re-confirm against east on the next deploy.")
+//! @yah:handoff("FIXED, but the ticket's DIAGNOSIS WAS WRONG — read this before reviewing. The phantom row does NOT come from the registry. Evidence: (1) Registry.workloads is never written anywhere in kamaji-bin (only the field decl + list()'s clone) — the registry contributes ZERO rows to List; insert_probe, the only registry write a bundle deploy makes, touches `probes`, not `workloads`. (2) bundle_state_to_entry ALWAYS sets mesh_ident: Some(..), so it cannot emit the observed mesh_ident:null. (3) containerd.rs list() renders a container that exists with NO TASK as exactly {state: Pending, pid: None} with mesh_ident: labels.get(\"yah.mesh-ident\") → None when unlabelled. That is the observed row byte-for-byte. The phantom is a STALE CONTAINERD CONTAINER named yah-marketing — a leftover of the pre-bundle nginx stand-in — concatenated with the live native bundle row.")
+//! @yah:handoff("FIX (oss/kamaji/crates/kamaji-bin/src/server.rs): new dedupe_workload_entries() + liveness_rank(), applied to the merged entries in the List arm. One row per workload id, keeping the most-live row and preserving first-seen order. Rank is (pid.is_some(), state) — a backend that can name a running process is authoritative over one that only knows a record exists. Deliberately liveness-based, NOT source-priority, so it stays correct regardless of which runtimes are compiled in or what order the merges run. WorkloadState is #[non_exhaustive]; an unknown future state ranks with Pending and so can never shadow a live pid.")
+//! @yah:handoff("Also emits a warn! whenever a duplicate id is collapsed (both rows' state+pid). Deliberate: the dedupe alone would make a genuinely-stale container INVISIBLE, which trades a cosmetic bug for a silent one. The log keeps the operational signal.")
+//! @yah:handoff("VERIFIED: 4 new unit tests reproduce the exact east 2026-07-21 shape (stale Pending/null-pid/null-mesh_ident vs Running/pid 67749) plus order-independence, distinct-id preservation, and pid-less tie-breaking. kamaji-bin lib 197 pass; full oss/kamaji workspace green, 0 failures; clippy clean; --features bundle-serving compiles.")
+//! @yah:verify("cd oss/kamaji && cargo test -p kamaji-bin --lib dedupe (4 pass) && cargo test (workspace green)")
+//! @yah:verify("On the next east bundle deploy: GET http://100.64.0.3:7443/workloads returns exactly one yah-marketing row with the correct pid + Running state; kamaji logs a 'duplicate workload id across backends' warn while the stale container survives")
+//!
+//! @yah:ticket(R626-F1, "Wire kamaji's existing docker/OrbStack backend into kamaji-bin (ServerCtx + Deploy/Stop/List routing)")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-23T02:25:58Z)
+//! @yah:phase(P1)
+//! @yah:parent(R626)
+//! @yah:next("R626-F2 (migrate pond's per-slot reconcilers onto kamaji Deploy/Stop) is now unblocked — the backend it needs exists and is proven. Note pond currently drives its own docker via yubaba's runtime layer; F2 is about pointing those reconcilers at a kamaji that owns the daemon.")
+//! @yah:next("Follow-up (not filed — small, and F2 may subsume it): thread a real MeshAssignment through the UDS Deploy so container AND bundle workloads can bind the mesh IP plane instead of the inlined loopback sentinel. Wanted by both this ticket and R599-F10.")
+//! @yah:next("Do NOT add tag:build-worker to us-west-015 on the strength of this ticket alone — that still needs this node on 0.8.20 and a docker daemon reachable by the `yah` account (this was all verified as the `leif` account).")
+//! @yah:handoff("LANDED + verified live against OrbStack 29.4.0. (1) BACKEND (oss/kamaji/crates/kamaji/src/docker.rs): docker.rs was complete but had never run wired — the R626 assumption is now DISCHARGED by a new live test (crates/kamaji/tests/docker_live.rs, 5 tests: deploy->inspect->list->stop round-trip, exited-container reports Failed with no pid, resolve/teardown by either key, unlabelled containers are not adopted, teardown idempotence). Fixed while there: task_pid was hardcoded 0 with a doc comment claiming 'Docker CLI doesn't surface the host PID' — it does, via .State.Pid; deploy now returns the real pid. New DockerWorkload {state, pid, workload_id} + list_workloads_detailed() carries the pid in the SAME docker inspect round-trips list_workloads already made; Kamaji::list_workloads now delegates to it.")
+//! @yah:handoff("(2) WIRING (kamaji-bin): new `docker-integration` cargo feature (= dep:kamaji + kamaji/docker-integration, no new Rust deps — shells out). ServerCtx grows `docker: Option<DockerRuntime>` + with_docker(), mirroring the containerd/bundle Option<Backend> pattern. Deploy{Container} extracted into deploy_container(): containerd first when configured (a node with a containerd socket is a fleet node; its docker daemon is the developer's), else docker, else a build-aware BackendRefused from no_container_backend_error() that names each backend as 'not compiled in' vs 'compiled but unconfigured' — a rebuild and a restart-with-flags are different fixes. List merges docker rows via docker_workload_to_entry (joins the existing R599-B11 dedupe safely, and carries a real pid so it ranks on liveness rather than losing as pid-less). Stop routes to docker teardown.")
+//! @yah:handoff("(3) BUG FOUND AND FIXED IN THE WIRING ITSELF — R590-B9 bites here. The sibling client sends id = spec.name (`forge-abc`) but the docker backend NAMES containers by mesh identity (`forge.abc`). Keying Stop on the id would find nothing, Ack, and leave the container running forever — a silent supervision leak. Fix: deploy stamps a `yah.workload_id` label (WORKLOAD_ID_LABEL), and new resolve()/teardown_by_key() accept EITHER key (direct inspect fast path, then a label scan). Recorded on the daemon rather than in an in-memory map so a kamaji restart can't lose it. List now reports id=workload_id + mesh_ident=identity, matching containerd's split so the two backends' rows are comparable in the dedupe. PROVEN: reverting teardown_by_key makes deploy_list_stop_through_kamaji_against_live_docker fail on 'Stop must actually remove the container from the daemon'.")
+//! @yah:handoff("(4) BINARY (main.rs): --docker (ambient DOCKER_HOST) / --docker-host URL, env KAMAJI_DOCKER=1|<host>. Deliberately NOT keyed off a bare $DOCKER_HOST — nearly every dev host sets it and a supervisor must not adopt a daemon nobody asked it to supervise. Attach health-checks at startup and hard-errors (exit 1, verified) rather than failing on the first deploy; --docker against a no-feature build hard-errors like the bundle flags do. ABOUT + help text updated.")
+//! @yah:verify("cargo test -p kamaji-bin -p kamaji --features docker-integration → kamaji-bin lib 200 pass (was 197), kamaji lib 52, docker_live 5, docker_backend_e2e 2. All green.")
+//! @yah:verify("cargo test --workspace (default build) → all green, 197 kamaji-bin lib, unchanged behaviour with the feature off")
+//! @yah:verify("cargo test -p kamaji-bin --features docker-integration,bundle-serving → 203 lib pass; cargo check --features containerd-integration,docker-integration --all-targets → clean (both backends compiled together)")
+//! @yah:verify("cargo clippy -p kamaji -p kamaji-bin --features docker-integration --all-targets → clean (only pre-existing pidfd events_tx + cheers-mock redundant-closure warnings)")
+//! @yah:verify("oss/yubaba: cargo check -p yubaba --features docker-integration → clean (yubaba forwards the kamaji feature)")
+//! @yah:verify("LIVE BINARY: ./kamaji --socket /tmp/r626.sock --docker → 'docker backend attached docker_host=<inherited> version=29.4.0' + UDS bound; --docker-host unix:///nonexistent/docker.sock → actionable error, exit 1")
+//! @yah:gotcha("The docker backend NAMES containers by mesh identity but yubaba ADDRESSES workloads by id, and for forge runs those differ (`forge.abc` vs `forge-abc`, R590-B9). Always reach for resolve()/teardown_by_key() when you hold a workload id — Kamaji::teardown_workload takes a MeshIdent and will silently no-op on an id. Containers deployed before this ticket carry no yah.workload_id label; they fall back to the identity, which is correct for every workload whose name and identity agree (i.e. everything but forge).")
+//! @yah:gotcha("Deploy carries no MeshAssignment over the UDS (the same gap R599-F10 recorded for bundles), so deploy_container passes MeshAssignment::inlined(127.0.0.1). Docker uses it only for the yah.mesh_ip label + YAH_MESH_IP env, and pond has no mesh IP plane — but a workload that actually needs its mesh IP will read loopback. Threading a real assignment through Deploy is the follow-up.")
+//! @yah:gotcha("When BOTH containerd and docker are configured, containerd wins Deploy{Container} — but Stop and List still route to BOTH (teardown is idempotent, and a node can hold containers from either). That asymmetry is deliberate: you must be able to stop what a previous configuration started.")
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -102,9 +142,10 @@ use crate::drain;
 use crate::journal::{JournalSender, LogSink};
 use crate::probe::{run_probe, ProbeTarget};
 
-// R599-F10: the native bundle backend. The `Kamaji` trait brings
-// deploy/list/teardown into scope for the kamaji-crate NativeRuntime.
-#[cfg(feature = "bundle-serving")]
+// The `Kamaji` trait brings deploy/list/teardown into scope for the
+// kamaji-crate backends: the NativeRuntime behind the bundle backend (R599-F10)
+// and the DockerRuntime behind the docker backend (R626-F1).
+#[cfg(any(feature = "bundle-serving", feature = "docker-integration"))]
 use kamaji::Kamaji as _;
 #[cfg(feature = "bundle-serving")]
 use std::path::PathBuf;
@@ -174,26 +215,45 @@ pub struct ServerCtx {
     /// bundle-serving" `BackendRefused`, exactly like the containerd None arm.
     #[cfg(feature = "bundle-serving")]
     pub bundle: Option<BundleBackend>,
+    /// Optional docker/OrbStack backend (R626-F1). `None` outside the
+    /// `docker-integration` feature build, or when kamaji is started without
+    /// `--docker`. This is the pond / dev-host counterpart to `containerd`:
+    /// both serve `Deploy { Container }`, and when both are configured
+    /// containerd wins (a node running containerd is a fleet node, and the
+    /// docker daemon there is the developer's, not the fleet's). Shelling out
+    /// to the `docker` CLI is cheap and stateless, so this needs no Arc — the
+    /// runtime is a single `String`.
+    #[cfg(feature = "docker-integration")]
+    pub docker: Option<kamaji::docker::DockerRuntime>,
 }
 
-/// The R599-F10 keep-alive bundle backend: materialize a W272 bundle from the
-/// node store and fork+supervise `mesofact-serve --bundle <dir> --listen <addr>`
-/// under the kamaji crate's native (fork+exec) runtime — the same supervisor
-/// R490 already runs mesofact-dev under.
+/// The node bundle backend: materialize a W272 bundle from the node store and
+/// serve it under one of two lifecycle runtimes, selected by `bundle.lifecycle`:
+/// the **keep-alive** [`NativeRuntime`] (R599-F10) forks a resident
+/// `mesofact-serve` — the same supervisor R490 runs mesofact-dev under — and the
+/// **on-demand** [`JitRuntime`] (R599-F6) holds the listen socket and forks the
+/// serve runtime lazily, reaping it when idle.
 ///
-/// The [`NativeRuntime`] is the **single owner** of each served bundle's child
-/// process (spawn, restart-per-policy, log capture, teardown). The kamaji-bin
-/// [`Registry`] is *not* a second lifecycle owner for bundle workloads: `List`
-/// merges the native runtime's live view (like the containerd merge), `Stop`
-/// routes teardown to it, and the only registry state a bundle deploy writes is
-/// a probe target so `Probe` can dial the serve process. See
-/// [`deploy_mesofact_bundle`] for the Drain caveat.
+/// The runtime is the **single owner** of each served bundle's child process
+/// (spawn, restart/re-fork, log capture, teardown); the two hold disjoint
+/// identities. The kamaji-bin [`Registry`] is *not* a second lifecycle owner for
+/// bundle workloads: `List` merges both runtimes' live views (like the
+/// containerd merge), `Stop` routes teardown to both, and the only registry
+/// state a bundle deploy writes is a keep-alive probe target so `Probe` can dial
+/// the serve process. See [`deploy_mesofact_bundle`] for the Drain caveat.
 ///
 /// [`NativeRuntime`]: kamaji::native::NativeRuntime
+/// [`JitRuntime`]: kamaji::jit::JitRuntime
 #[cfg(feature = "bundle-serving")]
 pub struct BundleBackend {
-    /// Fork+exec supervisor — single owner of each served bundle's process.
+    /// Fork+exec supervisor — single owner of each **keep-alive** served
+    /// bundle's process.
     pub native: Arc<kamaji::native::NativeRuntime>,
+    /// On-demand (JIT) runtime (R599-F6) — custodian of each **on-demand**
+    /// bundle's listen socket, forking the serve process on the first connection
+    /// and reaping it after idle. Disjoint from `native`: a bundle's lifecycle
+    /// selects exactly one of the two, so a given identity lives in one runtime.
+    pub jit: Arc<kamaji::jit::JitRuntime>,
     /// Node bundle store (R2 in prod, in-memory in tests) the cache pulls from.
     pub store: Arc<dyn yah_object_store::ObjectStore>,
     /// Cache root. Materialized bundles live at `<cache_dir>/bundles/<digest>/`;
@@ -225,8 +285,10 @@ impl BundleBackend {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_BUNDLE_PORT);
+        let state_dir = state_dir.into();
         Self {
-            native: Arc::new(kamaji::native::NativeRuntime::new(state_dir)),
+            native: Arc::new(kamaji::native::NativeRuntime::new(state_dir.clone())),
+            jit: Arc::new(kamaji::jit::JitRuntime::new(state_dir)),
             store,
             cache_dir: cache_dir.into(),
             cache_budget: 0,
@@ -293,6 +355,8 @@ impl ServerCtx {
             containerd: None,
             #[cfg(feature = "bundle-serving")]
             bundle: None,
+            #[cfg(feature = "docker-integration")]
+            docker: None,
         }
     }
 
@@ -306,6 +370,8 @@ impl ServerCtx {
             containerd: None,
             #[cfg(feature = "bundle-serving")]
             bundle: None,
+            #[cfg(feature = "docker-integration")]
+            docker: None,
         }
     }
 
@@ -332,6 +398,20 @@ impl ServerCtx {
     #[cfg(feature = "bundle-serving")]
     pub fn with_bundle_backend(mut self, backend: BundleBackend) -> Self {
         self.bundle = Some(backend);
+        self
+    }
+
+    /// Attach the docker/OrbStack backend (R626-F1). Only available with the
+    /// `docker-integration` feature; the binary calls this in `main.rs` when
+    /// the operator passed `--docker` / `--docker-host`.
+    ///
+    /// Attaching is deliberately opt-in rather than implied by the feature: a
+    /// dev host usually has *some* docker daemon reachable via `DOCKER_HOST`,
+    /// and a supervisor that adopts whichever daemon happens to be running
+    /// would deploy fleet workloads onto a developer's laptop docker.
+    #[cfg(feature = "docker-integration")]
+    pub fn with_docker(mut self, backend: kamaji::docker::DockerRuntime) -> Self {
+        self.docker = Some(backend);
         self
     }
 }
@@ -611,9 +691,10 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
                 }
             }
 
-            // Merge keep-alive bundle workloads (R599-F10). The native runtime
-            // is the source of truth for their live status — mirror the
-            // containerd merge rather than tracking a stale registry snapshot.
+            // Merge bundle workloads (R599-F10 keep-alive + R599-F6 on-demand).
+            // Each runtime is the source of truth for its own workloads' live
+            // status — mirror the containerd merge rather than tracking a stale
+            // registry snapshot. The two runtimes hold disjoint identities.
             #[cfg(feature = "bundle-serving")]
             if let Some(backend) = &ctx.bundle {
                 match backend.native.list_workloads().await {
@@ -628,11 +709,46 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
                         };
                     }
                 }
+                entries.extend(
+                    backend
+                        .jit
+                        .list_workloads()
+                        .await
+                        .into_iter()
+                        .map(bundle_state_to_entry),
+                );
             }
 
+            // Merge docker/OrbStack containers (R626-F1). Like the containerd
+            // merge, the daemon is the source of truth for its own containers'
+            // live status; `list_workloads_detailed` carries each container's
+            // host pid in the same round-trips, so a docker row can win the
+            // dedupe below on liveness rather than being ranked pid-less.
+            #[cfg(feature = "docker-integration")]
+            if let Some(docker) = &ctx.docker {
+                match docker.list_workloads_detailed().await {
+                    Ok(workloads) => {
+                        entries.extend(workloads.into_iter().map(docker_workload_to_entry))
+                    }
+                    Err(e) => {
+                        return KamajiToYubaba::Error {
+                            request_id: Some(request_id),
+                            code: ErrorCode::BackendRefused,
+                            message: format!("docker list failed: {e}"),
+                        };
+                    }
+                }
+            }
+
+            // One row per workload id (R599-B11). The merges above concatenate
+            // independent backend views, and those views are NOT guaranteed
+            // disjoint: a leftover containerd container can carry the same id as
+            // a live native bundle workload, and containerd reports a
+            // container-without-task as `Pending`/`pid: None`. Collapse to the
+            // most-live row rather than emitting both.
             KamajiToYubaba::WorkloadList {
                 request_id,
-                entries,
+                entries: dedupe_workload_entries(entries),
             }
         }
         YubabaToKamaji::Drain {
@@ -716,48 +832,7 @@ async fn deploy_workload(
 ) -> KamajiToYubaba {
     match spec {
         workload_spec::Workload::Container(spec) => {
-            #[cfg(feature = "containerd-integration")]
-            {
-                let Some(backend) = ctx.containerd.clone() else {
-                    return KamajiToYubaba::Error {
-                        request_id: Some(request_id),
-                        code: ErrorCode::BackendRefused,
-                        message: "no containerd backend configured — \
-                                  rebuild kamaji with --features containerd-integration \
-                                  and start with --containerd-socket"
-                            .to_string(),
-                    };
-                };
-                match backend.deploy(&id, &spec).await {
-                    Ok(_pid) => KamajiToYubaba::Ack {
-                        request_id,
-                        kind: kamaji_proto::AckKind::Deploy,
-                    },
-                    Err(crate::containerd::BackendError::InvalidSpec(msg)) => {
-                        KamajiToYubaba::Error {
-                            request_id: Some(request_id),
-                            code: ErrorCode::InvalidSpec,
-                            message: msg,
-                        }
-                    }
-                    Err(crate::containerd::BackendError::Containerd(e)) => KamajiToYubaba::Error {
-                        request_id: Some(request_id),
-                        code: ErrorCode::BackendRefused,
-                        message: format!("containerd: {e:#}"),
-                    },
-                }
-            }
-            #[cfg(not(feature = "containerd-integration"))]
-            {
-                let _ = (ctx, spec);
-                KamajiToYubaba::Error {
-                    request_id: Some(request_id),
-                    code: ErrorCode::BackendRefused,
-                    message: "kamaji built without containerd-integration feature; \
-                              Container workloads cannot be deployed"
-                        .to_string(),
-                }
-            }
+            deploy_container(ctx, request_id, &id, &spec).await
         }
         // R599-F4: a mesofact-static workload that carries a `serve_bundle` is a
         // deployed W272 bundle kamaji serves via its native backend — no longer
@@ -787,27 +862,137 @@ async fn deploy_workload(
     }
 }
 
+/// Dispatch a `Workload::Container` to whichever container backend this build
+/// has configured.
+///
+/// Two backends can serve a container, matching the two tiers kamaji runs on:
+///
+/// - **containerd** (R406-T9, `containerd-integration`) — the cloud tier.
+/// - **docker/OrbStack** (R626-F1, `docker-integration`) — pond and dev hosts,
+///   where the daemon speaks the Docker API rather than containerd's gRPC.
+///
+/// When both are configured containerd wins: a node with a containerd socket is
+/// a fleet node, and its docker daemon (if any) belongs to a developer, not to
+/// the fleet. When neither is, the deploy reports a `BackendRefused` naming what
+/// this specific build is missing — feature not compiled in vs compiled but
+/// unconfigured — so an operator can tell a rebuild from a restart-with-flags.
+#[allow(unused_variables)]
+async fn deploy_container(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: &WorkloadId,
+    spec: &workload_spec::WorkloadSpec,
+) -> KamajiToYubaba {
+    #[cfg(feature = "containerd-integration")]
+    if let Some(backend) = ctx.containerd.clone() {
+        return match backend.deploy(id, spec).await {
+            Ok(_pid) => KamajiToYubaba::Ack {
+                request_id,
+                kind: kamaji_proto::AckKind::Deploy,
+            },
+            Err(crate::containerd::BackendError::InvalidSpec(msg)) => KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::InvalidSpec,
+                message: msg,
+            },
+            Err(crate::containerd::BackendError::Containerd(e)) => KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!("containerd: {e:#}"),
+            },
+        };
+    }
+
+    #[cfg(feature = "docker-integration")]
+    if let Some(docker) = ctx.docker.clone() {
+        // The UDS `Deploy` carries no `MeshAssignment` (the same gap R599-F10
+        // recorded for bundle workloads), and the docker backend uses one only
+        // to stamp the `yah.mesh_ip` label and the `YAH_MESH_IP` env var. Pass
+        // the inlined loopback sentinel: on pond there is no mesh IP plane, and
+        // inventing a fake routable address would be a worse lie than loopback.
+        // Threading a real assignment through Deploy is the follow-up.
+        let mesh = kamaji::MeshAssignment::inlined(std::net::Ipv4Addr::LOCALHOST);
+        return match docker.deploy_workload(spec, &mesh).await {
+            Ok(result) => {
+                info!(
+                    id = %id.0,
+                    container_id = %result.container_id,
+                    pid = result.task_pid,
+                    "docker container deployed"
+                );
+                KamajiToYubaba::Ack {
+                    request_id,
+                    kind: kamaji_proto::AckKind::Deploy,
+                }
+            }
+            Err(e) => KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!("docker: {e:#}"),
+            },
+        };
+    }
+
+    no_container_backend_error(request_id)
+}
+
+/// The `BackendRefused` a `Deploy { Container }` gets when no container backend
+/// is available, spelled out per compiled-in feature.
+///
+/// Operators hit this in two very different situations — a binary built without
+/// the backend, and a binary built with it but started without its flags — and
+/// the remedies differ (rebuild vs restart). Naming the state of each backend
+/// separately means the message is actionable without reading kamaji's source.
+fn no_container_backend_error(request_id: kamaji_proto::RequestId) -> KamajiToYubaba {
+    let mut reasons: Vec<&str> = Vec::new();
+
+    #[cfg(feature = "containerd-integration")]
+    reasons.push("containerd backend not configured — start kamaji with --containerd-socket");
+    #[cfg(not(feature = "containerd-integration"))]
+    reasons.push("kamaji built without containerd-integration feature");
+
+    #[cfg(feature = "docker-integration")]
+    reasons.push("docker backend not configured — start kamaji with --docker");
+    #[cfg(not(feature = "docker-integration"))]
+    reasons.push("kamaji built without docker-integration feature");
+
+    KamajiToYubaba::Error {
+        request_id: Some(request_id),
+        code: ErrorCode::BackendRefused,
+        message: format!(
+            "no container backend available; Container workloads cannot be deployed ({})",
+            reasons.join("; ")
+        ),
+    }
+}
+
 /// Dispatch a serve-bundle mesofact-static workload (R599-F4) to the native
 /// backend: materialize the W272 bundle from the node store (R599-F1) and fork
 /// the serve runtime under kamaji's native supervisor (R599-F10).
 ///
-/// With the `bundle-serving` feature the KeepAlive path is live: materialize →
-/// resolve the serve bin (self → `<dir>/bins/<triple>/serve`, `mesofact/<ver>` →
-/// `<cache>/runtimes/<runtime>/<triple>/serve`) → fork
-/// `mesofact-serve --bundle <dir> --listen 127.0.0.1:<port>` under the native
-/// supervisor. OnDemand/JIT is out of scope (R599-F6) and refuses cleanly.
+/// With the `bundle-serving` feature both lifecycles are live, routed on
+/// `bundle.lifecycle` after a shared materialize → serve-bin-resolution front
+/// (self → `<dir>/bins/<triple>/serve`, `mesofact/<ver>` →
+/// `<cache>/runtimes/<runtime>/<triple>/serve`):
+/// - **KeepAlive** ([`deploy_bundle_keepalive`], R599-F10) forks
+///   `mesofact-serve --bundle <dir> --listen 127.0.0.1:<port>` as a resident
+///   process under the native supervisor.
+/// - **OnDemand** ([`deploy_bundle_on_demand`], R599-F6) binds+holds the listen
+///   socket in the [`JitRuntime`] and forks the serve runtime on the first
+///   connection (`--idle-ttl <secs>`, socket activation), reaping it when idle.
+///   The Ack means "socket bound and armed", not "process running".
 ///
 /// Without the feature (default build), an admitted serve-bundle deploy reports
 /// `BackendRefused` — the workload is *recognized* (no longer `InvalidSpec`) but
 /// this kamaji build has no bundle backend, exactly as a `Container` deploy
 /// reports `BackendRefused` without containerd.
 ///
-/// **Drain caveat:** the native runtime is the single owner of the child, so a
+/// **Drain caveat:** each runtime is the single owner of its child(ren), so a
 /// bundle deploy does NOT register a pidfd `DrainableHandle` (that would
-/// double-own the process with the supervisor and race its reaper). Structured
-/// Drain of a bundle workload is therefore not wired — a `Drain` returns
+/// double-own the process and race the supervisor's reaper). Structured Drain of
+/// a bundle workload is therefore not wired — a `Drain` returns
 /// `DrainAck { accepted:false, reason:"unknown workload" }`; teardown is via
-/// `Stop`, which routes to `NativeRuntime::teardown_workload`.
+/// `Stop`, which routes to both runtimes' idempotent `teardown_workload`.
 #[allow(unused_variables)]
 async fn deploy_mesofact_bundle(
     ctx: &Arc<ServerCtx>,
@@ -817,7 +1002,18 @@ async fn deploy_mesofact_bundle(
 ) -> KamajiToYubaba {
     #[cfg(feature = "bundle-serving")]
     {
-        deploy_bundle_keepalive(ctx, request_id, id, bundle).await
+        // Route by lifecycle: keep-alive forks a resident process (R599-F10);
+        // on-demand hands the socket to a lazily-forked, idle-reaped process
+        // (R599-F6). Both share the materialize + serve-bin-resolution front.
+        match &bundle.lifecycle {
+            workload_spec::BundleLifecycle::KeepAlive => {
+                deploy_bundle_keepalive(ctx, request_id, id, bundle).await
+            }
+            workload_spec::BundleLifecycle::OnDemand { idle_ttl } => {
+                let idle_ttl = *idle_ttl;
+                deploy_bundle_on_demand(ctx, request_id, id, bundle, idle_ttl).await
+            }
+        }
     }
     #[cfg(not(feature = "bundle-serving"))]
     {
@@ -841,60 +1037,31 @@ async fn deploy_mesofact_bundle(
     }
 }
 
-/// Keep-alive bundle deploy (R599-F10). Materialize the W272 bundle, resolve the
-/// serve binary, and fork it under the native supervisor. See
-/// [`deploy_mesofact_bundle`] for the OnDemand refusal + Drain caveat.
+/// Materialize the W272 bundle tree from the node store (R599-F1) and resolve
+/// the serve binary path (W272 §2/§3), shared by the keep-alive and on-demand
+/// deploy paths. Returns `(bundle_dir, serve_bin)` or, as `Err`, the exact
+/// `KamajiToYubaba::Error` to send back.
 #[cfg(feature = "bundle-serving")]
-async fn deploy_bundle_keepalive(
-    ctx: &Arc<ServerCtx>,
+async fn materialize_and_resolve_serve(
+    backend: &BundleBackend,
     request_id: kamaji_proto::RequestId,
     id: &WorkloadId,
     bundle: &workload_spec::MesofactServeBundle,
-) -> KamajiToYubaba {
-    use std::net::{Ipv4Addr, SocketAddr};
-
+) -> std::result::Result<(PathBuf, PathBuf), KamajiToYubaba> {
     let err = |code: ErrorCode, message: String| KamajiToYubaba::Error {
         request_id: Some(request_id),
         code,
         message,
     };
 
-    // SCOPE: keep-alive only. On-demand/JIT socket-activation is R599-F6 — refuse
-    // cleanly before doing any materialize work.
-    if let workload_spec::BundleLifecycle::OnDemand { idle_ttl } = &bundle.lifecycle {
-        return err(
-            ErrorCode::BackendRefused,
-            format!(
-                "on-demand JIT bundle lifecycle (idle_ttl={}ms) is R599-F6; this kamaji serves \
-                 only keep-alive serve_bundle workloads (R599-F10)",
-                idle_ttl.as_ms()
-            ),
-        );
-    }
-
-    let Some(backend) = ctx.bundle.as_ref() else {
-        return err(
-            ErrorCode::BackendRefused,
-            format!(
-                "no bundle backend configured on this kamaji instance to serve mesofact bundle \
-                 for {} — start kamaji with a node bundle store \
-                 (ServerCtx::with_bundle_backend)",
-                id.0
-            ),
-        );
-    };
-
     // 1. Materialize the bundle tree from the node store (R599-F1). The digest is
     //    the content-address; a bad hex shape is a spec error, not a backend one.
-    let digest = match yah_mesofact_bundle::BundleHash::parse(bundle.digest.0.clone()) {
-        Ok(d) => d,
-        Err(e) => {
-            return err(
-                ErrorCode::InvalidSpec,
-                format!("bundle digest {:?} is not a valid blake3: {e}", bundle.digest.0),
-            )
-        }
-    };
+    let digest = yah_mesofact_bundle::BundleHash::parse(bundle.digest.0.clone()).map_err(|e| {
+        err(
+            ErrorCode::InvalidSpec,
+            format!("bundle digest {:?} is not a valid blake3: {e}", bundle.digest.0),
+        )
+    })?;
 
     // Cache materialize is synchronous fs + object-store I/O (a cold deploy may
     // fetch from R2). Run it on the blocking pool so the dispatch loop isn't
@@ -911,16 +1078,16 @@ async fn deploy_bundle_keepalive(
     let bundle_dir = match materialized {
         Ok(Ok(dir)) => dir,
         Ok(Err(e)) => {
-            return err(
+            return Err(err(
                 ErrorCode::BackendRefused,
                 format!("materialize bundle {}: {e}", digest.as_str()),
-            )
+            ))
         }
         Err(e) => {
-            return err(
+            return Err(err(
                 ErrorCode::Internal,
                 format!("bundle materialize task failed: {e}"),
-            )
+            ))
         }
     };
 
@@ -931,10 +1098,10 @@ async fn deploy_bundle_keepalive(
         bundle_dir.join("bins").join(&triple).join("serve")
     } else if let Some(version) = bundle.runtime.strip_prefix("mesofact/") {
         if version.is_empty() {
-            return err(
+            return Err(err(
                 ErrorCode::InvalidSpec,
                 format!("bundle runtime {:?} missing a version after 'mesofact/'", bundle.runtime),
-            );
+            ));
         }
         // Vanilla bundle resolves the stock serve runtime asset from the node
         // cache: runtimes/mesofact/<ver>/<triple>/serve.
@@ -945,16 +1112,16 @@ async fn deploy_bundle_keepalive(
             .join(&triple)
             .join("serve")
     } else {
-        return err(
+        return Err(err(
             ErrorCode::InvalidSpec,
             format!(
                 "unrecognized bundle runtime {:?} (expected \"self\" or \"mesofact/<version>\")",
                 bundle.runtime
             ),
-        );
+        ));
     };
     if !serve_bin.exists() {
-        return err(
+        return Err(err(
             ErrorCode::BackendRefused,
             format!(
                 "serve runtime asset missing at {} (triple={triple}, runtime={}): a \"self\" \
@@ -963,7 +1130,7 @@ async fn deploy_bundle_keepalive(
                 serve_bin.display(),
                 bundle.runtime
             ),
-        );
+        ));
     }
     // The serve bin must be executable to fork it. materialize_bundle writes blob
     // bytes 0644, and the stock runtime-asset fetch may not set +x either — ensure
@@ -980,14 +1147,53 @@ async fn deploy_bundle_keepalive(
             }
         }
     }
+    let _ = id;
+    Ok((bundle_dir, serve_bin))
+}
 
-    // 3. Build the native WorkloadSpec (identity image, entrypoint=[serve_bin],
-    //    command=[--bundle <dir> --listen <addr>]) and fork it. Bind to
-    //    127.0.0.1:<port>, mirroring today's ingress testbed.
+/// Keep-alive bundle deploy (R599-F10). Materialize the W272 bundle, resolve the
+/// serve binary, and fork it under the native supervisor as a resident process.
+/// See [`deploy_mesofact_bundle`] for the Drain caveat.
+#[cfg(feature = "bundle-serving")]
+async fn deploy_bundle_keepalive(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: &WorkloadId,
+    bundle: &workload_spec::MesofactServeBundle,
+) -> KamajiToYubaba {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let err = |code: ErrorCode, message: String| KamajiToYubaba::Error {
+        request_id: Some(request_id),
+        code,
+        message,
+    };
+
+    let Some(backend) = ctx.bundle.as_ref() else {
+        return err(
+            ErrorCode::BackendRefused,
+            format!(
+                "no bundle backend configured on this kamaji instance to serve mesofact bundle \
+                 for {} — start kamaji with a node bundle store \
+                 (ServerCtx::with_bundle_backend)",
+                id.0
+            ),
+        );
+    };
+
+    let (bundle_dir, serve_bin) =
+        match materialize_and_resolve_serve(backend, request_id, id, bundle).await {
+            Ok(pair) => pair,
+            Err(e) => return e,
+        };
+
+    // Build the native WorkloadSpec (identity image, entrypoint=[serve_bin],
+    // command=[--bundle <dir> --listen <addr>]) and fork it. Bind to
+    // 127.0.0.1:<port>, mirroring today's ingress testbed.
     //
-    //    FOLLOW-UP: mesh-IP-plane binding + multi-bundle-per-node needs Deploy to
-    //    carry a MeshAssignment (bind IP + per-workload port); the UDS Deploy
-    //    envelope has none today, so every bundle shares the one loopback port.
+    // FOLLOW-UP: mesh-IP-plane binding + multi-bundle-per-node needs Deploy to
+    // carry a MeshAssignment (bind IP + per-workload port); the UDS Deploy
+    // envelope has none today, so every bundle shares the one loopback port.
     let listen = format!("127.0.0.1:{}", backend.bind_port);
     let spec = bundle_workload_spec(id, &serve_bin, &bundle_dir, &listen);
     let mesh = kamaji::MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
@@ -1018,6 +1224,71 @@ async fn deploy_bundle_keepalive(
         Err(e) => err(
             ErrorCode::BackendRefused,
             format!("native fork of mesofact-serve for {} failed: {e:#}", id.0),
+        ),
+    }
+}
+
+/// On-demand (JIT) bundle deploy (R599-F6). Materialize + resolve exactly like
+/// keep-alive, then hand the workload to the [`JitRuntime`]: kamaji binds+holds
+/// the listen socket and forks the serve runtime on the first connection,
+/// reaping it after `idle_ttl`. No resident process is spawned at deploy — the
+/// Ack means "the socket is bound and armed", not "a process is running".
+///
+/// **No probe target is registered** (unlike keep-alive): a `TcpConnect` probe
+/// on a 1s interval would connect to the held socket and trigger a fork every
+/// interval, defeating the idle reap. Absence of a probe maps to `Ready`
+/// ("no probe declared ↔ trust the workload's existence"), which is the right
+/// semantics for a serverless workload that is *supposed* to be zero-resident.
+#[cfg(feature = "bundle-serving")]
+async fn deploy_bundle_on_demand(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: &WorkloadId,
+    bundle: &workload_spec::MesofactServeBundle,
+    idle_ttl: workload_spec::Millis,
+) -> KamajiToYubaba {
+    use std::net::Ipv4Addr;
+
+    let err = |code: ErrorCode, message: String| KamajiToYubaba::Error {
+        request_id: Some(request_id),
+        code,
+        message,
+    };
+
+    let Some(backend) = ctx.bundle.as_ref() else {
+        return err(
+            ErrorCode::BackendRefused,
+            format!(
+                "no bundle backend configured on this kamaji instance to serve mesofact bundle \
+                 for {} — start kamaji with a node bundle store \
+                 (ServerCtx::with_bundle_backend)",
+                id.0
+            ),
+        );
+    };
+
+    let (bundle_dir, serve_bin) =
+        match materialize_and_resolve_serve(backend, request_id, id, bundle).await {
+            Ok(pair) => pair,
+            Err(e) => return e,
+        };
+
+    // The serve runtime owns idle detection: pass `--idle-ttl <secs>` and it
+    // self-reaps. Round sub-second TTLs up to 1s — a `0` would tell the runtime
+    // to never reap, silently turning the serverless workload keep-alive.
+    let idle_ttl_secs = idle_ttl.as_ms().div_ceil(1000).max(1);
+    let listen = format!("127.0.0.1:{}", backend.bind_port);
+    let spec = bundle_workload_spec_jit(id, &serve_bin, &bundle_dir, &listen, idle_ttl_secs);
+    let mesh = kamaji::MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
+
+    match backend.jit.deploy_on_demand(&spec, &mesh, &listen).await {
+        Ok(()) => KamajiToYubaba::Ack {
+            request_id,
+            kind: kamaji_proto::AckKind::Deploy,
+        },
+        Err(e) => err(
+            ErrorCode::BackendRefused,
+            format!("on-demand bind/arm of mesofact-serve for {} failed: {e:#}", id.0),
         ),
     }
 }
@@ -1092,6 +1363,103 @@ fn bundle_workload_spec(
     }
 }
 
+/// Build the [`WorkloadSpec`](workload_spec::WorkloadSpec) the on-demand (JIT)
+/// runtime forks (R599-F6). Same shape as [`bundle_workload_spec`] plus
+/// `--idle-ttl <secs>` so the serve runtime self-reaps on idle. `--listen` is
+/// still passed as the fallback bind address, but the JIT runtime hands the
+/// process kamaji's held socket via `LISTEN_FDS`, which takes precedence in
+/// `mesofact-serve`'s `socket_activation_listener`. `restart_policy` is `Never`:
+/// the JIT supervisor — not a restart loop — owns re-forking on the next
+/// connection, and an idle self-reap is an *expected* exit, not a crash to
+/// restart.
+#[cfg(feature = "bundle-serving")]
+fn bundle_workload_spec_jit(
+    id: &WorkloadId,
+    serve_bin: &Path,
+    bundle_dir: &Path,
+    listen: &str,
+    idle_ttl_secs: u64,
+) -> workload_spec::WorkloadSpec {
+    use workload_spec::RestartPolicy;
+    let mut spec = bundle_workload_spec(id, serve_bin, bundle_dir, listen);
+    // Append the idle-ttl flag to the serve argv (command follows entrypoint).
+    if let Some(cmd) = spec.command.as_mut() {
+        cmd.push("--idle-ttl".into());
+        cmd.push(idle_ttl_secs.to_string());
+    }
+    // The JIT supervisor re-forks on demand; a self-reap must not be restarted.
+    spec.restart_policy = RestartPolicy::Never;
+    spec
+}
+
+/// How "live" a [`WorkloadEntry`] claims its workload is — the tie-breaker when
+/// two backends report the same workload id (R599-B11).
+///
+/// A row carrying a pid outranks any pid-less row: a backend that can name an
+/// actual process is authoritative over one that only knows a record exists.
+/// State breaks the remaining ties, most-alive first.
+fn liveness_rank(e: &WorkloadEntry) -> (u8, u8) {
+    use kamaji_proto::WorkloadState as WireState;
+    let state = match e.state {
+        WireState::Running => 5,
+        WireState::Starting => 4,
+        WireState::Draining => 3,
+        WireState::Pending => 2,
+        WireState::Failed => 1,
+        WireState::Exited => 0,
+        // `WorkloadState` is #[non_exhaustive]: a state added by a newer peer
+        // ranks with Pending — "a record exists, nothing more is known". It can
+        // never outrank a row that names a live pid, so an unknown state can't
+        // shadow a genuinely-running workload.
+        _ => 2,
+    };
+    (u8::from(e.pid.is_some()), state)
+}
+
+/// Collapse a merged `List` result to **exactly one row per workload id**
+/// (R599-B11), keeping the most-live row per [`liveness_rank`] and preserving
+/// first-seen order.
+///
+/// The `List` handler concatenates the in-memory registry, containerd, and both
+/// bundle runtimes. Those views are not disjoint in practice: on the ingress
+/// testbed a stale containerd container left over from the pre-bundle nginx
+/// stand-in shared the `yah-marketing` id with the live native bundle workload,
+/// and containerd reports a container with no task as `Pending`/`pid: None` —
+/// so `GET /workloads` returned both, with the *phantom* sorting first and
+/// carrying a null pid. Anything taking the first match read the workload as
+/// not-yet-started.
+///
+/// Deliberately a dedupe and not a source-priority rule: whichever backend can
+/// point at a running process wins, so this stays correct regardless of which
+/// runtimes are compiled in or which order the merges run.
+fn dedupe_workload_entries(entries: Vec<WorkloadEntry>) -> Vec<WorkloadEntry> {
+    let mut out: Vec<WorkloadEntry> = Vec::with_capacity(entries.len());
+    for e in entries {
+        // Linear scan: a node supervises tens of workloads, not thousands, and
+        // this keeps first-seen order without a second index.
+        match out.iter_mut().find(|kept| kept.id == e.id) {
+            Some(kept) => {
+                // Collapsing is the right wire answer, but a duplicate id means
+                // two backends genuinely both hold a record — usually a stale
+                // container/process the operator still needs to reap. Say so,
+                // so the fix reports the condition instead of hiding it.
+                warn!(
+                    id = %e.id.0,
+                    kept_state = ?kept.state, kept_pid = ?kept.pid,
+                    other_state = ?e.state, other_pid = ?e.pid,
+                    "duplicate workload id across backends — collapsing to the \
+                     most-live row; the losing row is likely a stale record"
+                );
+                if liveness_rank(&e) > liveness_rank(kept) {
+                    *kept = e;
+                }
+            }
+            None => out.push(e),
+        }
+    }
+    out
+}
+
 /// Map a native [`kamaji::WorkloadState`] into the wire [`WorkloadEntry`] the
 /// `List` RPC returns (R599-F10). `container_id` is `"native-<pid>"`; a `0` pid
 /// means no child is currently running (parked between exits).
@@ -1107,9 +1475,12 @@ fn bundle_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
         WorkloadStatus::Restarting { .. } => WireState::Starting,
         WorkloadStatus::Failed { .. } => WireState::Failed,
     };
+    // container_id is `native-<pid>` (keep-alive) or `jit-<pid>` (on-demand); a
+    // `0` pid means no child is currently running (parked, or idle for JIT).
     let pid = s
         .container_id
         .strip_prefix("native-")
+        .or_else(|| s.container_id.strip_prefix("jit-"))
         .and_then(|p| p.parse::<u32>().ok())
         .filter(|p| *p != 0);
     WorkloadEntry {
@@ -1117,6 +1488,41 @@ fn bundle_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
         state,
         pid,
         mesh_ident: Some(s.ident.0),
+    }
+}
+
+/// Render a docker workload as a wire [`WorkloadEntry`] (R626-F1).
+///
+/// Unlike the bundle backend — whose `container_id` encodes the pid as
+/// `native-<pid>` — docker carries the real container id, and the pid arrives
+/// alongside it in [`DockerWorkload`].
+///
+/// `id` is the **workload id** (`yah.workload_id` label) and `mesh_ident` the
+/// mesh identity (`yah.ident`), which differ for forge runs (R590-B9). This
+/// matches the containerd backend's split — `id` is the deploy/stop key,
+/// `mesh_ident` the handle yubaba's HTTP surface polls — and it is what makes
+/// the cross-backend dedupe key comparable between the two.
+///
+/// [`DockerWorkload`]: kamaji::docker::DockerWorkload
+#[cfg(feature = "docker-integration")]
+fn docker_workload_to_entry(w: kamaji::docker::DockerWorkload) -> WorkloadEntry {
+    use kamaji::WorkloadStatus;
+    use kamaji_proto::WorkloadState as WireState;
+    let state = match &w.state.status {
+        WorkloadStatus::Pending => WireState::Pending,
+        WorkloadStatus::Running => WireState::Running,
+        WorkloadStatus::Stopping => WireState::Draining,
+        WorkloadStatus::Stopped => WireState::Exited,
+        // Docker's own restart-policy engine is re-launching the container —
+        // it is coming up, not down. Matches the bundle mapping.
+        WorkloadStatus::Restarting { .. } => WireState::Starting,
+        WorkloadStatus::Failed { .. } => WireState::Failed,
+    };
+    WorkloadEntry {
+        id: WorkloadId(w.workload_id),
+        state,
+        pid: w.pid,
+        mesh_ident: Some(w.state.ident.0),
     }
 }
 
@@ -1217,6 +1623,9 @@ async fn stop_workload(
     #[cfg(feature = "bundle-serving")]
     if let Some(backend) = &ctx.bundle {
         let ident = workload_spec::MeshIdent(id.0.clone());
+        // Both runtimes' teardown is idempotent (Ok when the ident is absent), so
+        // routing every Stop to both — even a non-bundle one — is safe and keeps
+        // Stop's idempotent contract. A given identity lives in at most one.
         if let Err(e) = backend.native.teardown_workload(&ident).await {
             return KamajiToYubaba::Error {
                 request_id: Some(request_id),
@@ -1224,7 +1633,32 @@ async fn stop_workload(
                 message: format!("bundle teardown: {e}"),
             };
         }
+        if let Err(e) = backend.jit.teardown_workload(&ident).await {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!("on-demand bundle teardown: {e}"),
+            };
+        }
         ctx.registry.lock().await.remove_probe(&id);
+    }
+    // Route teardown to the docker backend (R626-F1). `teardown_workload`
+    // swallows "no such container", so routing every Stop to it — including
+    // one for a workload docker never owned — is safe, exactly like the
+    // containerd and bundle arms above.
+    #[cfg(feature = "docker-integration")]
+    if let Some(docker) = &ctx.docker {
+        // Resolve by workload id OR mesh identity: docker NAMES containers by
+        // mesh identity, but a Stop carries the id, and the two differ for forge
+        // runs (R590-B9). Keying only on the id would make Stop a silent no-op
+        // that Acks while the container keeps running.
+        if let Err(e) = docker.teardown_by_key(&id.0).await {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!("docker teardown: {e:#}"),
+            };
+        }
     }
     KamajiToYubaba::Ack {
         request_id,
@@ -1285,7 +1719,10 @@ fn drain_outcome_to_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kamaji_proto::{AckKind, DrainBudget, ExitStatus, RequestId, WorkloadId};
+    use kamaji_proto::{
+        AckKind, DrainBudget, ExitStatus, RequestId, WorkloadId,
+        WorkloadState as WireWorkloadState,
+    };
 
     #[tokio::test]
     async fn hello_with_current_version_returns_welcome() {
@@ -1329,6 +1766,99 @@ mod tests {
             }
             other => panic!("expected WorkloadList, got {other:?}"),
         }
+    }
+
+    /// R599-B11: the exact live shape observed on east 2026-07-21 — a stale
+    /// containerd container (no task → `Pending`, null pid, no mesh-ident label)
+    /// sharing an id with the live native bundle workload. The merged List must
+    /// emit ONE row, and it must be the running one.
+    #[test]
+    fn dedupe_collapses_stale_pending_row_onto_the_running_one() {
+        let entries = vec![
+            // The phantom, as containerd's list() renders it — and it sorts first.
+            WorkloadEntry {
+                id: WorkloadId::new("yah-marketing"),
+                state: WireWorkloadState::Pending,
+                pid: None,
+                mesh_ident: None,
+            },
+            // The truth, as the native bundle runtime renders it.
+            WorkloadEntry {
+                id: WorkloadId::new("yah-marketing"),
+                state: WireWorkloadState::Running,
+                pid: Some(67749),
+                mesh_ident: Some("yah-marketing".into()),
+            },
+        ];
+        let out = dedupe_workload_entries(entries);
+        assert_eq!(out.len(), 1, "one row per workload id, got {out:?}");
+        assert_eq!(out[0].state, WireWorkloadState::Running);
+        assert_eq!(out[0].pid, Some(67749));
+        assert_eq!(out[0].mesh_ident.as_deref(), Some("yah-marketing"));
+    }
+
+    /// The winning row must be picked regardless of which order the backend
+    /// merges happened to run in — the rule is liveness, not source priority.
+    #[test]
+    fn dedupe_is_order_independent() {
+        let running = WorkloadEntry {
+            id: WorkloadId::new("w"),
+            state: WireWorkloadState::Running,
+            pid: Some(42),
+            mesh_ident: Some("w".into()),
+        };
+        let pending = WorkloadEntry {
+            id: WorkloadId::new("w"),
+            state: WireWorkloadState::Pending,
+            pid: None,
+            mesh_ident: None,
+        };
+        for entries in [
+            vec![pending.clone(), running.clone()],
+            vec![running.clone(), pending.clone()],
+        ] {
+            let out = dedupe_workload_entries(entries);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0], running, "liveness must win either way");
+        }
+    }
+
+    /// Dedupe must not collapse genuinely distinct workloads, and must preserve
+    /// the order they were merged in.
+    #[test]
+    fn dedupe_preserves_distinct_ids_and_order() {
+        let mk = |id: &str, pid| WorkloadEntry {
+            id: WorkloadId::new(id),
+            state: WireWorkloadState::Running,
+            pid: Some(pid),
+            mesh_ident: Some(id.into()),
+        };
+        let out = dedupe_workload_entries(vec![mk("a", 1), mk("b", 2), mk("c", 3)]);
+        assert_eq!(out.len(), 3);
+        let ids: Vec<_> = out.iter().map(|e| e.id.0.clone()).collect();
+        assert_eq!(ids, ["a", "b", "c"], "first-seen order preserved");
+    }
+
+    /// Two pid-less rows for one id still collapse, keeping the more-alive
+    /// state — a workload must never appear twice on the wire.
+    #[test]
+    fn dedupe_breaks_pidless_ties_on_state() {
+        let out = dedupe_workload_entries(vec![
+            WorkloadEntry {
+                id: WorkloadId::new("w"),
+                state: WireWorkloadState::Exited,
+                pid: None,
+                mesh_ident: None,
+            },
+            WorkloadEntry {
+                id: WorkloadId::new("w"),
+                state: WireWorkloadState::Starting,
+                pid: None,
+                mesh_ident: None,
+            },
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state, WireWorkloadState::Starting);
     }
 
     #[tokio::test]
@@ -1526,6 +2056,85 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// R626-F1: with the docker feature compiled in but no daemon attached to
+    /// ServerCtx, a Container deploy must say *which* backend is missing and
+    /// how to get it — a rebuild and a restart-with-flags are different fixes.
+    #[cfg(feature = "docker-integration")]
+    #[tokio::test]
+    async fn deploy_container_without_attached_docker_says_so() {
+        let ctx = Arc::new(ServerCtx::new());
+        let spec = workload_spec::Workload::Container(make_minimal_container_spec("svc"));
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(21),
+                id: WorkloadId::new("svc"),
+                spec,
+            },
+            &ctx,
+        )
+        .await;
+        match reply {
+            KamajiToYubaba::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                assert_eq!(request_id, Some(RequestId(21)));
+                assert_eq!(code, ErrorCode::BackendRefused);
+                assert!(message.contains("--docker"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A docker workload renders with the workload id as `id` and the mesh
+    /// identity as `mesh_ident` — the R590-B9 split the containerd backend also
+    /// uses, so the two backends' rows are comparable in the List dedupe.
+    #[cfg(feature = "docker-integration")]
+    #[test]
+    fn docker_entry_splits_workload_id_from_mesh_ident() {
+        let w = kamaji::docker::DockerWorkload {
+            state: kamaji::WorkloadState {
+                ident: workload_spec::MeshIdent("forge.abc".into()),
+                container_id: "deadbeef".into(),
+                status: kamaji::WorkloadStatus::Running,
+                mesh_ip: None,
+            },
+            pid: Some(4242),
+            workload_id: "forge-abc".into(),
+        };
+        let entry = docker_workload_to_entry(w);
+        assert_eq!(entry.id, WorkloadId::new("forge-abc"));
+        assert_eq!(entry.mesh_ident.as_deref(), Some("forge.abc"));
+        assert_eq!(entry.pid, Some(4242));
+        assert_eq!(entry.state, kamaji_proto::WorkloadState::Running);
+    }
+
+    /// Docker's restart-policy engine re-launching a container means it is
+    /// coming UP, so the wire state is `Starting`, not `Failed` — a supervisor
+    /// that read it as failed would tear down a container that is recovering.
+    #[cfg(feature = "docker-integration")]
+    #[test]
+    fn docker_restarting_renders_as_starting_with_no_pid() {
+        let w = kamaji::docker::DockerWorkload {
+            state: kamaji::WorkloadState {
+                ident: workload_spec::MeshIdent("svc".into()),
+                container_id: "deadbeef".into(),
+                status: kamaji::WorkloadStatus::Restarting {
+                    last_exit_code: 2,
+                    restart_count: 9,
+                    last_finished_at_unix_ms: 1,
+                },
+                mesh_ip: None,
+            },
+            pid: None,
+            workload_id: "svc".into(),
+        };
+        let entry = docker_workload_to_entry(w);
+        assert_eq!(entry.state, kamaji_proto::WorkloadState::Starting);
+        assert_eq!(entry.pid, None);
     }
 
     fn make_minimal_container_spec(name: &str) -> workload_spec::WorkloadSpec {
@@ -1902,16 +2511,19 @@ mod tests {
             .await;
         }
 
-        /// (b) An OnDemand serve_bundle deploy still refuses with the R599-F6
-        /// message — JIT is out of F10 scope.
+        /// (b) An OnDemand serve_bundle deploy binds+arms the JIT runtime (R599-F6):
+        /// it Acks (no process forked yet — lazy), the workload appears in List as
+        /// idle (Pending, no resident pid), and Stop releases it. Uses an ephemeral
+        /// bind port so the test never contends on the default 8080.
         #[tokio::test]
-        async fn ondemand_deploy_refuses_as_r599_f6() {
+        async fn ondemand_deploy_binds_and_appears_in_list_idle() {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
             let digest = publish_self_bundle(store.as_ref(), true);
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             let reply = handle_message(
@@ -1929,20 +2541,43 @@ mod tests {
             )
             .await;
             match reply {
-                KamajiToYubaba::Error {
-                    request_id,
-                    code,
-                    message,
-                } => {
-                    assert_eq!(request_id, Some(RequestId(111)));
-                    assert_eq!(code, ErrorCode::BackendRefused, "got: {message}");
-                    assert!(
-                        message.contains("R599-F6") && message.contains("on-demand"),
-                        "got: {message}"
-                    );
+                KamajiToYubaba::Ack { request_id, kind } => {
+                    assert_eq!(request_id, RequestId(111));
+                    assert_eq!(kind, kamaji_proto::AckKind::Deploy);
                 }
-                other => panic!("expected Error(BackendRefused), got {other:?}"),
+                other => panic!("expected Ack (bound+armed), got {other:?}"),
             }
+
+            // The armed on-demand workload appears in List as idle: present, but
+            // Pending with no resident pid (zero-resident until first connection).
+            let list = handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(112),
+                },
+                &ctx,
+            )
+            .await;
+            match list {
+                KamajiToYubaba::WorkloadList { entries, .. } => {
+                    let e = entries
+                        .iter()
+                        .find(|e| e.id == WorkloadId::new("yah-marketing"))
+                        .unwrap_or_else(|| panic!("on-demand workload should appear in List, got {entries:?}"));
+                    assert_eq!(e.state, kamaji_proto::WorkloadState::Pending, "idle ⇒ Pending");
+                    assert_eq!(e.pid, None, "no resident pid while idle");
+                }
+                other => panic!("expected WorkloadList, got {other:?}"),
+            }
+
+            // Stop releases the held socket and drops the workload.
+            let _ = handle_message(
+                YubabaToKamaji::Stop {
+                    request_id: RequestId(113),
+                    id: WorkloadId::new("yah-marketing"),
+                },
+                &ctx,
+            )
+            .await;
         }
 
         /// (c) A KeepAlive deploy whose bundle lacks the serve runtime asset
