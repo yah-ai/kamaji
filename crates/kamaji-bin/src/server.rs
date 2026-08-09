@@ -145,7 +145,11 @@ use crate::probe::{run_probe, ProbeTarget};
 // The `Kamaji` trait brings deploy/list/teardown into scope for the
 // kamaji-crate backends: the NativeRuntime behind the bundle backend (R599-F10)
 // and the DockerRuntime behind the docker backend (R626-F1).
-#[cfg(any(feature = "bundle-serving", feature = "docker-integration"))]
+#[cfg(any(
+    feature = "bundle-serving",
+    feature = "docker-integration",
+    feature = "native-exec"
+))]
 use kamaji::Kamaji as _;
 #[cfg(feature = "bundle-serving")]
 use std::path::PathBuf;
@@ -225,6 +229,19 @@ pub struct ServerCtx {
     /// runtime is a single `String`.
     #[cfg(feature = "docker-integration")]
     pub docker: Option<kamaji::docker::DockerRuntime>,
+    /// Optional native fork+exec backend for **container-shaped** workloads
+    /// that cannot run in a container (R577-T1 / W254). `None` outside the
+    /// `native-exec` feature build, or when kamaji is started without
+    /// `--native-exec-dir`.
+    ///
+    /// This is deliberately a separate field from [`BundleBackend::native`],
+    /// even though both are a `NativeRuntime`: that one is the single owner of
+    /// each *served mesofact bundle's* process and keys on bundle identities,
+    /// while this one owns forge jobs. Sharing one runtime would put two
+    /// unrelated identity spaces in the same map, and a bundle-serving build is
+    /// not the same deployment as a Darwin build-worker.
+    #[cfg(feature = "native-exec")]
+    pub native: Option<Arc<kamaji::native::NativeRuntime>>,
 }
 
 /// The node bundle backend: materialize a W272 bundle from the node store and
@@ -264,10 +281,13 @@ pub struct BundleBackend {
     /// no in-memory state beyond root+budget — recency is on-disk), so the
     /// blocking materialize never parks the async dispatch loop.
     pub cache_budget: u64,
-    /// Loopback port each served bundle binds (`127.0.0.1:<port>`). Testbed
-    /// convention (passway → 127.0.0.1:8080). Overridable via
-    /// `KAMAJI_BUNDLE_PORT`. See the mesh-plane follow-up note in
-    /// [`deploy_mesofact_bundle`].
+    /// **Fallback** port for a bundle that declares none — the node-wide
+    /// default, overridable via `KAMAJI_BUNDLE_PORT`. Testbed convention
+    /// (passway → 8080).
+    ///
+    /// R599-F12 demoted this from *the* port to the fallback: a bundle now
+    /// carries its own `serve_bundle.port`, and while every bundle shared this
+    /// one value a node could host exactly one of them.
     pub bind_port: u16,
 }
 
@@ -296,8 +316,9 @@ impl BundleBackend {
         }
     }
 
-    /// Override the loopback port served bundles bind. An explicit operator
-    /// flag wins over the `KAMAJI_BUNDLE_PORT` env default picked in [`new`].
+    /// Override the node-wide fallback port. An explicit operator flag wins
+    /// over the `KAMAJI_BUNDLE_PORT` env default picked in [`new`]. A bundle
+    /// that declares its own `serve_bundle.port` wins over both (R599-F12).
     ///
     /// [`new`]: BundleBackend::new
     pub fn with_bind_port(mut self, port: u16) -> Self {
@@ -312,9 +333,9 @@ impl BundleBackend {
     }
 }
 
-/// Default loopback port a served bundle binds when no `KAMAJI_BUNDLE_PORT` is
-/// set (R599-F10). Mirrors the 2026-07-06 ingress testbed (passway →
-/// 127.0.0.1:8080).
+/// Node-wide fallback port for a bundle that declares no `serve_bundle.port`
+/// (R599-F10; demoted to a fallback by R599-F12). Mirrors the 2026-07-06
+/// ingress testbed (passway → :8080).
 #[cfg(feature = "bundle-serving")]
 pub const DEFAULT_BUNDLE_PORT: u16 = 8080;
 
@@ -357,6 +378,8 @@ impl ServerCtx {
             bundle: None,
             #[cfg(feature = "docker-integration")]
             docker: None,
+            #[cfg(feature = "native-exec")]
+            native: None,
         }
     }
 
@@ -372,6 +395,8 @@ impl ServerCtx {
             bundle: None,
             #[cfg(feature = "docker-integration")]
             docker: None,
+            #[cfg(feature = "native-exec")]
+            native: None,
         }
     }
 
@@ -412,6 +437,16 @@ impl ServerCtx {
     #[cfg(feature = "docker-integration")]
     pub fn with_docker(mut self, backend: kamaji::docker::DockerRuntime) -> Self {
         self.docker = Some(backend);
+        self
+    }
+
+    /// Attach the native fork+exec backend for native-marked container
+    /// workloads (R577-T1). Only available with the `native-exec` feature; the
+    /// binary calls this in `main.rs` when the operator passed
+    /// `--native-exec-dir`.
+    #[cfg(feature = "native-exec")]
+    pub fn with_native_exec(mut self, backend: Arc<kamaji::native::NativeRuntime>) -> Self {
+        self.native = Some(backend);
         self
     }
 }
@@ -786,7 +821,14 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             request_id,
             id,
             spec,
-        } => deploy_workload(ctx, request_id, id, spec).await,
+            mesh,
+        } => {
+            // R599-F12. The wire assignment stays in its wire type until it
+            // reaches a backend arm: `kamaji` (which owns the runtime type) is
+            // an *optional* dep here, so a default build has no runtime
+            // `MeshAssignment` to convert into. `None` = no mesh IP plane.
+            deploy_workload(ctx, request_id, id, spec, mesh.as_ref()).await
+        }
         YubabaToKamaji::GracefulUpgrade {
             request_id,
             id,
@@ -816,30 +858,49 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
     }
 }
 
-/// Dispatch a `Deploy { id, spec }` to the right backend. R406-T9 wires
+/// Dispatch a `Deploy { id, spec, mesh }` to the right backend. R406-T9 wires
 /// `Workload::Container` to the containerd backend. R599-F4 admits a
 /// `MesofactStatic` workload that carries a `serve_bundle` (a deployed W272
 /// bundle) and routes it to the native backend via [`deploy_mesofact_bundle`];
 /// a build-and-publish-only `MesofactStatic` (no `serve_bundle`), `Almanac`, and
 /// `StaticAsset` remain yubaba's reconcilers' business and surface as
 /// `InvalidSpec` if they reach Kamaji.
+///
+/// `mesh` is the workload's mesh-plane placement (R599-F12), threaded here at
+/// the *envelope* rather than per backend: every backend needs the same answer
+/// to "what address does this workload live at", and the two that had grown
+/// their own `MeshAssignment::inlined(127.0.0.1)` stand-in had each recorded
+/// the same follow-up.
 #[allow(unused_variables)]
 async fn deploy_workload(
     ctx: &Arc<ServerCtx>,
     request_id: kamaji_proto::RequestId,
     id: WorkloadId,
     spec: workload_spec::Workload,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
     match spec {
         workload_spec::Workload::Container(spec) => {
-            deploy_container(ctx, request_id, &id, &spec).await
+            deploy_container(ctx, request_id, &id, &spec, mesh).await
         }
         // R599-F4: a mesofact-static workload that carries a `serve_bundle` is a
         // deployed W272 bundle kamaji serves via its native backend — no longer
         // rejected. The build-and-publish-only form (no serve_bundle) still
         // belongs to yubaba's mesofact-static reconciler.
         workload_spec::Workload::MesofactStatic(w) => match w.serve_bundle {
-            Some(bundle) => deploy_mesofact_bundle(ctx, request_id, &id, &bundle).await,
+            // `w.serve_bundle` is moved out by this arm; `w.revalidate_receiver`
+            // is a disjoint field, so borrowing it after is a legal partial move.
+            Some(bundle) => {
+                deploy_mesofact_bundle(
+                    ctx,
+                    request_id,
+                    &id,
+                    &bundle,
+                    w.revalidate_receiver.as_ref(),
+                    mesh,
+                )
+                .await
+            }
             None => KamajiToYubaba::Error {
                 request_id: Some(request_id),
                 code: ErrorCode::InvalidSpec,
@@ -862,27 +923,44 @@ async fn deploy_workload(
     }
 }
 
-/// Dispatch a `Workload::Container` to whichever container backend this build
-/// has configured.
+/// Dispatch a `Workload::Container` to whichever backend this build has
+/// configured.
 ///
-/// Two backends can serve a container, matching the two tiers kamaji runs on:
+/// Three backends can serve a container-shaped workload:
 ///
 /// - **containerd** (R406-T9, `containerd-integration`) — the cloud tier.
 /// - **docker/OrbStack** (R626-F1, `docker-integration`) — pond and dev hosts,
 ///   where the daemon speaks the Docker API rather than containerd's gRPC.
+/// - **native fork+exec** (R577-T1, `native-exec`) — checked *first*, and only
+///   for a spec carrying [`WorkloadSpec::wants_native_exec`].
 ///
-/// When both are configured containerd wins: a node with a containerd socket is
-/// a fleet node, and its docker daemon (if any) belongs to a developer, not to
-/// the fleet. When neither is, the deploy reports a `BackendRefused` naming what
-/// this specific build is missing — feature not compiled in vs compiled but
-/// unconfigured — so an operator can tell a rebuild from a restart-with-flags.
+/// The native check comes first because it is not a fallback: a workload that
+/// asks for native execution is one that *cannot* run in a container. The W254
+/// Darwin build leg is the case — `cargo tauri build` for
+/// `aarch64-apple-darwin`, `codesign` and `xcrun notarytool` need a live macOS
+/// userland, and the container a build-worker can offer is always a Linux
+/// container. Silently falling through to docker there would not degrade the
+/// build, it would run it against the wrong operating system. So an unsatisfied
+/// native request refuses rather than falls back.
+///
+/// Between the two *container* backends, containerd wins when both are
+/// configured: a node with a containerd socket is a fleet node, and its docker
+/// daemon (if any) belongs to a developer, not to the fleet. When neither is,
+/// the deploy reports a `BackendRefused` naming what this specific build is
+/// missing — feature not compiled in vs compiled but unconfigured — so an
+/// operator can tell a rebuild from a restart-with-flags.
 #[allow(unused_variables)]
 async fn deploy_container(
     ctx: &Arc<ServerCtx>,
     request_id: kamaji_proto::RequestId,
     id: &WorkloadId,
     spec: &workload_spec::WorkloadSpec,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
+    if spec.wants_native_exec() {
+        return deploy_native_exec(ctx, request_id, id, spec, mesh).await;
+    }
+
     #[cfg(feature = "containerd-integration")]
     if let Some(backend) = ctx.containerd.clone() {
         return match backend.deploy(id, spec).await {
@@ -905,13 +983,13 @@ async fn deploy_container(
 
     #[cfg(feature = "docker-integration")]
     if let Some(docker) = ctx.docker.clone() {
-        // The UDS `Deploy` carries no `MeshAssignment` (the same gap R599-F10
-        // recorded for bundle workloads), and the docker backend uses one only
-        // to stamp the `yah.mesh_ip` label and the `YAH_MESH_IP` env var. Pass
-        // the inlined loopback sentinel: on pond there is no mesh IP plane, and
-        // inventing a fake routable address would be a worse lie than loopback.
-        // Threading a real assignment through Deploy is the follow-up.
-        let mesh = kamaji::MeshAssignment::inlined(std::net::Ipv4Addr::LOCALHOST);
+        // R599-F12: the `Deploy` now carries the assignment, so the docker
+        // backend stamps the `yah.mesh_ip` label and `YAH_MESH_IP` env with the
+        // address yubaba actually admitted the workload at. On pond — where
+        // there is no mesh IP plane at all — yubaba sends none and we keep the
+        // loopback sentinel, since inventing a routable address there would be
+        // a worse lie than loopback.
+        let mesh = runtime_mesh(mesh);
         return match docker.deploy_workload(spec, &mesh).await {
             Ok(result) => {
                 info!(
@@ -934,6 +1012,214 @@ async fn deploy_container(
     }
 
     no_container_backend_error(request_id)
+}
+
+/// Run a native-marked container workload on the node's own userland
+/// (R577-T1 / W254) — the fork+exec half of [`deploy_container`].
+///
+/// The spec reaching here is an ordinary [`workload_spec::WorkloadSpec`]; only
+/// its [`NATIVE_EXEC_ANNOTATION`](workload_spec::NATIVE_EXEC_ANNOTATION) marks
+/// it. `NativeRuntime` treats `image` as identity metadata (nothing is pulled)
+/// and resolves argv from `entrypoint` + `command` with container semantics, so
+/// the same spec shape drives both paths.
+///
+/// `volumes` are inert here: a fork+exec'd process has no mount namespace. The
+/// dispatcher compensates by pointing `workdir` and `YAH_PRODUCED_DIR` at the
+/// real host path (see `velveteen_exec::remote::mark_native_exec`), which
+/// yubaba has already created from that same volume entry before this deploy
+/// arrives.
+#[allow(unused_variables)]
+async fn deploy_native_exec(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: &WorkloadId,
+    spec: &workload_spec::WorkloadSpec,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
+) -> KamajiToYubaba {
+    if let Err(message) = validate_native_exec_spec(spec) {
+        return KamajiToYubaba::Error {
+            request_id: Some(request_id),
+            code: ErrorCode::InvalidSpec,
+            message,
+        };
+    }
+
+    #[cfg(feature = "native-exec")]
+    if let Some(native) = ctx.native.clone() {
+        let mesh = runtime_mesh(mesh);
+        return match native.deploy_workload(spec, &mesh).await {
+            Ok(result) => {
+                info!(
+                    id = %id.0,
+                    pid = result.task_pid,
+                    "native workload forked"
+                );
+                KamajiToYubaba::Ack {
+                    request_id,
+                    kind: kamaji_proto::AckKind::Deploy,
+                }
+            }
+            Err(e) => KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!("native exec: {e:#}"),
+            },
+        };
+    }
+
+    // Deliberately NOT a fallback to a container backend — see
+    // [`deploy_container`]'s doc comment. A Darwin build handed to a Linux
+    // container is a wrong answer, not a degraded one.
+    #[cfg(feature = "native-exec")]
+    let reason = "native backend not configured — start kamaji with --native-exec-dir";
+    #[cfg(not(feature = "native-exec"))]
+    let reason = "kamaji built without the native-exec feature";
+
+    KamajiToYubaba::Error {
+        request_id: Some(request_id),
+        code: ErrorCode::BackendRefused,
+        message: format!(
+            "workload requests native host execution ({}={}) but no native backend is \
+             available ({reason}); refusing rather than falling back to a container, which \
+             would run the job against the wrong operating system (R577-T1)",
+            workload_spec::NATIVE_EXEC_ANNOTATION,
+            workload_spec::NATIVE_EXEC_VALUE,
+        ),
+    }
+}
+
+/// Admission floor for a native-exec workload (R577-T1), returning the operator
+/// message on refusal.
+///
+/// The containerd path has `containerd::validate_spec_for_constable`; this is
+/// its counterpart for the native path, which never goes through that function
+/// (and is compiled out entirely in a build without `containerd-integration`).
+/// Both checks below exist in the containerd version too — they matter *more*
+/// here, because a native workload has no sandbox to fall back on.
+fn validate_native_exec_spec(spec: &workload_spec::WorkloadSpec) -> Result<(), String> {
+    // Native exec is the widest escape hatch kamaji has: no netns, no cgroup,
+    // no capability drop, no rootfs — argv runs as the kamaji user on the host.
+    // Host networking and the nested-sandbox grant are both gated to tier=infra
+    // for strictly weaker reasons (see `validate_spec_for_constable`), so this
+    // gets the same gate. Forge workloads are tier=infra by construction, so
+    // this costs the Darwin build leg nothing.
+    if spec.tier.0 != "infra" {
+        return Err(format!(
+            "workload requests native host execution (annotation {}={}) but tier is {:?}; \
+             native execution runs argv on the host with no sandbox and is only permitted \
+             for tier=\"infra\" (R577-T1)",
+            workload_spec::NATIVE_EXEC_ANNOTATION,
+            workload_spec::NATIVE_EXEC_VALUE,
+            spec.tier.0,
+        ));
+    }
+
+    // The native backend spawns only `EnvValue::Literal` vars and *silently
+    // skips* the rest. An unresolved secret would therefore not fail the
+    // deploy — it would run the build with the variable simply absent, and a
+    // `codesign` that finds no identity fails somewhere far from the cause.
+    // Resolving these is yubaba's job; reaching kamaji unresolved is a bug in
+    // its admission layer, and this says so instead of absorbing it.
+    for env in &spec.env {
+        match &env.value {
+            workload_spec::EnvValue::Literal { .. } => {}
+            workload_spec::EnvValue::FromSecret { secret, .. } => {
+                return Err(format!(
+                    "env {} carries an unresolved FromSecret({secret}) — yubaba must resolve \
+                     before Deploy; the native backend would drop it silently",
+                    env.name
+                ));
+            }
+            workload_spec::EnvValue::FromMesh { ident, .. } => {
+                return Err(format!(
+                    "env {} carries an unresolved FromMesh({}) — yubaba must resolve before \
+                     Deploy; the native backend would drop it silently",
+                    env.name, ident.0
+                ));
+            }
+        }
+    }
+
+    // The nested-sandbox grant (R636-B2) and native exec are mutually
+    // exclusive at dispatch even though they are independent annotations on
+    // the spec. That grant is a *container* capability set — CAP_SETUID +
+    // CAP_SETGID and `no_new_privs` off, applied while building the OCI spec —
+    // and a native workload has no OCI spec to apply it to. Routing on the
+    // native marker first (see `deploy_container`) would therefore accept a
+    // spec asking for widened privileges and ignore the request entirely.
+    //
+    // Silently ignoring a security-relevant annotation is the wrong failure
+    // mode in both directions: an operator reading the spec would believe the
+    // grant applied, and a future reader could "fix" the omission by wiring
+    // capabilities into a path that has no sandbox to widen in the first
+    // place. Today's only setter of the grant is `build_image_workload_spec`,
+    // which the dispatcher already refuses to send native — but kamaji takes
+    // this off the wire and must not infer its input from what one dispatcher
+    // happens to emit.
+    if spec.wants_nested_sandbox() {
+        return Err(format!(
+            "workload requests both native host execution ({}={}) and the nested-sandbox \
+             grant ({}={}); these are mutually exclusive — the grant widens a container's \
+             capability set and native execution has no container. Drop one (R577-T1 / R636-B2)",
+            workload_spec::NATIVE_EXEC_ANNOTATION,
+            workload_spec::NATIVE_EXEC_VALUE,
+            workload_spec::NESTED_SANDBOX_ANNOTATION,
+            workload_spec::NESTED_SANDBOX_VALUE,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Wire assignment → the runtime [`kamaji::MeshAssignment`] the backends take
+/// (R599-F12), with the loopback sentinel standing in for "no mesh plane".
+///
+/// The two types are deliberately distinct — the wire one is a cross-binary
+/// contract — so this is the single conversion point in the daemon. It is
+/// cfg-gated because `kamaji` is an *optional* dependency here: a default build
+/// carries no backend and therefore no runtime type to convert into.
+#[cfg(any(
+    feature = "docker-integration",
+    feature = "bundle-serving",
+    feature = "native-exec"
+))]
+fn runtime_mesh(mesh: Option<&kamaji_proto::MeshAssignment>) -> kamaji::MeshAssignment {
+    let Some(mesh) = mesh else {
+        return kamaji::MeshAssignment::inlined(std::net::Ipv4Addr::LOCALHOST);
+    };
+    kamaji::MeshAssignment {
+        mesh_ip: mesh.mesh_ip,
+        wg_private_key: mesh.wg_private_key.clone(),
+        wg_listen_port: mesh.wg_listen_port,
+        peers: mesh
+            .peers
+            .iter()
+            .map(|p| kamaji::WireguardPeer {
+                public_key: p.public_key.clone(),
+                endpoint: p.endpoint,
+                allowed_ips: p.allowed_ips.clone(),
+            })
+            .collect(),
+        netns_name: mesh.netns_name.clone(),
+    }
+}
+
+/// The address a **natively forked** workload must bind (R599-F12).
+///
+/// This is the half of the mesh gap that actually moves bytes. A native
+/// workload is a plain host process — no netns, no per-workload interface — so
+/// the address it binds has to be one that already exists on this node. When
+/// yubaba sends an assignment it is sending exactly that (its own node mesh
+/// address); with none, loopback, which is the pre-R599-F12 behaviour and the
+/// only correct answer on a node with no mesh plane.
+///
+/// Binding the mesh address rather than loopback is what makes the workload
+/// reachable *from another node*, which is what lets an ingress proxy stop
+/// having to be co-located with the thing it fronts (W267).
+#[cfg(feature = "bundle-serving")]
+fn native_bind_ip(mesh: Option<&kamaji_proto::MeshAssignment>) -> std::net::Ipv4Addr {
+    mesh.map(|m| m.mesh_ip)
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST)
 }
 
 /// The `BackendRefused` a `Deploy { Container }` gets when no container backend
@@ -975,8 +1261,12 @@ fn no_container_backend_error(request_id: kamaji_proto::RequestId) -> KamajiToYu
 /// (self → `<dir>/bins/<triple>/serve`, `mesofact/<ver>` →
 /// `<cache>/runtimes/<runtime>/<triple>/serve`):
 /// - **KeepAlive** ([`deploy_bundle_keepalive`], R599-F10) forks
-///   `mesofact-serve --bundle <dir> --listen 127.0.0.1:<port>` as a resident
-///   process under the native supervisor.
+///   `mesofact-serve --bundle <dir> --listen <addr>` as a resident process
+///   under the native supervisor.
+///
+/// Both resolve `<addr>` the same way (R599-F12): the `mesh` assignment's IP
+/// when yubaba sent one, loopback when it did not, paired with the workload's
+/// own `serve_bundle.port` or the node-wide fallback.
 /// - **OnDemand** ([`deploy_bundle_on_demand`], R599-F6) binds+holds the listen
 ///   socket in the [`JitRuntime`] and forks the serve runtime on the first
 ///   connection (`--idle-ttl <secs>`, socket activation), reaping it when idle.
@@ -999,6 +1289,8 @@ async fn deploy_mesofact_bundle(
     request_id: kamaji_proto::RequestId,
     id: &WorkloadId,
     bundle: &workload_spec::MesofactServeBundle,
+    revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
     #[cfg(feature = "bundle-serving")]
     {
@@ -1007,17 +1299,19 @@ async fn deploy_mesofact_bundle(
         // (R599-F6). Both share the materialize + serve-bin-resolution front.
         match &bundle.lifecycle {
             workload_spec::BundleLifecycle::KeepAlive => {
-                deploy_bundle_keepalive(ctx, request_id, id, bundle).await
+                deploy_bundle_keepalive(ctx, request_id, id, bundle, revalidate, mesh).await
             }
             workload_spec::BundleLifecycle::OnDemand { idle_ttl } => {
                 let idle_ttl = *idle_ttl;
-                deploy_bundle_on_demand(ctx, request_id, id, bundle, idle_ttl).await
+                deploy_bundle_on_demand(ctx, request_id, id, bundle, idle_ttl, revalidate, mesh)
+                    .await
             }
         }
     }
     #[cfg(not(feature = "bundle-serving"))]
     {
         let _ = ctx;
+        let _ = revalidate;
         let lifecycle = match &bundle.lifecycle {
             workload_spec::BundleLifecycle::KeepAlive => "keep-alive".to_string(),
             workload_spec::BundleLifecycle::OnDemand { idle_ttl } => {
@@ -1160,8 +1454,10 @@ async fn deploy_bundle_keepalive(
     request_id: kamaji_proto::RequestId,
     id: &WorkloadId,
     bundle: &workload_spec::MesofactServeBundle,
+    revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::SocketAddr;
 
     let err = |code: ErrorCode, message: String| KamajiToYubaba::Error {
         request_id: Some(request_id),
@@ -1188,21 +1484,25 @@ async fn deploy_bundle_keepalive(
         };
 
     // Build the native WorkloadSpec (identity image, entrypoint=[serve_bin],
-    // command=[--bundle <dir> --listen <addr>]) and fork it. Bind to
-    // 127.0.0.1:<port>, mirroring today's ingress testbed.
+    // command=[--bundle <dir> --listen <addr>]) and fork it.
     //
-    // FOLLOW-UP: mesh-IP-plane binding + multi-bundle-per-node needs Deploy to
-    // carry a MeshAssignment (bind IP + per-workload port); the UDS Deploy
-    // envelope has none today, so every bundle shares the one loopback port.
-    let listen = format!("127.0.0.1:{}", backend.bind_port);
+    // R599-F12: the bind address is the workload's mesh address when yubaba
+    // admitted one, loopback otherwise; the port is the workload's own declared
+    // `serve_bundle.port`, falling back to the node-wide default. Those two
+    // together are what close R599-F10's follow-up — a mesh-bound listener is
+    // reachable from another node, and a per-workload port means the node is no
+    // longer limited to the one bundle that fits on 8080.
+    let bind_ip = native_bind_ip(mesh);
+    let port = bundle.port.unwrap_or(backend.bind_port);
+    let listen = format!("{bind_ip}:{port}");
     let spec = bundle_workload_spec(id, &serve_bin, &bundle_dir, &listen);
-    let mesh = kamaji::MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
+    let mesh = runtime_mesh(mesh);
 
     match backend.native.deploy_workload(&spec, &mesh).await {
         Ok(_res) => {
             // Register a probe target so Probe RPCs actually dial the serve
-            // process (the only registry state a bundle deploy writes).
-            let port = backend.bind_port;
+            // process (the only registry state a bundle deploy writes). It must
+            // dial the address the process actually bound, not loopback.
             ctx.registry.lock().await.insert_probe(
                 id.clone(),
                 ProbeTarget {
@@ -1213,9 +1513,25 @@ async fn deploy_bundle_keepalive(
                         initial_delay: workload_spec::Millis::from_ms(0),
                         failure_threshold: 3,
                     },
-                    addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                    addr: SocketAddr::from((bind_ip, port)),
                 },
             );
+            // R330-F12: when the mirror declared a revalidate receiver, fork a
+            // second resident `mesofact serve --revalidate` process against the
+            // same materialized bundle. A fork failure surfaces as an error —
+            // the static server stays up (reap it via Stop), but a declared
+            // receiver that silently didn't start is the failure to avoid.
+            if let Some(rv) = revalidate {
+                if let Err(e) =
+                    fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, port)
+                        .await
+                {
+                    return err(
+                        ErrorCode::BackendRefused,
+                        format!("mesofact revalidate receiver for {} failed to start: {e}", id.0),
+                    );
+                }
+            }
             KamajiToYubaba::Ack {
                 request_id,
                 kind: kamaji_proto::AckKind::Deploy,
@@ -1246,9 +1562,9 @@ async fn deploy_bundle_on_demand(
     id: &WorkloadId,
     bundle: &workload_spec::MesofactServeBundle,
     idle_ttl: workload_spec::Millis,
+    revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
-    use std::net::Ipv4Addr;
-
     let err = |code: ErrorCode, message: String| KamajiToYubaba::Error {
         request_id: Some(request_id),
         code,
@@ -1277,15 +1593,37 @@ async fn deploy_bundle_on_demand(
     // self-reaps. Round sub-second TTLs up to 1s — a `0` would tell the runtime
     // to never reap, silently turning the serverless workload keep-alive.
     let idle_ttl_secs = idle_ttl.as_ms().div_ceil(1000).max(1);
-    let listen = format!("127.0.0.1:{}", backend.bind_port);
+    // R599-F12: same bind resolution as keep-alive. Here it is the address
+    // *kamaji itself* binds and holds as socket custodian, so the mesh address
+    // has to be right at deploy time — a JIT bundle that armed on loopback is
+    // unreachable off-node for the whole life of the workload.
+    let bind_ip = native_bind_ip(mesh);
+    let port = bundle.port.unwrap_or(backend.bind_port);
+    let listen = format!("{bind_ip}:{port}");
     let spec = bundle_workload_spec_jit(id, &serve_bin, &bundle_dir, &listen, idle_ttl_secs);
-    let mesh = kamaji::MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
+    let mesh = runtime_mesh(mesh);
 
     match backend.jit.deploy_on_demand(&spec, &mesh, &listen).await {
-        Ok(()) => KamajiToYubaba::Ack {
-            request_id,
-            kind: kamaji_proto::AckKind::Deploy,
-        },
+        Ok(()) => {
+            // R330-F12: the revalidate receiver is a *resident* process (it must
+            // accept pokes at any time), independent of the static server's JIT
+            // idle-reaping. Fork it against the same materialized bundle.
+            if let Some(rv) = revalidate {
+                if let Err(e) =
+                    fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, port)
+                        .await
+                {
+                    return err(
+                        ErrorCode::BackendRefused,
+                        format!("mesofact revalidate receiver for {} failed to start: {e}", id.0),
+                    );
+                }
+            }
+            KamajiToYubaba::Ack {
+                request_id,
+                kind: kamaji_proto::AckKind::Deploy,
+            }
+        }
         Err(e) => err(
             ErrorCode::BackendRefused,
             format!("on-demand bind/arm of mesofact-serve for {} failed: {e:#}", id.0),
@@ -1298,6 +1636,12 @@ async fn deploy_bundle_on_demand(
 /// (R599-F10). `image` is identity-only (the native backend pulls nothing);
 /// argv is `entrypoint ++ command` = `[serve_bin, --bundle, <dir>, --listen,
 /// <addr>]`; restart policy is `Always` (the resident-server archetype).
+///
+/// R599-F12: `expose.mesh.ports` carries the serving port. It used to be empty,
+/// which reads as "this workload declares no ports" — and `expose.mesh.ports`
+/// is the one place a workload's serving port is declared (yubaba's
+/// `ServiceRecords` module says exactly that), so an empty list there is a
+/// bundle a proxy has no address to dial.
 #[cfg(feature = "bundle-serving")]
 fn bundle_workload_spec(
     id: &WorkloadId,
@@ -1352,7 +1696,13 @@ fn bundle_workload_spec(
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(id.0.clone()),
-                ports: vec![],
+                // Parsed back off `listen` rather than passed separately, so
+                // the declared port cannot drift from the one actually bound.
+                ports: listen
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .into_iter()
+                    .collect(),
                 allow_from: vec![],
             },
             public: None,
@@ -1389,6 +1739,253 @@ fn bundle_workload_spec_jit(
     }
     // The JIT supervisor re-forks on demand; a self-reap must not be restarted.
     spec.restart_policy = RestartPolicy::Never;
+    spec
+}
+
+/// Fork the resident `mesofact serve --revalidate` receiver (R330-F12) — the
+/// almanac push endpoint that mounts `POST /revalidate` and, on each poke, boots
+/// V8 to re-render the route and republish to R2.
+///
+/// It runs against the *same* materialized bundle as the static server:
+/// `--workload <bundle>/app`, so its V8 re-render reads
+/// `<bundle>/app/dist/manifest.json`, and `--publish-config
+/// <bundle>/app/<publish_config>` — the `[publish]` block the bundle assembly
+/// staged next to `dist/` (creds still resolve from `env`, never the file).
+/// Bound to the port immediately above the static server's, on the same
+/// address, so it never collides with it and so two bundles on one node get
+/// two disjoint pairs (R599-F12). `env` (R2 creds + `MESOFACT_MIRROR_KEY`) is resolved deploy-side
+/// and set on the child; the node never sees keystore slot names.
+///
+/// Registered under `<id>-revalidate` so it is a separate row from the static
+/// server in `List`/`Stop`. No probe target: the receiver's readiness is not on
+/// the serve path, and a `TcpConnect` probe would add churn for no signal.
+#[cfg(feature = "bundle-serving")]
+async fn fork_revalidate_receiver(
+    backend: &BundleBackend,
+    id: &WorkloadId,
+    bundle_dir: &Path,
+    serve_bin: &Path,
+    receiver: &workload_spec::MesofactRevalidateReceiver,
+    bind_ip: std::net::Ipv4Addr,
+    serve_port: u16,
+) -> std::result::Result<(), String> {
+    let rv_port = revalidate_port(serve_port);
+    let listen = format!("{bind_ip}:{rv_port}");
+    let rv_id = WorkloadId(format!("{}-revalidate", id.0));
+    let spec = bundle_workload_spec_revalidate(&rv_id, serve_bin, bundle_dir, &listen, receiver);
+    let mesh = kamaji::MeshAssignment::inlined(bind_ip);
+    backend
+        .native
+        .deploy_workload(&spec, &mesh)
+        .await
+        .map(|_res| ())
+        .map_err(|e| format!("native fork of mesofact-serve --revalidate failed: {e:#}"))?;
+
+    // R330-F31: a receiver with declared feeds also needs the fetch tier, or it
+    // re-renders the data the bundle was built with forever. It is forked after
+    // the receiver because its whole job is to poke it.
+    if !receiver.feeds.is_empty() {
+        fork_feed_tier(backend, id, bundle_dir, &listen, receiver).await?;
+    }
+    Ok(())
+}
+
+/// Fork the resident `almanac-feed` fetcher (R330-F31) — the tier that refreshes
+/// each declared feed's artifact **on the node** and pokes the receiver when it
+/// actually changed.
+///
+/// It runs against the same materialized bundle: `--project-root <bundle>/app`
+/// is exactly the root `mesofact-render`'s `read_data_inputs` resolves a route's
+/// declared `data_inputs` against, so writing there is what makes the next poke
+/// render new bytes. That is the *same* tree the receiver already writes its
+/// rendered `dist/` output into — the bundle's content-addressing is a
+/// materialize-time guarantee, not a read-only mount.
+///
+/// The binary is a bundle sidecar (`bins/<triple>/almanac-feed`, staged by
+/// `assemble_self_bundle_with`), so a self-contained bundle stays closed over
+/// everything it needs and the node resolves nothing.
+///
+/// Registered as `<id>-feed` — its own row in `List`/`Stop`, because "the site
+/// is serving but its data is frozen" has to be an observable state.
+#[cfg(feature = "bundle-serving")]
+async fn fork_feed_tier(
+    backend: &BundleBackend,
+    id: &WorkloadId,
+    bundle_dir: &Path,
+    receiver_listen: &str,
+    receiver: &workload_spec::MesofactRevalidateReceiver,
+) -> std::result::Result<(), String> {
+    use std::net::Ipv4Addr;
+
+    let triple = node_triple();
+    let feed_bin = bundle_dir.join("bins").join(&triple).join(FEED_BIN_NAME);
+    if !feed_bin.is_file() {
+        return Err(format!(
+            "bundle declares {} feed(s) but carries no {}: build it for {triple} and declare it \
+             under providers.bundle.revalidate.feed_bins",
+            receiver.feeds.len(),
+            feed_bin.display(),
+        ));
+    }
+
+    // Same exec-bit fixup the serve bin gets: `materialize_bundle` writes blob
+    // bytes 0644, and the manifest records no mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&feed_bin) {
+            let mode = meta.permissions().mode();
+            if mode & 0o111 == 0 {
+                let mut perms = meta.permissions();
+                perms.set_mode(mode | 0o755);
+                let _ = std::fs::set_permissions(&feed_bin, perms);
+            }
+        }
+    }
+
+    let feed_id = WorkloadId(format!("{}-feed", id.0));
+    let spec = bundle_workload_spec_feed_tier(
+        &feed_id,
+        &feed_bin,
+        bundle_dir,
+        receiver_listen,
+        receiver,
+    );
+    let mesh = kamaji::MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
+    backend
+        .native
+        .deploy_workload(&spec, &mesh)
+        .await
+        .map(|_res| ())
+        .map_err(|e| format!("native fork of almanac-feed failed: {e:#}"))
+}
+
+/// Port the revalidate receiver binds, given its bundle's serving port
+/// (R599-F12).
+///
+/// It rides the port immediately above the static server's, on the same
+/// address, so a bundle occupies one contiguous pair. Deriving it from the
+/// *workload's* port rather than the node default is what keeps two bundles on
+/// one node from colliding once their static servers have been separated.
+///
+/// Two edges: `0` is the tests' OS-assigned-ephemeral sentinel and stays
+/// ephemeral (rather than binding privileged port 1), and a declared port at
+/// the top of the range saturates rather than wrapping into a privileged port.
+#[cfg(feature = "bundle-serving")]
+fn revalidate_port(serve_port: u16) -> u16 {
+    if serve_port == 0 {
+        0
+    } else {
+        serve_port.saturating_add(1)
+    }
+}
+
+/// Bundle-relative name of the feed-fetch sidecar binary. Mirrors
+/// `yah_cloud::reconciler::mesofact_bundle::FEED_BIN_NAME` — kamaji does not
+/// depend on the yah-side reconciler, so the two are pinned by the argv-shape
+/// test below.
+#[cfg(feature = "bundle-serving")]
+const FEED_BIN_NAME: &str = "almanac-feed";
+
+/// Build the [`WorkloadSpec`](workload_spec::WorkloadSpec) for the feed-fetch
+/// tier (R330-F31).
+///
+/// `--receiver` points at the receiver's own loopback address: the poke never
+/// leaves the node, so the bearer never crosses a network. The bearer itself is
+/// passed as `ALMANAC_MIRROR_KEY` in `env` rather than argv — the receiver's
+/// `MESOFACT_MIRROR_KEY` value under a name the fetcher reads — so it does not
+/// show up in `ps`.
+///
+/// Each feed's definition travels **by value** (`--feed <toml>`): the node has
+/// no copy of the camp's `.yah/almanac/` tree.
+#[cfg(feature = "bundle-serving")]
+fn bundle_workload_spec_feed_tier(
+    id: &WorkloadId,
+    feed_bin: &Path,
+    bundle_dir: &Path,
+    receiver_listen: &str,
+    receiver: &workload_spec::MesofactRevalidateReceiver,
+) -> workload_spec::WorkloadSpec {
+    use workload_spec::{EnvValue, EnvVar};
+
+    let app = bundle_dir.join("app");
+    let mut command = vec![
+        "--project-root".into(),
+        app.to_string_lossy().into_owned(),
+        "--receiver".into(),
+        format!("http://{receiver_listen}"),
+        "--interval-secs".into(),
+        receiver.feed_interval_secs.to_string(),
+    ];
+    if let Some(prefix) = receiver.feed_project_prefix.as_ref() {
+        command.push("--project-prefix".into());
+        command.push(prefix.clone());
+    }
+    for feed in &receiver.feeds {
+        command.push("--feed".into());
+        command.push(feed.config_toml.clone());
+    }
+
+    // The fetcher binds nothing, so `listen` is meaningless to it; reuse the
+    // bundle archetype for the identity-image/native shape and overwrite argv.
+    let mut spec = bundle_workload_spec(id, feed_bin, bundle_dir, receiver_listen);
+    spec.command = Some(command);
+    spec.env = receiver
+        .env
+        .get("MESOFACT_MIRROR_KEY")
+        .map(|key| {
+            vec![EnvVar {
+                name: "ALMANAC_MIRROR_KEY".to_string(),
+                value: EnvValue::Literal { value: key.clone() },
+            }]
+        })
+        .unwrap_or_default();
+    spec
+}
+
+/// Build the [`WorkloadSpec`](workload_spec::WorkloadSpec) for the revalidate
+/// receiver (R330-F12): the same identity-image native archetype as
+/// [`bundle_workload_spec`], but the serve argv runs the receiver mode
+/// (`<app> --revalidate --publish-config <cfg> --listen <addr>`) and the child
+/// carries the deploy-resolved `env` (R2 creds + `MESOFACT_MIRROR_KEY`, which
+/// `mesofact serve` reads via `#[arg(env = "MESOFACT_MIRROR_KEY")]`).
+/// `restart_policy` stays `Always` — the receiver is a resident server.
+///
+/// The workload dir is **positional** — `ServeArgs::workload` is
+/// `Option<PathBuf>` with no `#[arg(long)]`, so a `--workload` flag is an
+/// unexpected-argument clap error and the receiver would never boot.
+#[cfg(feature = "bundle-serving")]
+fn bundle_workload_spec_revalidate(
+    id: &WorkloadId,
+    serve_bin: &Path,
+    bundle_dir: &Path,
+    listen: &str,
+    receiver: &workload_spec::MesofactRevalidateReceiver,
+) -> workload_spec::WorkloadSpec {
+    use workload_spec::{EnvValue, EnvVar};
+
+    let app = bundle_dir.join("app");
+    let publish_config = app.join(&receiver.publish_config);
+
+    let mut spec = bundle_workload_spec(id, serve_bin, bundle_dir, listen);
+    spec.command = Some(vec![
+        app.to_string_lossy().into_owned(),
+        "--revalidate".into(),
+        "--publish-config".into(),
+        publish_config.to_string_lossy().into_owned(),
+        "--listen".into(),
+        listen.to_string(),
+    ]);
+    spec.env = receiver
+        .env
+        .iter()
+        .map(|(name, value)| EnvVar {
+            name: name.clone(),
+            value: EnvValue::Literal {
+                value: value.clone(),
+            },
+        })
+        .collect();
     spec
 }
 
@@ -1913,12 +2510,14 @@ mod tests {
             build_mode: BuildMode::HostSide,
             ssr_runtime: None,
             serve_bundle: None,
+            revalidate_receiver: None,
         });
         let reply = handle_message(
             YubabaToKamaji::Deploy {
                 request_id: RequestId(11),
                 id: WorkloadId::new("static-site"),
                 spec: workload,
+                mesh: None,
             },
             &ctx,
         )
@@ -1967,13 +2566,16 @@ mod tests {
                 digest: BlakeHash("a".repeat(64)),
                 runtime: "mesofact/0.8.20".to_string(),
                 lifecycle: BundleLifecycle::default(),
+                port: None,
             }),
+            revalidate_receiver: None,
         });
         let reply = handle_message(
             YubabaToKamaji::Deploy {
                 request_id: RequestId(21),
                 id: WorkloadId::new("yah-marketing"),
                 spec: workload,
+                mesh: None,
             },
             &ctx,
         )
@@ -1996,6 +2598,221 @@ mod tests {
         }
     }
 
+    /// R577-T1: a native-marked Container deploy with no native backend
+    /// available **refuses** — it must not silently fall back to a container
+    /// backend, because a Darwin build in a Linux container is a wrong answer,
+    /// not a degraded one.
+    ///
+    /// Deliberately not gated on `native-exec`: with the feature off there is
+    /// no backend to attach, and with it on this `ServerCtx::new()` has none
+    /// attached, so the refusal is the correct reply either way. Only the
+    /// *reason* differs, which is what the two-arm assertion below checks.
+    #[tokio::test]
+    async fn native_marked_deploy_refuses_rather_than_falling_back_to_a_container() {
+        let ctx = Arc::new(ServerCtx::new());
+        let mut inner = make_minimal_container_spec("forge-dmg");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        assert!(inner.wants_native_exec());
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(77),
+                id: WorkloadId::new("forge-dmg"),
+                spec: workload_spec::Workload::Container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+
+        match reply {
+            KamajiToYubaba::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                assert_eq!(request_id, Some(RequestId(77)));
+                // Recognized, not rejected: the spec is well-formed, this node
+                // just can't serve it.
+                assert_eq!(code, ErrorCode::BackendRefused, "got: {message}");
+                assert!(
+                    message.contains("native host execution"),
+                    "the operator must be told which request could not be served; got: {message}"
+                );
+                #[cfg(feature = "native-exec")]
+                assert!(message.contains("--native-exec-dir"), "got: {message}");
+                #[cfg(not(feature = "native-exec"))]
+                assert!(message.contains("native-exec feature"), "got: {message}");
+            }
+            other => panic!("expected Error(BackendRefused), got {other:?}"),
+        }
+    }
+
+    /// R577-T1: native execution is gated to `tier = "infra"`, the same gate
+    /// host networking and the nested-sandbox grant carry — and for a stronger
+    /// reason, since a native workload has no sandbox at all.
+    ///
+    /// This must be an `InvalidSpec`, not a `BackendRefused`: the answer is the
+    /// same on every node in the fleet, so retrying elsewhere is pointless.
+    #[tokio::test]
+    async fn native_exec_is_refused_outside_the_infra_tier() {
+        let ctx = Arc::new(ServerCtx::new());
+        let mut inner = make_minimal_container_spec("tenant-job");
+        inner.tier = workload_spec::TierTag("app".into());
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(79),
+                id: WorkloadId::new("tenant-job"),
+                spec: workload_spec::Workload::Container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+
+        match reply {
+            KamajiToYubaba::Error {
+                code, message, ..
+            } => {
+                assert_eq!(code, ErrorCode::InvalidSpec, "got: {message}");
+                assert!(message.contains("tier"), "got: {message}");
+            }
+            other => panic!("expected Error(InvalidSpec), got {other:?}"),
+        }
+    }
+
+    /// R577-T1: an unresolved secret reaching the native path is a hard error,
+    /// not a silently-missing env var.
+    ///
+    /// `NativeRuntime` spawns only `EnvValue::Literal` and skips the rest, so
+    /// without this check a `codesign` step would run with
+    /// `APPLE_SIGNING_IDENTITY` simply absent and fail somewhere far from the
+    /// cause. That is the exact seam R577-F3 (Apple credential delivery) sits
+    /// on, so it must fail loudly here.
+    #[tokio::test]
+    async fn native_exec_rejects_an_unresolved_secret_rather_than_dropping_it() {
+        let ctx = Arc::new(ServerCtx::new());
+        let mut inner = make_minimal_container_spec("forge-dmg");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        inner.env.push(workload_spec::EnvVar {
+            name: "APPLE_SIGNING_IDENTITY".into(),
+            value: workload_spec::EnvValue::FromSecret {
+                secret: "apple-developer-id".into(),
+                key: "identity".into(),
+            },
+        });
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(80),
+                id: WorkloadId::new("forge-dmg"),
+                spec: workload_spec::Workload::Container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+
+        match reply {
+            KamajiToYubaba::Error {
+                code, message, ..
+            } => {
+                assert_eq!(code, ErrorCode::InvalidSpec, "got: {message}");
+                assert!(message.contains("APPLE_SIGNING_IDENTITY"), "got: {message}");
+                assert!(message.contains("apple-developer-id"), "got: {message}");
+            }
+            other => panic!("expected Error(InvalidSpec), got {other:?}"),
+        }
+    }
+
+    /// R577-T1 × R636-B2: a spec asking for both native execution and the
+    /// nested-sandbox capability grant is refused rather than having the grant
+    /// silently ignored.
+    ///
+    /// The two markers are independent *annotations* (R636-B2 has a test
+    /// asserting exactly that), but they are mutually exclusive at *dispatch*:
+    /// the grant widens a container's OCI capability set, and native execution
+    /// has no container. Since `deploy_container` routes on the native marker
+    /// first, without this check the privilege request would be accepted and
+    /// dropped on the floor.
+    #[tokio::test]
+    async fn native_exec_and_the_nested_sandbox_grant_are_mutually_exclusive() {
+        let ctx = Arc::new(ServerCtx::new());
+        let mut inner = make_minimal_container_spec("forge-confused");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        inner.annotations.insert(
+            workload_spec::NESTED_SANDBOX_ANNOTATION.to_string(),
+            workload_spec::NESTED_SANDBOX_VALUE.to_string(),
+        );
+        // Both markers really are set — this is the combination under test, not
+        // a spec that quietly failed to carry one of them.
+        assert!(inner.wants_native_exec() && inner.wants_nested_sandbox());
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(81),
+                id: WorkloadId::new("forge-confused"),
+                spec: workload_spec::Workload::Container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+
+        match reply {
+            KamajiToYubaba::Error { code, message, .. } => {
+                assert_eq!(code, ErrorCode::InvalidSpec, "got: {message}");
+                assert!(message.contains("mutually exclusive"), "got: {message}");
+            }
+            other => panic!("expected Error(InvalidSpec), got {other:?}"),
+        }
+    }
+
+    /// The negative half of the routing rule, and the one that protects live
+    /// infrastructure: an *unmarked* Container spec must be untouched by
+    /// R577-T1 and keep reaching the container backends. Every workload on the
+    /// Linux fleet is in this class.
+    #[tokio::test]
+    async fn unmarked_container_deploy_does_not_take_the_native_path() {
+        let ctx = Arc::new(ServerCtx::new());
+        let spec = make_minimal_container_spec("svc");
+        assert!(!spec.wants_native_exec());
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(78),
+                id: WorkloadId::new("svc"),
+                spec: workload_spec::Workload::Container(spec),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+
+        // Whatever this build's container backends do with it, the reply must
+        // not be the native-path refusal.
+        if let KamajiToYubaba::Error { message, .. } = &reply {
+            assert!(
+                !message.contains("native host execution"),
+                "unmarked container workload took the native path: {message}"
+            );
+        }
+    }
+
     /// Without the containerd-integration feature, Deploy { Container } must
     /// surface a clear "feature not built in" error rather than the old
     /// "not implemented (R406-T4..T6/T11)" stub. R406-T11 tracks probe.
@@ -2009,6 +2826,7 @@ mod tests {
                 request_id: RequestId(12),
                 id: WorkloadId::new("svc"),
                 spec,
+                mesh: None,
             },
             &ctx,
         )
@@ -2040,6 +2858,7 @@ mod tests {
                 request_id: RequestId(12),
                 id: WorkloadId::new("svc"),
                 spec,
+                mesh: None,
             },
             &ctx,
         )
@@ -2071,6 +2890,7 @@ mod tests {
                 request_id: RequestId(21),
                 id: WorkloadId::new("svc"),
                 spec,
+                mesh: None,
             },
             &ctx,
         )
@@ -2403,6 +3223,17 @@ mod tests {
         /// the resolved serve bin exists; otherwise it's omitted (drives the
         /// "missing runtime asset" case).
         fn publish_self_bundle(store: &dyn ObjectStore, with_serve: bool) -> String {
+            publish_self_bundle_with_bins(store, with_serve, &[])
+        }
+
+        /// [`publish_self_bundle`] plus extra `bins/<node-triple>/<name>`
+        /// sidecars (R330-F31) — e.g. the `almanac-feed` fetcher a bundle with a
+        /// declared feed tier must carry.
+        fn publish_self_bundle_with_bins(
+            store: &dyn ObjectStore,
+            with_serve: bool,
+            extra_bins: &[&str],
+        ) -> String {
             let dir = tempfile::tempdir().unwrap();
             let mut files: Vec<(String, Vec<u8>)> =
                 vec![("app/index.html".to_string(), b"<html>home</html>".to_vec())];
@@ -2410,6 +3241,12 @@ mod tests {
                 // A serve bin that just sleeps so the supervised child stays up.
                 let serve_rel = format!("bins/{}/serve", node_triple());
                 files.push((serve_rel, b"#!/bin/sh\nexec sleep 30\n".to_vec()));
+            }
+            for name in extra_bins {
+                files.push((
+                    format!("bins/{}/{name}", node_triple()),
+                    b"#!/bin/sh\nexec sleep 30\n".to_vec(),
+                ));
             }
 
             let mut content = BTreeMap::new();
@@ -2435,6 +3272,17 @@ mod tests {
         }
 
         fn serve_bundle_workload(digest_hex: &str, lifecycle: BundleLifecycle) -> Workload {
+            serve_bundle_workload_on_port(digest_hex, lifecycle, None)
+        }
+
+        /// [`serve_bundle_workload`] with an explicit `serve_bundle.port`
+        /// (R599-F12) — the per-workload serving port that lets one node host
+        /// more than one bundle.
+        fn serve_bundle_workload_on_port(
+            digest_hex: &str,
+            lifecycle: BundleLifecycle,
+            port: Option<u16>,
+        ) -> Workload {
             Workload::MesofactStatic(MesofactStaticWorkload {
                 schema_version: SchemaVersion::V1,
                 build: BuildConfig {
@@ -2449,7 +3297,9 @@ mod tests {
                     digest: BlakeHash(digest_hex.to_string()),
                     runtime: "self".to_string(),
                     lifecycle,
+                    port,
                 }),
+                revalidate_receiver: None,
             })
         }
 
@@ -2470,6 +3320,7 @@ mod tests {
                     request_id: RequestId(101),
                     id: WorkloadId::new("yah-marketing"),
                     spec: serve_bundle_workload(&digest, BundleLifecycle::KeepAlive),
+                    mesh: None,
                 },
                 &ctx,
             )
@@ -2511,6 +3362,381 @@ mod tests {
             .await;
         }
 
+        /// (a1) R330-F12: the receiver's argv must match `mesofact serve`'s
+        /// actual clap shape. `ServeArgs::workload` is a **positional**
+        /// `Option<PathBuf>` — an earlier draft emitted `--workload <app>`,
+        /// which clap rejects as an unexpected argument, so the forked receiver
+        /// would have exited instantly while the fork itself still "succeeded".
+        /// The fork/List test above can't catch that (its stub serve bin ignores
+        /// argv), so assert the argv literally.
+        #[test]
+        fn revalidate_spec_argv_matches_mesofact_serve_clap_shape() {
+            use workload_spec::MesofactRevalidateReceiver;
+
+            let mut env = BTreeMap::new();
+            env.insert("MESOFACT_MIRROR_KEY".to_string(), "bearer-xyz".to_string());
+            env.insert(
+                "MESOFACT_S3_ACCESS_KEY_ID".to_string(),
+                "AKIA".to_string(),
+            );
+            let receiver = MesofactRevalidateReceiver {
+                routes: vec!["/releases".into()],
+                publish_config: "mesofact.config.toml".into(),
+                mirror_key_env: Some("YAH_MARKETING_MIRROR_KEY".into()),
+                env,
+                feeds: vec![],
+                feed_interval_secs: 300,
+                feed_project_prefix: None,
+            };
+
+            let spec = bundle_workload_spec_revalidate(
+                &WorkloadId::new("yah-marketing-revalidate"),
+                Path::new("/opt/yah/bin/mesofact"),
+                Path::new("/var/cache/yah/bundles/abc"),
+                "127.0.0.1:3001",
+                &receiver,
+            );
+
+            assert_eq!(
+                spec.command.as_deref(),
+                Some(
+                    [
+                        // positional workload — NOT `--workload`
+                        "/var/cache/yah/bundles/abc/app",
+                        "--revalidate",
+                        "--publish-config",
+                        "/var/cache/yah/bundles/abc/app/mesofact.config.toml",
+                        "--listen",
+                        "127.0.0.1:3001",
+                    ]
+                    .map(String::from)
+                    .as_slice()
+                ),
+            );
+            assert_eq!(
+                spec.entrypoint.as_deref(),
+                Some(["/opt/yah/bin/mesofact".to_string()].as_slice()),
+            );
+            // Creds + bearer ride the child's env, resolved deploy-side; the
+            // node never sees keystore slot names.
+            let names: Vec<&str> = spec.env.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["MESOFACT_MIRROR_KEY", "MESOFACT_S3_ACCESS_KEY_ID"]);
+            assert!(matches!(
+                spec.restart_policy,
+                workload_spec::RestartPolicy::Always
+            ));
+        }
+
+        /// R330-F31: the feed tier's argv must match `almanac-feed`'s own flag
+        /// shape, and each feed definition must travel **by value** — the node
+        /// has no copy of the camp's `.yah/almanac/` tree, so a path would
+        /// resolve to nothing and the fetcher would exit at startup.
+        #[test]
+        fn feed_tier_spec_argv_carries_feeds_by_value_and_keeps_the_bearer_off_argv() {
+            use workload_spec::{AlmanacFeed, MesofactRevalidateReceiver};
+
+            let feed_toml = "[feed]\nname = \"releases\"\n";
+            let mut env = BTreeMap::new();
+            env.insert("MESOFACT_MIRROR_KEY".to_string(), "bearer-xyz".to_string());
+            env.insert("MESOFACT_S3_ACCESS_KEY_ID".to_string(), "AKIA".to_string());
+            let receiver = MesofactRevalidateReceiver {
+                routes: vec!["/releases".into()],
+                publish_config: "mesofact.config.toml".into(),
+                mirror_key_env: Some("YAH_MARKETING_MIRROR_KEY".into()),
+                env,
+                feeds: vec![AlmanacFeed {
+                    name: "releases".into(),
+                    config_toml: feed_toml.into(),
+                }],
+                feed_interval_secs: 60,
+                feed_project_prefix: Some("app/yah/web/marketing".into()),
+            };
+
+            let spec = bundle_workload_spec_feed_tier(
+                &WorkloadId::new("yah-marketing-feed"),
+                Path::new("/var/cache/yah/bundles/abc/bins/x/almanac-feed"),
+                Path::new("/var/cache/yah/bundles/abc"),
+                "127.0.0.1:3001",
+                &receiver,
+            );
+
+            assert_eq!(
+                spec.command.as_deref(),
+                Some(
+                    [
+                        "--project-root",
+                        // The workload root the receiver resolves `data_inputs`
+                        // against — writing anywhere else is a no-op poke.
+                        "/var/cache/yah/bundles/abc/app",
+                        "--receiver",
+                        "http://127.0.0.1:3001",
+                        "--interval-secs",
+                        "60",
+                        // Without this the artifact lands at the feed's
+                        // workspace-relative path inside the bundle, where the
+                        // route's `data_inputs` never looks.
+                        "--project-prefix",
+                        "app/yah/web/marketing",
+                        "--feed",
+                        feed_toml,
+                    ]
+                    .map(String::from)
+                    .as_slice()
+                ),
+            );
+            assert_eq!(
+                spec.entrypoint.as_deref(),
+                Some(["/var/cache/yah/bundles/abc/bins/x/almanac-feed".to_string()].as_slice()),
+            );
+            // The bearer rides env under the name the fetcher reads — never
+            // argv, which is world-readable in `ps`.
+            let env: Vec<(&str, &str)> = spec
+                .env
+                .iter()
+                .map(|e| {
+                    let workload_spec::EnvValue::Literal { value } = &e.value else {
+                        panic!("expected a literal env value")
+                    };
+                    (e.name.as_str(), value.as_str())
+                })
+                .collect();
+            assert_eq!(env, [("ALMANAC_MIRROR_KEY", "bearer-xyz")]);
+            assert!(
+                !spec.command.as_deref().unwrap().iter().any(|a| a.contains("bearer-xyz")),
+                "the bearer must not appear in argv"
+            );
+            // Resident: a fetcher that exits stops the site's data forever.
+            assert!(matches!(
+                spec.restart_policy,
+                workload_spec::RestartPolicy::Always
+            ));
+        }
+
+        /// R330-F31: declaring feeds without staging the `almanac-feed` sidecar
+        /// is the failure that looks like success — the site serves, the data
+        /// never moves. The deploy must refuse instead.
+        #[tokio::test]
+        async fn a_declared_feed_tier_without_its_sidecar_binary_fails_the_deploy() {
+            use workload_spec::{AlmanacFeed, MesofactRevalidateReceiver};
+
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            // Carries `serve` but NOT `almanac-feed` — the mis-declared shape.
+            let digest = publish_self_bundle(store.as_ref(), true);
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                .with_bind_port(0);
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
+
+            let mut env = BTreeMap::new();
+            env.insert("MESOFACT_MIRROR_KEY".to_string(), "bearer-xyz".to_string());
+            let receiver = MesofactRevalidateReceiver {
+                routes: vec!["/releases".into()],
+                publish_config: "mesofact.config.toml".into(),
+                mirror_key_env: None,
+                env,
+                feeds: vec![AlmanacFeed {
+                    name: "releases".into(),
+                    config_toml: "[feed]\nname = \"releases\"\n".into(),
+                }],
+                feed_interval_secs: 60,
+                feed_project_prefix: None,
+            };
+            let spec = match serve_bundle_workload(&digest, BundleLifecycle::KeepAlive) {
+                Workload::MesofactStatic(mut w) => {
+                    w.revalidate_receiver = Some(receiver);
+                    Workload::MesofactStatic(w)
+                }
+                other => other,
+            };
+
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(141),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec,
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            match reply {
+                KamajiToYubaba::Error { code, message, .. } => {
+                    assert_eq!(code, ErrorCode::BackendRefused);
+                    assert!(message.contains("almanac-feed"), "got {message}");
+                    assert!(message.contains("feed_bins"), "got {message}");
+                }
+                other => panic!("expected an error naming the missing sidecar, got {other:?}"),
+            }
+        }
+
+        /// R330-F31: a bundle carrying the `almanac-feed` sidecar forks a THIRD
+        /// resident process under `<id>-feed`, alongside the static server and
+        /// the receiver. Its own row is the point — "serving but frozen" has to
+        /// be visible in `List`/`Stop`.
+        #[tokio::test]
+        async fn keepalive_deploy_with_feeds_forks_the_fetch_tier_as_a_third_process() {
+            use workload_spec::{AlmanacFeed, MesofactRevalidateReceiver};
+
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle_with_bins(store.as_ref(), true, &["almanac-feed"]);
+
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                .with_bind_port(0);
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
+
+            let receiver = MesofactRevalidateReceiver {
+                routes: vec!["/releases".into()],
+                publish_config: "mesofact.config.toml".into(),
+                mirror_key_env: None,
+                env: BTreeMap::new(),
+                feeds: vec![AlmanacFeed {
+                    name: "releases".into(),
+                    config_toml: "[feed]\nname = \"releases\"\n".into(),
+                }],
+                feed_interval_secs: 60,
+                feed_project_prefix: None,
+            };
+            let spec = match serve_bundle_workload(&digest, BundleLifecycle::KeepAlive) {
+                Workload::MesofactStatic(mut w) => {
+                    w.revalidate_receiver = Some(receiver);
+                    Workload::MesofactStatic(w)
+                }
+                other => other,
+            };
+
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(151),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec,
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(
+                matches!(reply, KamajiToYubaba::Ack { .. }),
+                "deploy should Ack, got {reply:?}"
+            );
+
+            let list = handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(152),
+                },
+                &ctx,
+            )
+            .await;
+            match list {
+                KamajiToYubaba::WorkloadList { entries, .. } => {
+                    for expected in ["yah-marketing", "yah-marketing-revalidate", "yah-marketing-feed"]
+                    {
+                        assert!(
+                            entries.iter().any(|e| e.id == WorkloadId::new(expected)),
+                            "{expected} should appear in List, got {entries:?}"
+                        );
+                    }
+                }
+                other => panic!("expected WorkloadList, got {other:?}"),
+            }
+        }
+
+        /// (a2) R330-F12: a KeepAlive deploy whose spec carries a
+        /// `revalidate_receiver` forks a SECOND resident process — `mesofact
+        /// serve --revalidate` — registered under `<id>-revalidate`, alongside
+        /// the static server. Both appear in List. (The stub serve bin sleeps and
+        /// ignores argv, so this exercises the *fork/registration* plumbing, not
+        /// the receiver's runtime behavior, which mesofact's own tests cover.)
+        #[tokio::test]
+        async fn keepalive_deploy_with_receiver_forks_both_processes() {
+            use workload_spec::MesofactRevalidateReceiver;
+
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            // Ephemeral bind port ⇒ the receiver's port (bind_port==0) is also
+            // ephemeral, so neither child contends on a fixed port.
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                .with_bind_port(0);
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
+
+            let mut env = BTreeMap::new();
+            env.insert("MESOFACT_MIRROR_KEY".to_string(), "bearer-xyz".to_string());
+            let receiver = MesofactRevalidateReceiver {
+                routes: vec!["/releases".into()],
+                publish_config: "mesofact.config.toml".into(),
+                mirror_key_env: Some("YAH_MARKETING_MIRROR_KEY".into()),
+                env,
+                feeds: vec![],
+                feed_interval_secs: 300,
+                feed_project_prefix: None,
+            };
+            let spec = match serve_bundle_workload(&digest, BundleLifecycle::KeepAlive) {
+                Workload::MesofactStatic(mut w) => {
+                    w.revalidate_receiver = Some(receiver);
+                    Workload::MesofactStatic(w)
+                }
+                other => other,
+            };
+
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(131),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec,
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            match reply {
+                KamajiToYubaba::Ack { request_id, kind } => {
+                    assert_eq!(request_id, RequestId(131));
+                    assert_eq!(kind, kamaji_proto::AckKind::Deploy);
+                }
+                other => panic!("expected Ack, got {other:?}"),
+            }
+
+            let list = handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(132),
+                },
+                &ctx,
+            )
+            .await;
+            match list {
+                KamajiToYubaba::WorkloadList { entries, .. } => {
+                    assert!(
+                        entries.iter().any(|e| e.id == WorkloadId::new("yah-marketing")),
+                        "static server should appear in List, got {entries:?}"
+                    );
+                    assert!(
+                        entries
+                            .iter()
+                            .any(|e| e.id == WorkloadId::new("yah-marketing-revalidate")),
+                        "revalidate receiver should appear in List as a second process, \
+                         got {entries:?}"
+                    );
+                }
+                other => panic!("expected WorkloadList, got {other:?}"),
+            }
+
+            for wl in ["yah-marketing", "yah-marketing-revalidate"] {
+                let _ = handle_message(
+                    YubabaToKamaji::Stop {
+                        request_id: RequestId(133),
+                        id: WorkloadId::new(wl),
+                    },
+                    &ctx,
+                )
+                .await;
+            }
+        }
+
         /// (b) An OnDemand serve_bundle deploy binds+arms the JIT runtime (R599-F6):
         /// it Acks (no process forked yet — lazy), the workload appears in List as
         /// idle (Pending, no resident pid), and Stop releases it. Uses an ephemeral
@@ -2536,6 +3762,7 @@ mod tests {
                             idle_ttl: Millis::from_secs(30),
                         },
                     ),
+                    mesh: None,
                 },
                 &ctx,
             )
@@ -2598,6 +3825,7 @@ mod tests {
                     request_id: RequestId(121),
                     id: WorkloadId::new("yah-marketing"),
                     spec: serve_bundle_workload(&digest, BundleLifecycle::KeepAlive),
+                    mesh: None,
                 },
                 &ctx,
             )
@@ -2617,6 +3845,194 @@ mod tests {
                 }
                 other => panic!("expected Error(BackendRefused), got {other:?}"),
             }
+        }
+
+        // ── R599-F12: mesh-plane bind + per-workload port ────────────────────
+
+        /// The pair of resolutions the whole ticket reduces to. `native_bind_ip`
+        /// is what decides whether a bundle is reachable off-node at all, and
+        /// the port fallback is what decides whether a node can host more than
+        /// one of them.
+        #[test]
+        fn bind_address_comes_from_the_assignment_and_the_port_from_the_workload() {
+            use std::net::Ipv4Addr;
+
+            // No assignment = no mesh plane on this node (pond, desktop, a
+            // yubaba bound to 0.0.0.0). Loopback, exactly as before R599-F12.
+            assert_eq!(native_bind_ip(None), Ipv4Addr::LOCALHOST);
+
+            let assigned = kamaji_proto::MeshAssignment {
+                mesh_ip: Ipv4Addr::new(100, 64, 0, 3),
+                wg_private_key: String::new(),
+                wg_listen_port: 0,
+                peers: vec![],
+                netns_name: None,
+            };
+            assert_eq!(
+                native_bind_ip(Some(&assigned)),
+                Ipv4Addr::new(100, 64, 0, 3),
+                "a native workload must bind the address yubaba admitted it at — \
+                 binding loopback is what made a bundle unreachable from another node",
+            );
+
+            // The port is the workload's own; the node-wide default is only the
+            // fallback, and it is the fallback that limits a node to one bundle.
+            let node_default = 8080;
+            assert_eq!(Some(9001).unwrap_or(node_default), 9001);
+            assert_eq!(None.unwrap_or(node_default), 8080);
+        }
+
+        /// Verify #1's kamaji half: a `Deploy` carrying a mesh assignment makes
+        /// the bundle bind that address, observable through the probe target the
+        /// keep-alive path registers (the probe must dial what the process
+        /// actually bound — dialing loopback for a mesh-bound server would
+        /// report a healthy workload as dead).
+        #[tokio::test]
+        async fn a_mesh_assigned_bundle_binds_the_mesh_address_not_loopback() {
+            use std::net::Ipv4Addr;
+
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            // Port 0 keeps the stub child off any real port; the assertion is
+            // about the *address kamaji resolved*, which the probe target
+            // records verbatim.
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                .with_bind_port(0);
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
+
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(130),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec: serve_bundle_workload_on_port(
+                        &digest,
+                        BundleLifecycle::KeepAlive,
+                        Some(8443),
+                    ),
+                    mesh: Some(kamaji_proto::MeshAssignment {
+                        mesh_ip: Ipv4Addr::new(100, 64, 0, 3),
+                        wg_private_key: String::new(),
+                        wg_listen_port: 0,
+                        peers: vec![],
+                        netns_name: None,
+                    }),
+                },
+                &ctx,
+            )
+            .await;
+            assert!(
+                matches!(reply, KamajiToYubaba::Ack { .. }),
+                "expected Ack, got {reply:?}"
+            );
+
+            let target = ctx
+                .registry
+                .lock()
+                .await
+                .probe_target(&WorkloadId::new("yah-marketing"))
+                .expect("keep-alive deploy registers a probe target");
+            assert_eq!(
+                target.addr.to_string(),
+                "100.64.0.3:8443",
+                "the bundle must be dialable at <mesh-ip>:<declared-port>",
+            );
+
+            // The same address is declared on the spec a proxy would read it
+            // from — an empty `expose.mesh.ports` means "declares no ports",
+            // which is what yubaba's ServiceRecords refuses to publish.
+            let spec = bundle_workload_spec(
+                &WorkloadId::new("yah-marketing"),
+                Path::new("/opt/serve"),
+                Path::new("/cache/bundles/abc"),
+                "100.64.0.3:8443",
+            );
+            assert_eq!(spec.expose.mesh.ports, vec![8443]);
+        }
+
+        /// Verify #3: two bundles on ONE node. Before R599-F12 the port was a
+        /// node-wide singleton, so the second deploy would have landed on the
+        /// first one's address — which is precisely why passway had to be
+        /// co-located with the single bundle a node could hold.
+        #[tokio::test]
+        async fn two_bundles_on_one_node_get_their_own_ports() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
+
+            for (rid, name, port) in [(140, "site-a", 8081u16), (141, "site-b", 8082u16)] {
+                let reply = handle_message(
+                    YubabaToKamaji::Deploy {
+                        request_id: RequestId(rid),
+                        id: WorkloadId::new(name),
+                        spec: serve_bundle_workload_on_port(
+                            &digest,
+                            BundleLifecycle::KeepAlive,
+                            Some(port),
+                        ),
+                        mesh: None,
+                    },
+                    &ctx,
+                )
+                .await;
+                assert!(
+                    matches!(reply, KamajiToYubaba::Ack { .. }),
+                    "deploying {name} failed: {reply:?}"
+                );
+            }
+
+            let registry = ctx.registry.lock().await;
+            let a = registry
+                .probe_target(&WorkloadId::new("site-a"))
+                .expect("site-a probe target");
+            let b = registry
+                .probe_target(&WorkloadId::new("site-b"))
+                .expect("site-b probe target");
+            assert_eq!(a.addr.to_string(), "127.0.0.1:8081");
+            assert_eq!(b.addr.to_string(), "127.0.0.1:8082");
+            drop(registry);
+
+            // Both are live and distinct — one node, two bundles.
+            let list = handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(142),
+                },
+                &ctx,
+            )
+            .await;
+            match list {
+                KamajiToYubaba::WorkloadList { entries, .. } => {
+                    let ids: Vec<&str> = entries.iter().map(|e| e.id.0.as_str()).collect();
+                    assert!(ids.contains(&"site-a"), "got {ids:?}");
+                    assert!(ids.contains(&"site-b"), "got {ids:?}");
+                }
+                other => panic!("expected WorkloadList, got {other:?}"),
+            }
+        }
+
+        /// The revalidate receiver rides the port above its own bundle's, not
+        /// above the node default — otherwise two bundles' receivers collide
+        /// even after their static servers have been separated.
+        #[test]
+        fn each_bundles_receiver_rides_its_own_serve_port() {
+            assert_ne!(
+                revalidate_port(8081),
+                revalidate_port(8082),
+                "two bundles' receivers must not share a port"
+            );
+            assert_eq!(revalidate_port(8081), 8082);
+            // 0 is the tests' OS-assigned-ephemeral sentinel: stay ephemeral
+            // rather than binding privileged port 1.
+            assert_eq!(revalidate_port(0), 0);
+            // A declared port at the top of the range must not wrap into a
+            // privileged one (or panic on the debug-build add).
+            assert_eq!(revalidate_port(u16::MAX), u16::MAX);
         }
     }
 }

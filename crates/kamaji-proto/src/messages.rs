@@ -15,6 +15,8 @@
 //! @yah:handoff("INCIDENTAL green-keeping fix (NOT part of the rename): added `render_command: None` to two BuildConfig test fixtures (kamaji-proto/src/codec.rs:785, kamaji-bin/src/server.rs:761) that drifted when R535-T7 added BuildConfig.render_command (landed in the same e815d59 wip commit, fixtures not propagated). Two-line adaptation to unblock the workspace test.")
 //! @yah:handoff("VERIFY (all green): oss/kamaji `cargo test --workspace` 0 failed (kamaji-proto 24 + kamaji-bin lib 184 + sibling_wire_e2e 2 + uds_skeleton 1 + kamaji lib 29 + others); root `cargo check -p hub --all-features` clean; oss/yubaba `cargo check -p yubaba --all-features` + `cargo test -p yubaba --test integration_constable_client --no-run` compile clean. Grep: zero residual WardenToConstable/ConstableToWarden/ConstableClient/constable_version/constable_proto in all 3 workspaces; raft Warden* symbols correctly untouched.")
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 use serde::{Deserialize, Serialize};
 use workload_spec::Workload;
 
@@ -189,6 +191,54 @@ pub struct WorkloadEntry {
     pub mesh_ident: Option<String>,
 }
 
+/// Mesh-plane placement for a deployed workload (R599-F12) — yubaba's
+/// admission-time decision about *where on the mesh* the workload's listener
+/// lives, carried to kamaji so the backend can honour it.
+///
+/// Wire mirror of `kamaji::MeshAssignment`. The two are deliberately separate
+/// types: this one is a cross-binary contract that an internal refactor of the
+/// runtime struct must not be able to reshape silently. `kamaji`'s `sibling`
+/// module owns the conversion in both directions.
+///
+/// What `mesh_ip` *means* differs by backend, and the difference is load-
+/// bearing:
+///
+/// - **Container backends** (containerd/docker) put the workload in its own
+///   network namespace, so `mesh_ip` is that namespace's address — an address
+///   that need not exist on the host.
+/// - **Native backends** (the W272 bundle path) fork a plain host process, so
+///   `mesh_ip` must be an address **already bound on this node** — in practice
+///   the node's own mesh address, the one yubaba itself listens on. Handing a
+///   native workload an unassigned address makes it fail to bind
+///   ("Address not available"), so yubaba sends its own node address here for
+///   native deploys rather than an allocated per-workload one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshAssignment {
+    /// Mesh-plane IP for this workload. See the type docs for what it means
+    /// per backend.
+    pub mesh_ip: Ipv4Addr,
+    /// WireGuard private key for the workload's mesh interface. Empty when the
+    /// deployment has no WireGuard plane (`has_wireguard()` is false on the
+    /// runtime type).
+    pub wg_private_key: String,
+    /// WireGuard listen port. `0` alongside an empty key = no WireGuard.
+    pub wg_listen_port: u16,
+    /// Mesh peers the workload's interface is configured with.
+    pub peers: Vec<WireguardPeer>,
+    /// Network namespace the workload's listener must be created in, when the
+    /// backend is a socket custodian. `None` = the host namespace.
+    pub netns_name: Option<String>,
+}
+
+/// One WireGuard peer entry in a [`MeshAssignment`]. Wire mirror of
+/// `kamaji::WireguardPeer`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireguardPeer {
+    pub public_key: String,
+    pub endpoint: Option<SocketAddr>,
+    pub allowed_ips: Vec<IpAddr>,
+}
+
 /// Discriminant for a generic [`KamajiToYubaba::Ack`] — which request the
 /// ack belongs to. Lets Yubaba's dispatch table key on request-kind without
 /// re-parsing the original payload.
@@ -230,10 +280,21 @@ pub enum YubabaToKamaji {
     /// Connection greeting — exchanged once per UDS connection.
     Hello { version: ProtocolVersion },
     /// Deploy a workload. Backend (native vs container) is selected by `spec`.
+    ///
+    /// `mesh` is the workload's mesh-plane placement (R599-F12). `None` means
+    /// this deployment has no mesh IP plane — a pond/desktop node — and kamaji
+    /// binds loopback, which is the pre-R599-F12 behaviour. `Some` means bind
+    /// the assignment's `mesh_ip`, which is what makes a workload reachable
+    /// from another node and therefore what lets an ingress proxy live
+    /// somewhere other than on top of its own backend.
+    ///
+    /// Adding this field is a **backward-incompatible** wire change (postcard
+    /// is positional), which is why [`ProtocolVersion::V2`] exists.
     Deploy {
         request_id: RequestId,
         id: WorkloadId,
         spec: Workload,
+        mesh: Option<MeshAssignment>,
     },
     /// Stop a workload — SIGTERM-with-grace floor; backend hides specifics.
     Stop {

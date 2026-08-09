@@ -8,13 +8,24 @@ use serde::{Deserialize, Serialize};
 /// cluster can decode multiple versions during upgrades — the receiver picks
 /// the highest version it supports that the sender also offers.
 ///
-/// V1 is the initial scaffolding shape. Add a V2 variant when a breaking
+/// V1 is the initial scaffolding shape. Add a new variant when a breaking
 /// rename or removal lands; additive variant introductions (new request kinds,
 /// new ack kinds) ride on the `#[non_exhaustive]` enums without a version bump.
+///
+/// V2 (R599-F12) added `mesh` to [`crate::YubabaToKamaji::Deploy`]. Postcard is
+/// positional, so a *field* added to an existing variant is breaking in both
+/// directions even though a new *variant* would not be: an old kamaji decoding
+/// a V2 `Deploy` trips on the trailing bytes, and a new kamaji decoding a V1
+/// one runs off the end. The bump is what turns that into an explicit
+/// handshake refusal naming the version, instead of a postcard error mid-frame.
+/// Variants are appended, so `V1` keeps postcard discriminant 0 and the
+/// `Hello`/`Welcome` exchange itself still decodes across the skew — which is
+/// the whole point of doing version negotiation in the first frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ProtocolVersion {
     V1,
+    V2,
 }
 
 impl Default for ProtocolVersion {
@@ -25,5 +36,5 @@ impl Default for ProtocolVersion {
 
 impl ProtocolVersion {
     /// The version this build of `kamaji-proto` produces by default.
-    pub const CURRENT: Self = Self::V1;
+    pub const CURRENT: Self = Self::V2;
 }

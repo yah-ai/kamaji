@@ -412,6 +412,7 @@ async fn scripted_backend(listener: UnixListener) {
                 request_id,
                 id,
                 spec,
+                mesh,
             } => match spec {
                 workload_spec::Workload::Container(decoded) => {
                     // Prove the spec survived the postcard wire on the server
@@ -419,6 +420,18 @@ async fn scripted_backend(listener: UnixListener) {
                     assert_eq!(
                         decoded.name, "noisetable-api",
                         "spec.name corrupted on the wire"
+                    );
+                    // R599-F12: and that the mesh assignment arrived with it.
+                    // Before this field existed the server had to invent
+                    // `MeshAssignment::inlined(127.0.0.1)`, so a workload could
+                    // only ever be told to bind loopback.
+                    let mesh = mesh.expect(
+                        "Deploy must carry the caller's MeshAssignment, not drop it at the client",
+                    );
+                    assert!(
+                        mesh.mesh_ip.to_string().starts_with("10.64.0."),
+                        "mesh_ip corrupted on the wire: {}",
+                        mesh.mesh_ip
                     );
                     assert_eq!(
                         decoded.image.digest, TEST_DIGEST,

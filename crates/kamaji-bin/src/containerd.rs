@@ -998,6 +998,20 @@ fn validate_spec_for_constable(spec: &WorkloadSpec) -> Result<(), BackendError> 
         )));
     }
 
+    // The nested-sandbox grant (R636-B2) is the same shape of escape hatch: it
+    // hands the container CAP_SETUID + CAP_SETGID and turns `no_new_privs` off
+    // so rootless BuildKit can build a user namespace. Gate it to the infra
+    // tier for the same reason.
+    if spec.wants_nested_sandbox() && spec.tier.0 != "infra" {
+        return Err(BackendError::InvalidSpec(format!(
+            "workload requests the nested-sandbox grant (annotation {}={}) but tier is {:?}; \
+             it is only permitted for tier=\"infra\"",
+            workload_spec::NESTED_SANDBOX_ANNOTATION,
+            workload_spec::NESTED_SANDBOX_VALUE,
+            spec.tier.0,
+        )));
+    }
+
     for env in &spec.env {
         match &env.value {
             EnvValue::Literal { .. } => {}
@@ -1155,6 +1169,34 @@ mod tests {
     #[test]
     fn validate_allows_host_network_for_infra_tier() {
         let mut spec = with_host_network(make_spec("svc"));
+        spec.tier = TierTag("infra".into());
+        validate_spec_for_constable(&spec).unwrap();
+    }
+
+    fn with_nested_sandbox(mut spec: WorkloadSpec) -> WorkloadSpec {
+        spec.annotations.insert(
+            workload_spec::NESTED_SANDBOX_ANNOTATION.into(),
+            workload_spec::NESTED_SANDBOX_VALUE.into(),
+        );
+        spec
+    }
+
+    /// R636-B2: the nested-sandbox grant is gated exactly like host
+    /// networking — an ordinary tenant workload cannot hand itself
+    /// CAP_SETUID/CAP_SETGID by setting an annotation.
+    #[test]
+    fn validate_rejects_nested_sandbox_for_non_infra_tier() {
+        // make_spec is tier=public; the grant must be refused.
+        let err = validate_spec_for_constable(&with_nested_sandbox(make_spec("svc"))).unwrap_err();
+        assert!(matches!(err, BackendError::InvalidSpec(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("nested-sandbox"), "msg: {msg}");
+        assert!(msg.contains("infra"), "msg: {msg}");
+    }
+
+    #[test]
+    fn validate_allows_nested_sandbox_for_infra_tier() {
+        let mut spec = with_nested_sandbox(make_spec("svc"));
         spec.tier = TierTag("infra".into());
         validate_spec_for_constable(&spec).unwrap();
     }

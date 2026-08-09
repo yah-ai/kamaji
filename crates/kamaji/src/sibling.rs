@@ -226,11 +226,20 @@ impl KamajiClient {
     /// what it is handed; it does not re-litigate whether the workload should
     /// run.
     ///
+    /// `mesh` carries that admission's mesh-plane placement (R599-F12). Pass
+    /// `None` when the deployment has no mesh IP plane — a pond or desktop node
+    /// — and kamaji binds loopback. Passing the
+    /// [`MeshAssignment::inlined`](crate::MeshAssignment::inlined) sentinel is
+    /// *not* the way to say that: it would read on the wire as a real
+    /// instruction to bind a loopback-ish address, so callers holding a sentinel
+    /// should send `None` instead.
+    ///
     /// [`Kamaji::deploy_workload`]: crate::Kamaji::deploy_workload
     pub async fn deploy_envelope(
         &self,
         id: &WorkloadId,
         workload: &workload_spec::Workload,
+        mesh: Option<&crate::MeshAssignment>,
     ) -> Result<(), ClientError> {
         let request_id = self.next_request_id();
         let reply = self
@@ -239,6 +248,7 @@ impl KamajiClient {
                     request_id,
                     id: id.clone(),
                     spec: workload.clone(),
+                    mesh: mesh.map(mesh_to_proto),
                 },
                 request_id,
             )
@@ -448,6 +458,47 @@ fn proto_state_to_status(s: ProtoWorkloadState) -> crate::WorkloadStatus {
     }
 }
 
+/// Runtime [`MeshAssignment`](crate::MeshAssignment) → its wire mirror
+/// (R599-F12).
+///
+/// The [`crate::MeshAssignment::inlined`] sentinel — no WireGuard, loopback-ish
+/// IP — is *not* a mesh placement, and sending it would tell kamaji to bind an
+/// address that means "there is no mesh here". Callers therefore pass `None` in
+/// that case; see [`KamajiClient::deploy_envelope`].
+pub(crate) fn mesh_to_proto(mesh: &crate::MeshAssignment) -> kamaji_proto::MeshAssignment {
+    kamaji_proto::MeshAssignment {
+        mesh_ip: mesh.mesh_ip,
+        wg_private_key: mesh.wg_private_key.clone(),
+        wg_listen_port: mesh.wg_listen_port,
+        peers: mesh
+            .peers
+            .iter()
+            .map(|p| kamaji_proto::WireguardPeer {
+                public_key: p.public_key.clone(),
+                endpoint: p.endpoint,
+                allowed_ips: p.allowed_ips.clone(),
+            })
+            .collect(),
+        netns_name: mesh.netns_name.clone(),
+    }
+}
+
+/// Whether a runtime assignment is a real mesh placement worth putting on the
+/// wire, or the [`inlined`](crate::MeshAssignment::inlined) "there is no mesh
+/// here" sentinel — which the wire spells `None`.
+///
+/// The sentinel is identified the same way [`crate::MeshAssignment::inlined`]
+/// constructs it: no WireGuard *and* a loopback address. A real single-node
+/// deployment that genuinely assigns 127.0.0.1 to a workload gets the same
+/// answer it always did (bind loopback), so collapsing the two costs nothing.
+fn wire_mesh(mesh: &crate::MeshAssignment) -> Option<&crate::MeshAssignment> {
+    if !mesh.has_wireguard() && mesh.mesh_ip.is_loopback() {
+        None
+    } else {
+        Some(mesh)
+    }
+}
+
 fn entry_to_workload_state(entry: WorkloadEntry) -> crate::WorkloadState {
     crate::WorkloadState {
         ident: crate::MeshIdent(entry.id.0.clone()),
@@ -469,6 +520,11 @@ impl crate::Kamaji for KamajiClient {
     /// and sends `YubabaToKamaji::Deploy`. Returns a [`DeployResult`]
     /// with `mesh_ip` taken from `mesh` and `task_pid = 0` (the pid arrives
     /// later via the `WorkloadStarted` push message, not yet plumbed).
+    ///
+    /// R599-F12: `mesh` now reaches the daemon instead of being dropped here.
+    /// A [`MeshAssignment::inlined`](crate::MeshAssignment::inlined) sentinel
+    /// still doesn't — it means "this deployment has no mesh plane", which the
+    /// wire spells `None`, not "bind 127.0.0.1 on purpose".
     async fn deploy_workload(
         &self,
         spec: &workload_spec::WorkloadSpec,
@@ -476,7 +532,7 @@ impl crate::Kamaji for KamajiClient {
     ) -> anyhow::Result<crate::DeployResult> {
         let id = WorkloadId::new(&spec.name);
         let workload_envelope = workload_spec::Workload::Container(spec.clone());
-        self.deploy_envelope(&id, &workload_envelope)
+        self.deploy_envelope(&id, &workload_envelope, wire_mesh(mesh))
             .await
             .map_err(|e| anyhow::anyhow!("kamaji deploy_workload: {e}"))?;
         Ok(crate::DeployResult {

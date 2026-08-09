@@ -45,6 +45,11 @@ struct Args {
     /// `Some(host)` pins an explicit daemon. `None` leaves docker unattached.
     #[cfg_attr(not(feature = "docker-integration"), allow(dead_code))]
     docker_host: Option<String>,
+    /// State dir for the native fork+exec backend (R577-T1), holding each
+    /// native workload's stdout/stderr capture. `Some(dir)` attaches the
+    /// backend; `None` leaves native-marked container deploys refused.
+    #[cfg_attr(not(feature = "native-exec"), allow(dead_code))]
+    native_exec_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> std::result::Result<Args, ParseError> {
@@ -78,6 +83,12 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         Ok(v) => Some(v),
         Err(_) => None,
     };
+
+    // R577-T1: native fork+exec backend opt-in, same explicit-opt-in discipline
+    // as --docker. A supervisor must not start forking host processes because
+    // some ambient variable happened to be set.
+    let mut native_exec_dir: Option<PathBuf> =
+        std::env::var_os("KAMAJI_NATIVE_EXEC_DIR").map(PathBuf::from);
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -116,6 +127,13 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .map_err(|_| ParseError::BadValue("--bundle-port"))?,
                 );
             }
+            "--native-exec-dir" => {
+                native_exec_dir = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or(ParseError::MissingValue("--native-exec-dir"))?,
+                );
+            }
             // Bare `--docker` inherits DOCKER_HOST; `--docker-host URL` pins one.
             "--docker" => docker_host = Some(String::new()),
             "--docker-host" => {
@@ -136,6 +154,7 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         bundle_origin,
         bundle_port,
         docker_host,
+        native_exec_dir,
     })
 }
 
@@ -152,6 +171,7 @@ fn print_help() {
     println!();
     println!(
         "Usage: kamaji [--socket PATH] [--containerd-socket PATH] [--docker | --docker-host URL]\n              \
+         [--native-exec-dir PATH]\n              \
          [--bundle-cache-dir PATH] [--bundle-origin URL] [--bundle-port PORT]"
     );
     println!();
@@ -166,6 +186,12 @@ fn print_help() {
     println!("                                $DOCKER_HOST (default: off; $KAMAJI_DOCKER=1 also enables)");
     println!("      --docker-host URL         as --docker, against an explicit daemon, e.g.");
     println!("                                unix:///var/run/docker.sock");
+    println!("      --native-exec-dir PATH    supervise Container workloads marked");
+    println!("                                `yah.exec = native` by forking them on this host's");
+    println!("                                own userland, capturing logs under PATH. Needed by");
+    println!("                                Darwin build-workers: no container can run");
+    println!("                                cargo-tauri/codesign/notarytool (default:");
+    println!("                                $KAMAJI_NATIVE_EXEC_DIR, else such deploys are refused)");
     println!("      --bundle-cache-dir PATH   node bundle root for serving published W272 mesofact");
     println!("                                bundles: <root>/bundles, <root>/runtimes, <root>/state");
     println!("                                (default: $KAMAJI_BUNDLE_CACHE_DIR, else serve-bundle");
@@ -339,6 +365,37 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
         anyhow::bail!(
             "--docker / --docker-host require the kamaji binary be built with \
              --features docker-integration"
+        );
+    }
+
+    // ── native fork+exec backend (R577-T1 / W254) ────────────────────────────
+    // For container-shaped workloads that cannot run in a container at all —
+    // the Darwin build leg. Explicit opt-in: this backend runs argv on the
+    // host's own userland with no sandbox, so it must never attach by accident.
+    #[cfg(feature = "native-exec")]
+    {
+        ctx = if let Some(dir) = &args.native_exec_dir {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                anyhow::anyhow!("creating native-exec state dir {}: {e}", dir.display())
+            })?;
+            tracing::info!(
+                state_dir = %dir.display(),
+                "native-exec backend attached; Container workloads marked yah.exec=native \
+                 will be forked on this host"
+            );
+            ctx.with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir)))
+        } else {
+            tracing::debug!(
+                "no --native-exec-dir; native-marked Container deploys will be refused"
+            );
+            ctx
+        };
+    }
+    #[cfg(not(feature = "native-exec"))]
+    if args.native_exec_dir.is_some() {
+        anyhow::bail!(
+            "--native-exec-dir requires the kamaji binary be built with \
+             --features native-exec"
         );
     }
 

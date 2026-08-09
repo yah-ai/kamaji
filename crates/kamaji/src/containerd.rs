@@ -760,6 +760,20 @@ impl Kamaji for ContainerdRuntime {
             );
         }
 
+        // The nested-sandbox grant (R636-B2) is the same shape of escape
+        // hatch: it hands the container CAP_SETUID + CAP_SETGID and turns
+        // `no_new_privs` off so rootless BuildKit can build a user namespace.
+        // Gate it to the infra tier for the same reason.
+        if spec.wants_nested_sandbox() && spec.tier.0 != "infra" {
+            anyhow::bail!(
+                "workload requests the nested-sandbox grant (annotation {}={}) but tier is {:?}; \
+                 it is only permitted for tier=\"infra\"",
+                workload_spec::NESTED_SANDBOX_ANNOTATION,
+                workload_spec::NESTED_SANDBOX_VALUE,
+                spec.tier.0,
+            );
+        }
+
         // Idempotent redeploy: reap any prior generation(s) — BOTH pod slots —
         // reset the slot cell, and release any held custody listen socket.
         let _ = self.teardown_workload(&spec.expose.mesh.identity).await;

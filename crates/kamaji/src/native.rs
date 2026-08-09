@@ -204,6 +204,23 @@ async fn spawn_child(
     let stderr_file =
         open(&stderr_path).with_context(|| format!("opening {}", stderr_path.display()))?;
 
+    // NOTE: no `env_clear()`, and that is load-bearing in two directions.
+    //
+    // The obvious one: a native workload is a host process, and a host process
+    // needs `PATH` / `HOME` to find its own toolchain. A build step here shells
+    // out to cargo, xcodebuild, codesign — none of which resolve under an empty
+    // environment. Clearing would look like runtime hygiene (the container
+    // backend does start from nothing) and would break these far from this file.
+    //
+    // The one that is easy to undo by accident: inheritance is also how a NODE
+    // carries node-local configuration into the jobs it runs. us-west-015's
+    // kamaji LaunchAgent already pins `DOCKER_HOST` this way, and R577-F3's
+    // Darwin signing leg rides the same channel for `APPLE_SIGNING_IDENTITY` —
+    // the name of an identity in *that machine's* keychain, which is node-local
+    // by nature and must not travel in a checked-in recipe or on the wire. If
+    // this is ever narrowed to an allow-list, that leg must be part of the
+    // change, not a casualty of it. Pinned by
+    // `tests::daemon_environment_is_inherited_by_the_child`.
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
@@ -214,6 +231,8 @@ async fn spawn_child(
     if let Some(workdir) = &spec.workdir {
         cmd.current_dir(workdir);
     }
+    // Spec env layers OVER the inherited environment, so a workload can override
+    // a node default without the node having to know about the workload.
     for e in &spec.env {
         if let EnvValue::Literal { value } = &e.value {
             cmd.env(&e.name, value);
@@ -921,6 +940,81 @@ mod tests {
         assert!(runtime.get_workload(&ident).await.unwrap().is_none());
         // Idempotent.
         runtime.teardown_workload(&ident).await.unwrap();
+    }
+
+    /// The child inherits the daemon's environment, and a spec literal layers
+    /// over it.
+    ///
+    /// This is the delivery channel R577-F3's Darwin signing leg uses: a node
+    /// sets `APPLE_SIGNING_IDENTITY` (which names an identity in *its own*
+    /// keychain) in the kamaji LaunchAgent, and the forked build inherits it —
+    /// no coordinator→worker credential delivery, nothing per-camp in a
+    /// checked-in recipe, nothing on the wire. `DOCKER_HOST` on us-west-015
+    /// already works this way. It is also what gives a build `PATH` at all.
+    ///
+    /// An `env_clear()` added here as runtime hygiene would break both, and the
+    /// failure would surface as `codesign` complaining about a missing identity
+    /// on a machine where the identity is plainly installed. Hence a test rather
+    /// than only a comment.
+    #[tokio::test]
+    async fn daemon_environment_is_inherited_by_the_child() {
+        std::env::set_var("KAMAJI_NATIVE_INHERIT_PROBE", "from-the-daemon");
+        std::env::set_var("KAMAJI_NATIVE_OVERRIDE_PROBE", "from-the-daemon");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-inherit",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo inherited=$KAMAJI_NATIVE_INHERIT_PROBE; \
+                 echo overridden=$KAMAJI_NATIVE_OVERRIDE_PROBE; \
+                 sleep 30"
+                    .into(),
+            ],
+        );
+        spec.env = vec![workload_spec::EnvVar {
+            name: "KAMAJI_NATIVE_OVERRIDE_PROBE".into(),
+            value: EnvValue::Literal {
+                value: "from-the-spec".into(),
+            },
+        }];
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut logs = runtime
+            .stream_logs(
+                &ident,
+                LogOpts {
+                    tail: None,
+                    follow: false,
+                    stream: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut captured = String::new();
+        while let Some(ev) = logs.next().await {
+            captured.push_str(&ev.message);
+            captured.push('\n');
+        }
+
+        runtime.teardown_workload(&ident).await.unwrap();
+        std::env::remove_var("KAMAJI_NATIVE_INHERIT_PROBE");
+        std::env::remove_var("KAMAJI_NATIVE_OVERRIDE_PROBE");
+
+        assert!(
+            captured.contains("inherited=from-the-daemon"),
+            "a native child must inherit the daemon environment (no env_clear); got:\n{captured}"
+        );
+        assert!(
+            captured.contains("overridden=from-the-spec"),
+            "a spec literal must win over an inherited value; got:\n{captured}"
+        );
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ pub mod version;
 pub use codec::{decode_frame, encode_frame, Error, MAX_FRAME_BYTES};
 pub use messages::{
     AckKind, DrainBudget, DrainOutcome, DrainPhase, ErrorCode, ExitStatus, KamajiToYubaba,
-    ProbeStatus, RequestId, WorkloadEntry, WorkloadId, WorkloadState, YubabaToKamaji,
+    MeshAssignment, ProbeStatus, RequestId, WireguardPeer, WorkloadEntry, WorkloadId, WorkloadState,
+    YubabaToKamaji,
 };
 pub use version::ProtocolVersion;

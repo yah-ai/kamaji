@@ -197,6 +197,7 @@ mod tests {
             request_id: RequestId(7),
             id: WorkloadId::new("forge-b3"),
             spec: Workload::Container(spec),
+            mesh: None,
         };
         let bytes = encode_frame(&msg).unwrap();
         let (decoded, consumed) = decode_frame::<YubabaToKamaji>(&bytes).unwrap();
@@ -644,6 +645,7 @@ mod tests {
                 TierTag("private".into()),
                 vec![8080],
             )),
+            mesh: None,
         });
 
         // Stop.
@@ -886,6 +888,7 @@ mod tests {
                         vec![3000],
                     )),
                     serve_bundle: None,
+                    revalidate_receiver: None,
                 }),
             ),
             // Almanac — exercises AlmanacTarget (Http + Tcp), Cadence::Cron,
@@ -938,6 +941,7 @@ mod tests {
                 request_id: RequestId(20),
                 id: WorkloadId::new(label),
                 spec,
+                mesh: None,
             };
             let bytes = encode_frame(&msg).unwrap();
             let (decoded, consumed) = decode_frame::<YubabaToKamaji>(&bytes)
@@ -982,6 +986,7 @@ mod tests {
                 TierTag("private".into()),
                 vec![8080],
             )),
+            mesh: None,
         };
         let bytes = encode_frame(&msg).unwrap();
         let (decoded, consumed) = decode_frame::<YubabaToKamaji>(&bytes)

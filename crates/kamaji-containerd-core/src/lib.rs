@@ -98,6 +98,20 @@ pub const LOG_BASE: &str = "/var/log/yah";
 /// finding" for why this is the narrower of the two pre-merge sets.
 pub const GRANTED_CAPABILITY: &str = "CAP_NET_BIND_SERVICE";
 
+/// The extra capabilities granted *only* to a `yah.sandbox=nested` workload
+/// (R636-B2) — the pair `rootlesskit` needs to exec the setuid-root
+/// `newuidmap` / `newgidmap` helpers that populate a user namespace's id
+/// maps. Granting them also requires `noNewPrivileges = false`, which
+/// [`build_oci_spec_with`] sets on the same condition; with `no_new_privs`
+/// left on the kernel strips the helpers' setuid bit and they fail with
+/// "Could not set caps".
+///
+/// This is deliberately not `CAP_SYS_ADMIN`: a *non*-rootless buildkitd would
+/// need that instead, and it is a far wider grant. See
+/// `workload_spec::WorkloadSpec::wants_nested_sandbox` for the measured
+/// ladder showing each of the three relaxations is individually necessary.
+pub const NESTED_SANDBOX_CAPABILITIES: [&str; 2] = ["CAP_SETUID", "CAP_SETGID"];
+
 // ── Connection + client construction ──────────────────────────────────────────
 
 /// Connect to a containerd UDS at `socket`, returning the raw `tonic`
@@ -800,6 +814,29 @@ pub fn build_oci_spec_with(
         .unwrap_or("/")
         .to_string();
 
+    // Capabilities / `no_new_privs` / fd budget: the baseline is
+    // [`GRANTED_CAPABILITY`] alone with `no_new_privs` on. A workload that
+    // stands up its own unprivileged container sandbox (rootless BuildKit —
+    // `yah.sandbox=nested`, guarded to tier=infra by each caller before this
+    // function runs) gets exactly the three relaxations `rootlesskit` needs to
+    // exec the setuid-root `newuidmap`/`newgidmap` helpers.
+    // See `WorkloadSpec::wants_nested_sandbox` for the measured evidence that
+    // each of the three is individually load-bearing.
+    //
+    // The fd budget goes up with it. That part is *headroom, not a measured
+    // requirement*: a small build completes fine at the 1024 baseline, but the
+    // workload is running a whole container runtime (content store, snapshots,
+    // one exec per concurrent RUN) rather than a single service, and the real
+    // rusty-v8 build it exists for is orders of magnitude larger than anything
+    // that has been run against the 1024 limit.
+    let nested_sandbox = spec.wants_nested_sandbox();
+    let caps: serde_json::Value = if nested_sandbox {
+        serde_json::json!([GRANTED_CAPABILITY, NESTED_SANDBOX_CAPABILITIES[0], NESTED_SANDBOX_CAPABILITIES[1]])
+    } else {
+        serde_json::json!([GRANTED_CAPABILITY])
+    };
+    let nofile: u32 = if nested_sandbox { 65_536 } else { 1024 };
+
     let process = serde_json::json!({
         "terminal": false,
         "user": { "uid": uid, "gid": gid },
@@ -807,17 +844,17 @@ pub fn build_oci_spec_with(
         "env": env,
         "cwd": cwd,
         "capabilities": {
-            "bounding":  [GRANTED_CAPABILITY],
-            "effective": [GRANTED_CAPABILITY],
-            "permitted": [GRANTED_CAPABILITY],
+            "bounding":  caps.clone(),
+            "effective": caps.clone(),
+            "permitted": caps,
             "ambient":   [],
         },
         "rlimits": [{
             "type": "RLIMIT_NOFILE",
-            "hard": 1024_u32,
-            "soft": 1024_u32,
+            "hard": nofile,
+            "soft": nofile,
         }],
-        "noNewPrivileges": true,
+        "noNewPrivileges": !nested_sandbox,
     });
 
     // Namespaces: isolated by default. Host networking is a guarded opt-in
@@ -1015,6 +1052,23 @@ mod tests {
         spec
     }
 
+    fn with_nested_sandbox(mut spec: WorkloadSpec) -> WorkloadSpec {
+        spec.annotations.insert(
+            workload_spec::NESTED_SANDBOX_ANNOTATION.into(),
+            workload_spec::NESTED_SANDBOX_VALUE.into(),
+        );
+        spec
+    }
+
+    fn caps(oci: &serde_json::Value) -> Vec<String> {
+        oci["process"]["capabilities"]["bounding"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    }
+
     fn netns_present(oci: &serde_json::Value) -> bool {
         oci["linux"]["namespaces"]
             .as_array()
@@ -1077,7 +1131,7 @@ mod tests {
         assert_eq!(cfg.user, None);
     }
 
-    /// The P018 rusty-v8 shape: image supplies `ENTRYPOINT ["bash","-c"]` + baked
+    /// The rusty-v8-musl rusty-v8 shape: image supplies `ENTRYPOINT ["bash","-c"]` + baked
     /// build ENV, the workload supplies only a single-string command. The merged
     /// argv must be `bash -c <command>` and the baked env must survive.
     #[test]
@@ -1214,6 +1268,87 @@ mod tests {
     #[test]
     fn chain_id_empty_is_empty() {
         assert_eq!(chain_id(&[]), "");
+    }
+
+    /// R636-B2 baseline half: an ordinary workload keeps the tight sandbox.
+    /// This is the assertion the ticket's second `@yah:verify` asks for — the
+    /// widening must be provably opt-in, not provable "by inspection".
+    #[test]
+    fn oci_spec_baseline_sandbox_is_unchanged_without_the_annotation() {
+        let oci = build_oci_spec(&test_spec("svc"), &[], None);
+        assert_eq!(
+            caps(&oci),
+            vec![GRANTED_CAPABILITY.to_string()],
+            "a workload without yah.sandbox=nested must keep the CAP_NET_BIND_SERVICE-only set"
+        );
+        assert_eq!(
+            oci["process"]["noNewPrivileges"], true,
+            "no_new_privs must stay on for every workload that did not ask for the grant"
+        );
+        assert_eq!(oci["process"]["rlimits"][0]["hard"], 1024);
+        // Host networking is a *different* escape hatch and must not drag the
+        // capability grant along with it.
+        let host_net = build_oci_spec(&with_host_network(test_spec("svc")), &[], None);
+        assert_eq!(caps(&host_net), vec![GRANTED_CAPABILITY.to_string()]);
+        assert_eq!(host_net["process"]["noNewPrivileges"], true);
+    }
+
+    /// R636-B2 grant half: `yah.sandbox=nested` adds exactly CAP_SETUID +
+    /// CAP_SETGID and turns `no_new_privs` off — the measured-minimal set
+    /// rootless BuildKit's `rootlesskit` needs to exec `newuidmap`/`newgidmap`.
+    /// Notably *not* CAP_SYS_ADMIN, and the ambient set stays empty.
+    #[test]
+    fn oci_spec_nested_sandbox_grants_setuid_setgid_and_drops_no_new_privs() {
+        let oci = build_oci_spec(&with_nested_sandbox(test_spec("forge-build")), &[], None);
+        assert_eq!(
+            caps(&oci),
+            vec![
+                GRANTED_CAPABILITY.to_string(),
+                "CAP_SETUID".to_string(),
+                "CAP_SETGID".to_string(),
+            ],
+        );
+        assert_eq!(
+            oci["process"]["capabilities"]["effective"],
+            oci["process"]["capabilities"]["bounding"],
+        );
+        assert_eq!(
+            oci["process"]["capabilities"]["permitted"],
+            oci["process"]["capabilities"]["bounding"],
+        );
+        assert_eq!(
+            oci["process"]["capabilities"]["ambient"],
+            serde_json::json!([]),
+            "ambient must stay empty — the helpers are setuid binaries, not ambient-cap consumers"
+        );
+        assert!(
+            !caps(&oci).iter().any(|c| c == "CAP_SYS_ADMIN"),
+            "the grant must never widen to CAP_SYS_ADMIN"
+        );
+        assert_eq!(
+            oci["process"]["noNewPrivileges"], false,
+            "with no_new_privs on, the kernel strips newuidmap's setuid bit \
+             and rootlesskit fails with 'Could not set caps'"
+        );
+        assert_eq!(
+            oci["process"]["rlimits"][0]["hard"], 65_536,
+            "headroom for a workload running its own container runtime — not a \
+             measured requirement (a small build passes at the 1024 baseline)"
+        );
+    }
+
+    /// The grant must not change anything else about the sandbox — same
+    /// namespaces, same mounts. Only the three process-level knobs move.
+    #[test]
+    fn oci_spec_nested_sandbox_leaves_namespaces_and_mounts_alone() {
+        let plain = build_oci_spec(&test_spec("svc"), &[], None);
+        let nested = build_oci_spec(&with_nested_sandbox(test_spec("svc")), &[], None);
+        assert_eq!(plain["linux"]["namespaces"], nested["linux"]["namespaces"]);
+        assert_eq!(plain["mounts"], nested["mounts"]);
+        assert!(
+            netns_present(&nested),
+            "the grant is orthogonal to networking — it must not leak the netns"
+        );
     }
 
     #[test]
