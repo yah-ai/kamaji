@@ -55,6 +55,37 @@
 //! @arch:see(.yah/docs/working/W264-kamaji-managed-scryer.md)
 //!
 //!
+//!
+//! @yah:ticket(R605-F8, "Shape A: microVM kamaji backend so a build can be isolated on any node, dispatched by annotation like native-exec")
+//! @yah:status(review)
+//! @yah:at(2026-08-27T03:47:03Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R605)
+//! @arch:see(.yah/docs/working/W325-isolated-x86-build-capacity.md)
+//! @yah:next("THE WIRE DOES NOT CHANGE, and that is the whole sizing insight. kamaji::Backend is not a postcard wire type (kamaji-proto/src/codec.rs references only ErrorCode::BackendRefused). Backend selection is per-workload and ANNOTATION-driven: kamaji-bin/src/server.rs:1115 branches on spec.wants_native_exec() into deploy_native_exec. A microVM backend is a sibling branch on a new annotation value — no Workload enum variant, no exhaustive-match churn in peer-owned codec.rs, no postcard variant-order hazard. Same zero-blast-radius pattern R572-F1, R594-F2 and R577-T1 each chose.")
+//! @yah:next("Follow workload_spec's NATIVE_EXEC_ANNOTATION shape exactly: a const key + value pair plus a wants_*() accessor on WorkloadSpec, mirrored by a validate_*_spec guard in server.rs. Reuse, do not re-invent: yah.sandbox = nested (wants_nested_sandbox) already exists for privileged BuildKit-in-container.")
+//! @yah:next("THE REAL COST IS NOT RUST. Budget the ticket against the microVM supply chain: a kernel image + rootfs to boot, jailer setup, TAP networking that still reaches crates.io and the registry (forge already needs HOST_NETWORK_ANNOTATION because kamaji's default netns is loopback-only, velveteen-exec/src/remote.rs:735), and getting the source tree + cargo cache in and artifacts out — forge_produced::durable_mount is a host bind-mount today and a microVM needs a virtio-fs or vsock equivalent.")
+//! @yah:next("QED-side axis: velveteen's TaskRuntime (oss/qed/crates/velveteen/src/lib.rs) is Native | Container today. A microVM runtime extends that enum — check its consumers before adding a variant.")
+//! @yah:verify("An isolated build runs end to end: a `yah qed run` x86 offload carrying the microVM annotation boots a microVM on the target node, completes a real cargo build, lands its produces, and is torn down — with the node's other workloads unaffected.")
+//! @yah:gotcha("THE TICKET TEXT THAT SPAWNED THIS IS WRONG ON ONE POINT, corrected by R605-S6: R605-S6's next-step says Shape A 'mirrors R578-F1's macvm.rs pattern for Tart'. There is no macvm.rs in the tree — R578-F1 is still open and unstarted, and the only occurrence of the string macvm anywhere is inside R605-S6's own annotation. There is no in-tree precedent to mirror; follow the annotation-dispatch pattern in the next-steps instead.")
+//! @yah:gotcha("The dynamic-placement half is ALREADY BUILT — do not rebuild it. LifecycleArchetype::Job, WorkloadSpec::for_forge, CloudConfig::admit_workload with the R572-F5 capacity floor + archetype taints + mesh-tag affinity, and velveteen_exec::remote::build_workload_spec all ship today and have been placing builds as ordinary Workloads since R594. This ticket adds ISOLATION to that path, nothing else.")
+//! @yah:gotcha("Substrate is confirmed available: both OVH nodes have /dev/kvm with kvm_intel nested=Y (probed 2026-08-19). But the debian service user (uid 1000) is NOT in group kvm (gid 992) and /dev/kvm is 0660 root:kvm — anything opening it needs a group add or root, on every node this backend is meant to run.")
+//! @yah:handoff("SHIPPED, the software half. New oss/kamaji/crates/kamaji/src/microvm.rs: MicroVmRuntime (impl Kamaji, Backend::MicroVm) driving Firecracker via --no-api --config-file, one /30 TAP slot per guest, an ext4 scratch disk built with mkfs.ext4 -d and unpacked with debugfs rdump (neither needs root -- a loop mount would, and unpacking a build's artifacts is the wrong place for root). Dispatch is annotation-driven exactly like native-exec: kamaji-bin server.rs branches spec.wants_microvm() into deploy_microvm, guarded by validate_microvm_spec, refusing rather than falling back to a container. Wire unchanged as predicted: no Workload variant, no kamaji-proto edit.")
+//! @yah:handoff("THE MARKER IS A THIRD VALUE ON yah.exec, NOT A SECOND KEY, and that is the one design call worth reviewing. W325 section 5 said 'a sibling branch on a new annotation value' and taking it literally pays off: MICROVM_EXEC_VALUE = microvm sits on the existing NATIVE_EXEC_ANNOTATION, so a map key holds one value and the three substrates (container / native / microvm) are mutually exclusive BY CONSTRUCTION. A separate yah.isolation key would have made native+microvm expressible and therefore a refusal someone has to write and maintain -- exactly the branch validate_native_exec_spec already carries for the yah.sandbox pair. Pinned by exec_substrate_markers_are_mutually_exclusive_by_construction.")
+//! @yah:handoff("TWO REAL BUGS FOUND BY BUILDING IT, neither anticipated by the ticket or by W325. (1) resources.memory_mb cannot be read literally by a VM backend: it is a cgroup CEILING everywhere else and WorkloadSpec::for_forge sets it to 32 GiB, while W325 section 4 measured the OVH nodes at 11682 MB total. Firecracker would read it as an ALLOCATION and every forge microVM would fail to boot. guest_memory_mb clamps it to [memory_request_mb, node cap] and refuses at deploy -- naming both numbers -- when the floor exceeds the cap, because a build that dies at 90 percent with a SIGKILL costs far more to diagnose than a deploy that says no. (2) ephemeral_storage_mb is the same problem inverted: for_forge sets 512 MiB, which would fail every build at its first checkout, so it is a floor on the scratch disk and not the answer.")
+//! @yah:handoff("THIRD FINDING, security-relevant: a microVM workload must NOT carry HOST_NETWORK_ANNOTATION. It is inert at the backend -- a guest has no namespace to place in the host's, it has a virtual NIC on a TAP -- but AdmissionGrant::from_spec reads host_network off exactly that annotation, so leaving the dispatcher's blanket set would make every signed microVM grant assert a privilege the run never took. build_workload_spec now skips it for microvm only; a_microvm_workload_does_not_claim_host_networking pins both directions, including that the container leg still gets it (R590-B7 proved that one the hard way).")
+//! @yah:handoff("QED AXIS DONE TOO, so the backend is actually reachable from a pipeline rather than being dead code: velveteen TaskRuntime gained MicroVm (the ticket's fourth next-step said to check consumers first -- 20 files mention the enum but only 3 match on it exhaustively, so the blast radius was small), velveteen-exec build_workload_spec stamps the marker via mark_microvm, and qed runner.rs refuses (RunWhere::Local, TaskRuntime::MicroVm) through local_microvm_is_refused. Local is refused on purpose: a microVM isolates a build from what ELSE is on the node, and locally that is the author. A step writes runtime = microvm in its pipeline TOML.")
+//! @yah:handoff("mark_microvm is ONE line where mark_native_exec is three, and the asymmetry is the point. The native path rewrites workdir and publishes YAH_PRODUCED_DIR because a fork+exec'd process has no mount namespace, so /yah/produced does not exist for it. A guest has a whole kernel, so kamaji honours the spec's declared volume targets: each Bind source is copied onto the scratch disk under a slug, the guest bind-mounts it back at target, and a step writing to /yah/produced works unchanged -- forge_produced::host_path reads the artifacts back from the same host dir it always did. Read-only volumes are carried IN but never copied back OUT: that flag is a promise to the host, and the guest is precisely the party that cannot be trusted to keep it.")
+//! @yah:handoff("DISCOVERED WORK done in this pass, beyond the ticket. (a) app/yah/desktop/src/kamaji.rs:306 and state.rs:625 -- Backend::MicroVm and BackendAvailability.microvm made these non-exhaustive; both fixed, and I broke the camp build for ~20 minutes before @Ashguard:blade and @Ashguard:spade flagged the yah-qed runner.rs half. (b) kamaji-bin server.rs bundle_state_to_entry renamed runtime_state_to_entry and its cfg widened -- it gained a third caller and the old name stopped being true. (c) workload-spec admission.rs: the signing site and the verifying site were two copies of the same runtime if-ladder, which is exactly when a duplicated ladder starts to drift, so both now call GrantRuntime::of_spec.")
+//! @yah:verify("cd oss/kamaji && cargo test --workspace --all-features -- 19 test-result-ok lines, 0 failed, 0 errors. Includes kamaji lib 137 (27 of them microvm::, 3 more probe:: covering /dev/kvm) and kamaji-bin lib 258 (4 new microVM dispatch tests).")
+//! @yah:verify("cd oss/yah-base && cargo test -p yah-workload-spec --all-features -- 162 in the lib, all green (5 new: the marker, mutual exclusion, JSON round-trip, and two on the GrantRuntime::MicroVm signing path). cd oss/qed && cargo test -p yah-qed --lib -- 881 passed 1 ignored; cargo test -p velveteen -p velveteen-exec -- 14 and 123 passed (3 new on the dispatcher marker).")
+//! @yah:verify("cargo check -p desktop --all-targets clean after the two exhaustiveness fixes. ./scripts/check-schema-drift.sh and ./scripts/check-workload-spec-ts.sh both report in-sync -- no regeneration needed, because TaskRuntime is not enumerated in the generated qed-pipeline schema and the workload-spec change added consts and methods rather than fields. Root cargo check --workspace --all-targets shows no error in any crate I touched (the only failures are a peer's in-flight bash_ast::relocation::effective work in crates/yah/agent-tools).")
+//! @yah:gotcha("THE TICKET'S OWN VERIFY IS NOT MET AND CANNOT BE FROM THIS CAMP -- read this before signing off. It asks for an isolated build running end to end on a target node. Nothing has booted a guest: the camp host is macOS with no /dev/kvm, and more fundamentally NO NODE HAS A GUEST KERNEL OR ROOTFS, so MicroVmRuntime::new refuses to construct everywhere today and a microvm-marked deploy gets a BackendRefused naming --microvm-dir. That is the designed failure mode, not a bug. The remaining distance is filed as R605-F14 (build the guest kernel + rootfs + the init that reads /job.json) and R605-T15 (usermod -aG kvm on each node, per W325 section 4's measurement). This ticket delivered the software half W325 section 5 sized; F14 is the supply-chain half it warned was the real cost.")
+//! @yah:assumes("Firecracker's --no-api --config-file boot shape, its JSON field names (boot-source / machine-config / network-interfaces), and that a guest halting with panic=1 reboot=k exits the VMM process. All three are from Firecracker's documented behaviour and NONE are measured -- there is no KVM here. the_config_document_uses_firecrackers_field_names pins the serialization so a Rust rename cannot silently break it, but it cannot prove the names are the ones Firecracker wants. If the halt assumption is wrong the supervisor never fires and every job hangs until teardown; check that first on the first real boot (also recorded on R605-F14).")
+//! @yah:cleanup("kamaji-bin main.rs hardcodes the VMM path as /usr/bin/firecracker rather than searching PATH or taking a flag. Fine for a fleet where the node is provisioned by us, wrong the moment someone installs it elsewhere; give it a --microvm-vmm-bin when R605-F14 makes that a real question.")
+//! @yah:cleanup("Drain is not wired for microVM workloads -- a Drain returns DrainAck{accepted:false}, teardown is via Stop. Same deliberate gap the bundle backend has for the same reason (the runtime single-owns the process, so registering a pidfd DrainableHandle would double-own it and race the supervisor's reaper). Also: a leaked TAP from a crashed kamaji holds its slot until restart; create_tap deletes-then-creates so it self-heals on reuse, but nothing sweeps them.")
+//! @yah:handoff("IN REVIEW: the microVM backend and its annotation dispatch are built, wired end to end from a pipeline step down to the VMM launch, and unit-tested across five crates. It has never booted a guest and cannot until R605-F14 and R605-T15 land -- see the gotcha. Sign-off here is on the software, not on a working isolated build.")
+//! @yah:verify("PRECISION ON THE PROBE COUNT above: 2 new probe:: tests run on this macOS host (absent_kvm_device_is_unavailable_not_a_panic, microvm_is_unavailable_off_linux_without_touching_the_filesystem) plus availability_require_routes_per_backend extended to route Backend::MicroVm. A third, unopenable_kvm_device_names_the_group_fix, is cfg(target_os = linux) and has NOT run anywhere -- it reproduces W325 section 4's exists-but-EACCES case, which is the fleet's actual state, so run it on the first Linux node that gets this build.")
 
 pub mod inlined;
 pub mod probe;
@@ -73,6 +104,11 @@ pub mod docker;
 
 #[cfg(feature = "native-integration")]
 pub mod native;
+
+/// KVM microVM backend (R605-F8 / W325 §5) — boots a workload in a Firecracker
+/// guest with its own kernel instead of sharing the host's.
+#[cfg(feature = "microvm-integration")]
+pub mod microvm;
 
 /// On-demand ("serverless") JIT lifecycle (R599-F6): kamaji holds a workload's
 /// listen socket via the [`socket_custody`] custodian, forks the serve runtime
@@ -105,11 +141,16 @@ pub use workload_spec::{MeshIdent, WorkloadSpec};
 
 /// Which concrete runtime a given `Kamaji` instance is driving.
 ///
-/// Per W199 §Backend availability, Kamaji carries three backends. The
-/// `Native` backend is always available (fork+exec for musl-static Rust
-/// workloads); `Containerd` and `Docker` are probed at init and may be
-/// absent on a given host. Workloads that request an absent backend fail
-/// with a structured [`BackendUnavailable`] error.
+/// Per W199 §Backend availability, the `Native` backend is always available
+/// (fork+exec for musl-static Rust workloads); `Containerd`, `Docker` and
+/// `MicroVm` are probed at init and may be absent on a given host. Workloads
+/// that request an absent backend fail with a structured
+/// [`BackendUnavailable`] error.
+///
+/// The variants are ordered by **how much of the host a workload can see**,
+/// widest first: native shares everything, a container shares the kernel, a
+/// microVM shares only the hardware. That is also the order they were built in,
+/// which is a coincidence worth not reading anything into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
@@ -121,6 +162,17 @@ pub enum Backend {
     /// Docker CLI shell-out — dev backend for OrbStack / Docker Desktop /
     /// Colima. The pond outer substrate uses this.
     Docker,
+    /// KVM microVM (Firecracker) — the workload boots its own kernel in its
+    /// own guest (R605-F8 / W325 §5). Requires `/dev/kvm`, a guest kernel
+    /// image and a guest rootfs on the node; see [`microvm`].
+    ///
+    /// This is the only backend whose isolation does not depend on the host
+    /// kernel being uncompromised by the workload, which is why W325 reaches
+    /// for it to let a build share a node with production rather than needing
+    /// a node of its own.
+    ///
+    /// [`microvm`]: crate::microvm
+    MicroVm,
 }
 
 /// Reported when a workload requests a backend that this Kamaji instance

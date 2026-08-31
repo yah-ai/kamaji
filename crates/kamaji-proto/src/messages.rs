@@ -327,6 +327,16 @@ pub enum YubabaToKamaji {
         id: WorkloadId,
         spec: Workload,
     },
+    /// Poll the progress of an **asynchronous** deploy (R330-F33).
+    ///
+    /// A bundle `Deploy` acks on *admission* — before the node has materialized
+    /// the W272 tree or forked the serve process — so the ack cannot carry the
+    /// outcome. This is how the caller learns it. Appended last to keep the
+    /// postcard variant indices of the pre-existing variants wire-stable.
+    DeployStatus {
+        request_id: RequestId,
+        id: WorkloadId,
+    },
 }
 
 /// Kamaji → Yubaba message variants.
@@ -402,4 +412,141 @@ pub enum KamajiToYubaba {
         request_id: RequestId,
         entries: Vec<WorkloadEntry>,
     },
+    /// Response to [`YubabaToKamaji::DeployStatus`] (R330-F33).
+    ///
+    /// `state` is where the asynchronous deploy has got to: `Pending` while the
+    /// bundle materializes, `Starting` once the fork is issued, `Running` when
+    /// the workload is up, `Failed` when the deploy gave up. `detail` carries
+    /// the reason a `Failed` deploy failed — the message that used to come back
+    /// in the synchronous `Error` reply, and the only thing that makes an
+    /// asynchronous failure diagnosable. `None` on every non-failed state.
+    ///
+    /// Appended last to keep the postcard variant indices of the pre-existing
+    /// variants wire-stable.
+    DeployStatusResult {
+        request_id: RequestId,
+        id: WorkloadId,
+        state: WorkloadState,
+        detail: Option<String>,
+    },
+}
+
+impl KamajiToYubaba {
+    /// The [`RequestId`] this frame is a reply to, or `None` when it is not a
+    /// reply at all — the spontaneous lifecycle pushes, and a `Welcome`
+    /// arriving after the handshake already consumed one.
+    ///
+    /// R746-B11: this lives HERE, not in the client, because
+    /// `KamajiToYubaba` is `#[non_exhaustive]` — a match in any *other* crate
+    /// needs a wildcard arm, and a new reply variant then silently falls into
+    /// it and reads as a push. That is exactly what happened to
+    /// [`Self::DeployStatusResult`]: it was appended to the enum and never
+    /// added to the client's correlation table, so every `DeployStatus` poll
+    /// for a workload that HAD a deploy record got its reply dropped as an
+    /// unconsumed push and the caller parked on its oneshot forever. Inside
+    /// the defining crate the match below is exhaustive with no wildcard, so
+    /// the next appended variant fails to compile until it is classified.
+    pub fn reply_request_id(&self) -> Option<RequestId> {
+        match self {
+            Self::Ack { request_id, .. }
+            | Self::ProbeResult { request_id, .. }
+            | Self::DrainAck { request_id, .. }
+            | Self::DrainCompleted { request_id, .. }
+            | Self::WorkloadList { request_id, .. }
+            | Self::DeployStatusResult { request_id, .. } => Some(*request_id),
+            Self::Error { request_id, .. } => *request_id,
+            Self::Welcome { .. } | Self::WorkloadStarted { .. } | Self::WorkloadExited { .. } => {
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reply_correlation_tests {
+    use super::*;
+
+    fn rid() -> RequestId {
+        RequestId(7)
+    }
+
+    fn id() -> WorkloadId {
+        WorkloadId::new("yah-marketing")
+    }
+
+    /// Every variant that answers a request must correlate. The list is
+    /// written out by hand on purpose: `reply_request_id` cannot compile
+    /// without classifying a new variant, and this pins that the classifying
+    /// author picked the right side for the ones that already exist.
+    #[test]
+    fn every_reply_variant_correlates_to_its_request() {
+        let replies = [
+            KamajiToYubaba::Ack {
+                request_id: rid(),
+                kind: AckKind::Deploy,
+            },
+            KamajiToYubaba::Error {
+                request_id: Some(rid()),
+                code: ErrorCode::UnknownWorkload,
+                message: "nope".into(),
+            },
+            KamajiToYubaba::ProbeResult {
+                request_id: rid(),
+                id: id(),
+                status: ProbeStatus::Ready,
+            },
+            KamajiToYubaba::DrainAck {
+                request_id: rid(),
+                id: id(),
+                accepted: true,
+                reason: None,
+            },
+            KamajiToYubaba::DrainCompleted {
+                request_id: rid(),
+                id: id(),
+                outcome: DrainOutcome::UnknownWorkload,
+            },
+            KamajiToYubaba::WorkloadList {
+                request_id: rid(),
+                entries: vec![],
+            },
+            // R746-B11: this one was missing from the client's table.
+            KamajiToYubaba::DeployStatusResult {
+                request_id: rid(),
+                id: id(),
+                state: WorkloadState::Running,
+                detail: None,
+            },
+        ];
+        for reply in replies {
+            assert_eq!(
+                reply.reply_request_id(),
+                Some(rid()),
+                "{reply:?} answers a request and must route back to its waiter"
+            );
+        }
+    }
+
+    #[test]
+    fn pushes_and_untied_errors_do_not_correlate() {
+        let pushes = [
+            KamajiToYubaba::Welcome {
+                version: crate::version::ProtocolVersion::CURRENT,
+                kamaji_version: "test".into(),
+            },
+            KamajiToYubaba::WorkloadStarted { id: id(), pid: 123 },
+            KamajiToYubaba::WorkloadExited {
+                id: id(),
+                exit: ExitStatus::Exited(0),
+            },
+            KamajiToYubaba::Error {
+                request_id: None,
+                code: ErrorCode::Internal,
+                message: "malformed frame".into(),
+            },
+        ];
+        for push in pushes {
+            assert_eq!(push.reply_request_id(), None, "{push:?} is not a reply");
+        }
+    }
 }

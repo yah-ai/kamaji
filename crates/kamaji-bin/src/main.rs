@@ -50,6 +50,11 @@ struct Args {
     /// backend; `None` leaves native-marked container deploys refused.
     #[cfg_attr(not(feature = "native-exec"), allow(dead_code))]
     native_exec_dir: Option<PathBuf>,
+    /// Root of the node's microVM material (R605-F8): `<dir>/vmlinux`,
+    /// `<dir>/rootfs.ext4`, and `<dir>/vms` for per-guest state. `Some(dir)`
+    /// attaches the backend; `None` leaves microVM-marked deploys refused.
+    #[cfg_attr(not(feature = "microvm"), allow(dead_code))]
+    microvm_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> std::result::Result<Args, ParseError> {
@@ -89,6 +94,9 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
     // some ambient variable happened to be set.
     let mut native_exec_dir: Option<PathBuf> =
         std::env::var_os("KAMAJI_NATIVE_EXEC_DIR").map(PathBuf::from);
+
+    // R605-F8: microVM backend opt-in, same discipline again.
+    let mut microvm_dir: Option<PathBuf> = std::env::var_os("KAMAJI_MICROVM_DIR").map(PathBuf::from);
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -134,6 +142,13 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--native-exec-dir"))?,
                 );
             }
+            "--microvm-dir" => {
+                microvm_dir = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or(ParseError::MissingValue("--microvm-dir"))?,
+                );
+            }
             // Bare `--docker` inherits DOCKER_HOST; `--docker-host URL` pins one.
             "--docker" => docker_host = Some(String::new()),
             "--docker-host" => {
@@ -155,6 +170,7 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         bundle_port,
         docker_host,
         native_exec_dir,
+        microvm_dir,
     })
 }
 
@@ -171,7 +187,7 @@ fn print_help() {
     println!();
     println!(
         "Usage: kamaji [--socket PATH] [--containerd-socket PATH] [--docker | --docker-host URL]\n              \
-         [--native-exec-dir PATH]\n              \
+         [--native-exec-dir PATH] [--microvm-dir PATH]\n              \
          [--bundle-cache-dir PATH] [--bundle-origin URL] [--bundle-port PORT]"
     );
     println!();
@@ -192,6 +208,13 @@ fn print_help() {
     println!("                                Darwin build-workers: no container can run");
     println!("                                cargo-tauri/codesign/notarytool (default:");
     println!("                                $KAMAJI_NATIVE_EXEC_DIR, else such deploys are refused)");
+    println!("      --microvm-dir PATH        supervise Container workloads marked");
+    println!("                                `yah.exec = microvm` by booting each one in its own");
+    println!("                                KVM guest. PATH holds the guest kernel (vmlinux),");
+    println!("                                the guest rootfs (rootfs.ext4) and per-guest state.");
+    println!("                                Needs /dev/kvm openable by this user and");
+    println!("                                CAP_NET_ADMIN for guest networking (default:");
+    println!("                                $KAMAJI_MICROVM_DIR, else such deploys are refused)");
     println!("      --bundle-cache-dir PATH   node bundle root for serving published W272 mesofact");
     println!("                                bundles: <root>/bundles, <root>/runtimes, <root>/state");
     println!("                                (default: $KAMAJI_BUNDLE_CACHE_DIR, else serve-bundle");
@@ -212,6 +235,51 @@ fn print_help() {
     println!("Bundle-serving R2 credentials are read from the yah keystore (slots");
     println!("cloudflare-r2-access-key-id / cloudflare-r2-secret-key, env fallback");
     println!("CF_R2_ACCESS_KEY_ID / CF_R2_SECRET_KEY) plus $CF_ACCOUNT_ID — never from argv.");
+}
+
+/// Ceiling on guest RAM for this node, in MiB (R605-F8).
+///
+/// A microVM's memory is a real allocation, not a cgroup ceiling, so this
+/// number is the difference between "a build runs isolated" and "the node
+/// starts swapping under a raft voter" — which is precisely the outcome W325's
+/// whole isolation argument exists to prevent.
+///
+/// Half of `MemTotal` by default. Half rather than most-of because the node is
+/// not idle: on the fleet's OVH boxes it is simultaneously a raft voter and a
+/// yubaba, and this backend's promise is that a guest shares a node *safely*.
+/// `$KAMAJI_MICROVM_MAX_MEMORY_MB` overrides it for a dedicated build worker
+/// where that reasoning does not apply.
+///
+/// Read from `/proc/meminfo` rather than a Rust dependency: one file, one line,
+/// and the alternative is a crate in the supervisor's tree for a number this
+/// process reads exactly once at startup.
+#[cfg(feature = "microvm")]
+fn microvm_memory_cap_mb() -> u32 {
+    const FLOOR_MB: u32 = 2048;
+
+    if let Some(explicit) = std::env::var("KAMAJI_MICROVM_MAX_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+    {
+        return explicit;
+    }
+
+    let total_kb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))
+                .and_then(|v| v.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()))
+        })
+        .unwrap_or(0);
+
+    let half_mb = (total_kb / 1024 / 2) as u32;
+    // The floor wins on a host whose /proc is unreadable *or* genuinely tiny.
+    // Both cases end the same way — `MicroVmRuntime` refuses any workload
+    // requesting more than the cap, with a message naming both numbers — so
+    // guessing high here does not risk an over-committed guest.
+    half_mb.max(FLOOR_MB)
 }
 
 /// The compiled-in bundle port default, or a note that this build can't serve
@@ -255,11 +323,37 @@ fn run() -> Result<()> {
         }
     };
 
+    // R555-F4 / W235 §(c): say the admission posture out loud at startup.
+    //
+    // `workload_spec::admission::check` resolves this lazily and caches it, so
+    // without this line the first evidence a node gives of what it enforces is
+    // a refusal — or, worse, a silence that looks identical whether the
+    // operator's `YAH_ADMISSION` took effect or was ignored. That "did my
+    // security control turn on?" question is the one this module's typo-fails-
+    // closed rule already exists to answer; answering it before anything is
+    // dispatched costs one line.
+    let admission = workload_spec::admission::NodeAdmission::from_env();
+    tracing::info!(
+        policy = ?admission.policy,
+        pinned_keys = admission.trusted_keys.len(),
+        policy_env = workload_spec::admission::POLICY_ENV,
+        keys_env = workload_spec::admission::KEYS_ENV,
+        "signed-recipe admission posture (W235 §(c))"
+    );
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
         let ctx = build_ctx(&args).await?;
+        // R755-B5: bring back every bundle the previous kamaji was serving
+        // BEFORE the socket answers, so a control-plane roll is a restart of
+        // the node's sites and not an undeploy of them.
+        #[cfg(feature = "bundle-serving")]
+        {
+            let n = ctx.resume_bundle_workloads().await;
+            tracing::info!(resumed = n, "recorded bundle deploys replayed (R755-B5)");
+        }
         kamaji_bin::serve_with_ctx(&args.socket, ctx, async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -397,6 +491,50 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
             "--native-exec-dir requires the kamaji binary be built with \
              --features native-exec"
         );
+    }
+
+    // ── microVM backend (R605-F8 / W325 §5) ──────────────────────────────────
+    // For workloads that must not share the host kernel — a build placed next
+    // to a raft voter. Explicit opt-in like the others, but the flag alone is
+    // not enough: `MicroVmRuntime::new` refuses unless the node actually has a
+    // guest kernel and rootfs staged, and that refusal is fatal here rather
+    // than a warning. A node that was *told* to serve microVM workloads and
+    // silently could not would win placements it cannot honour, and every build
+    // routed to it would fail at deploy — noisily, but on the wrong node's
+    // ticket. Failing to start puts the error where the misconfiguration is.
+    #[cfg(feature = "microvm")]
+    {
+        ctx = if let Some(dir) = &args.microvm_dir {
+            let state_dir = dir.join("vms");
+            std::fs::create_dir_all(&state_dir).map_err(|e| {
+                anyhow::anyhow!("creating microVM state dir {}: {e}", state_dir.display())
+            })?;
+            let cfg = kamaji::microvm::MicroVmConfig {
+                vmm_bin: PathBuf::from("/usr/bin/firecracker"),
+                kernel_image: dir.join("vmlinux"),
+                rootfs_image: dir.join("rootfs.ext4"),
+                state_dir,
+                network: Some(kamaji::microvm::GuestNetwork::default()),
+                max_guest_memory_mb: microvm_memory_cap_mb(),
+                max_guest_vcpus: std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(1),
+            };
+            let runtime = kamaji::microvm::MicroVmRuntime::new(cfg)?;
+            tracing::info!(
+                microvm_dir = %dir.display(),
+                "microVM backend attached; Container workloads marked yah.exec=microvm \
+                 will be booted in their own KVM guest"
+            );
+            ctx.with_microvm(Arc::new(runtime))
+        } else {
+            tracing::debug!("no --microvm-dir; microVM-marked Container deploys will be refused");
+            ctx
+        };
+    }
+    #[cfg(not(feature = "microvm"))]
+    if args.microvm_dir.is_some() {
+        anyhow::bail!("--microvm-dir requires the kamaji binary be built with --features microvm");
     }
 
     // ── keep-alive mesofact bundle backend (R599-F10) ────────────────────────

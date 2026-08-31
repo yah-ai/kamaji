@@ -12,10 +12,24 @@
 //! - [`ProbeTarget`] — per-workload data Kamaji retains across deploy:
 //!   the [`Healthcheck`] spec plus the network endpoint to dial (`addr`,
 //!   resolved at deploy time — `127.0.0.1` for native and pond, the
-//!   containerd bridge IP for cloud-tier container workloads).
+//!   containerd bridge IP for cloud-tier container workloads), and/or the
+//!   workload's **process-control socket**.
 //! - [`run_probe`] — execute one probe and return [`ProbeStatus`]. Honors
 //!   `Healthcheck.timeout`; on a `None` target returns `ProbeStatus::Ready`
 //!   (no probe declared ↔ "trust the workload's existence as readiness").
+//!
+//! ## The control channel outranks the healthcheck (R715-F3 / W315)
+//!
+//! A workload that speaks the process-control channel answers the question
+//! directly — `starting`, `running`, `failed` — instead of being inferred from
+//! a bound port. `kamaji_proto::WorkloadState` and `procctl::ProcState` are the
+//! *same six words* by construction, so that answer is believed verbatim.
+//!
+//! When a target carries a control socket it is the whole probe: an
+//! unreachable socket reports `Starting`, never a fallback to the port. That is
+//! deliberate and it is the point of the channel — a bound port says nothing
+//! about whether the thing behind it finished booting, so falling back to it
+//! would reinstate exactly the false `Ready` W315 exists to end.
 //!
 //! Yubaba drives cadence by re-issuing
 //! [`kamaji_proto::YubabaToKamaji::Probe`]; this module answers one
@@ -42,7 +56,8 @@
 //! @yah:tier(Thief)
 //! @yah:handoff("DONE (verify-clean). Root cause: connection teardown AFTER a successful connect(), not at connect. Under full-workspace parallel load on macOS, connect() to a just-dropped loopback port races to succeed, then request write / first read gets ECONNRESET (os 54) -> fell through to HttpError::Io => Unhealthy, failing the Starting|Timeout assertion at probe.rs.\n\nFix (probe.rs production classifier, NOT the test): is_not_serving(kind)=Refused|Reset|Aborted|BrokenPipe + pre_response_err(), threaded through connect + write_all + flush + first read. Teardown BEFORE any response byte => Starting; teardown AFTER partial bytes stays Io => Unhealthy (truncated); well-formed non-2xx unaffected. Renamed HttpError::NotListening -> NotServing. Same predicate applied to run_tcp_connect (identical latent flake). Hardens real probing: workload mid-startup RSTing early connections now reads Starting not Unhealthy.\n\nVerify: 30x full parallel cargo test -p kamaji-bin --lib --all-features => 0 flakes (was ~35%). 23/23 probe unit tests green; full lib suite 188 passed. No test assertions changed.")
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kamaji_proto::ProbeStatus;
@@ -52,6 +67,10 @@ use tokio::time::timeout;
 use workload_spec::{HealthProbe, Healthcheck};
 
 /// Per-workload probe configuration Kamaji retains across deploy.
+///
+/// A target carries a control socket, a healthcheck, or both. With a control
+/// socket present it decides alone — see the module docs for why there is no
+/// fallback to the healthcheck.
 ///
 /// `addr` is the host:port to dial for `HttpGet` / `TcpConnect`. The deploy
 /// path resolves it at admission time:
@@ -64,8 +83,38 @@ use workload_spec::{HealthProbe, Healthcheck};
 /// need a network endpoint.
 #[derive(Debug, Clone)]
 pub struct ProbeTarget {
-    pub healthcheck: Healthcheck,
+    /// The spec's declared healthcheck. `None` for a workload whose only
+    /// readiness signal is its control channel — a portless GUI process has no
+    /// port to probe and inventing a healthcheck for it would be a lie.
+    pub healthcheck: Option<Healthcheck>,
+    /// Endpoint the healthcheck dials. Inert when `healthcheck` is `None`.
     pub addr: SocketAddr,
+    /// The workload's process-control socket (`$YAH_CONTROL_SOCK`), when it
+    /// declared one. Outranks `healthcheck`.
+    pub control: Option<PathBuf>,
+}
+
+impl ProbeTarget {
+    /// A target probed by the spec's declared healthcheck at `addr`.
+    pub fn healthcheck(healthcheck: Healthcheck, addr: SocketAddr) -> Self {
+        Self {
+            healthcheck: Some(healthcheck),
+            addr,
+            control: None,
+        }
+    }
+
+    /// A target probed by asking the workload directly (R715-F3 / W315).
+    ///
+    /// No `addr`: a workload on the control channel need not have a listener at
+    /// all, and the port is not consulted when the channel is present.
+    pub fn control(sock: impl Into<PathBuf>) -> Self {
+        Self {
+            healthcheck: None,
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            control: Some(sock.into()),
+        }
+    }
 }
 
 /// Execute a single probe against `target` and return its [`ProbeStatus`].
@@ -77,8 +126,14 @@ pub async fn run_probe(target: Option<&ProbeTarget>) -> ProbeStatus {
     let Some(target) = target else {
         return ProbeStatus::Ready;
     };
-    let deadline = Duration::from_millis(target.healthcheck.timeout.as_ms());
-    match &target.healthcheck.probe {
+    if let Some(control) = &target.control {
+        return run_control(control).await;
+    }
+    let Some(healthcheck) = &target.healthcheck else {
+        return ProbeStatus::Ready;
+    };
+    let deadline = Duration::from_millis(healthcheck.timeout.as_ms());
+    match &healthcheck.probe {
         HealthProbe::HttpGet {
             path,
             port,
@@ -92,6 +147,49 @@ pub async fn run_probe(target: Option<&ProbeTarget>) -> ProbeStatus {
             run_tcp_connect(addr, deadline).await
         }
         HealthProbe::Exec { argv } => run_exec(argv, deadline).await,
+    }
+}
+
+/// Ask the workload what it is doing, and believe it.
+///
+/// The vocabulary is shared with [`kamaji_proto::WorkloadState`] by
+/// construction (`procctl` holds the `From` impl, and it is an exhaustive
+/// match), so this is a projection onto the coarser [`ProbeStatus`] rather than
+/// a translation table:
+///
+/// | reported | probe |
+/// |---|---|
+/// | `running` | `Ready` — the only state that counts as serving |
+/// | `pending`, `starting` | `Starting` |
+/// | `draining`, `exited`, `failed` | `Unhealthy`, carrying the workload's own `detail` |
+///
+/// An unreachable socket is `Starting`, not `Unhealthy`: a workload that has
+/// not bound its control socket yet is indistinguishable here from one that
+/// never will, and calling the first case unhealthy would fail a workload for
+/// starting slowly.
+async fn run_control(sock: &Path) -> ProbeStatus {
+    use procctl::ProcState;
+
+    let status = match procctl::fetch_at(sock).await {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::trace!(sock = %sock.display(), error = %e, "control channel unreachable");
+            return ProbeStatus::Starting;
+        }
+    };
+    let detail = status
+        .detail
+        .as_deref()
+        .map(|d| format!(": {d}"))
+        .unwrap_or_default();
+    match status.state {
+        ProcState::Running => ProbeStatus::Ready,
+        ProcState::Pending | ProcState::Starting => ProbeStatus::Starting,
+        state @ (ProcState::Draining | ProcState::Exited | ProcState::Failed) => {
+            ProbeStatus::Unhealthy {
+                reason: format!("workload reports {state}{detail}"),
+            }
+        }
     }
 }
 
@@ -414,10 +512,10 @@ mod tests {
     async fn tcp_connect_ready_when_listener_accepts() {
         let listener = TcpListener::bind(loopback(0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let target = ProbeTarget {
-            healthcheck: hc(HealthProbe::TcpConnect { port }, 1000),
-            addr: loopback(port),
-        };
+        let target = ProbeTarget::healthcheck(
+            hc(HealthProbe::TcpConnect { port }, 1000),
+            loopback(port),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(matches!(status, ProbeStatus::Ready), "got {status:?}");
     }
@@ -430,10 +528,10 @@ mod tests {
         let listener = TcpListener::bind(loopback(0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let target = ProbeTarget {
-            healthcheck: hc(HealthProbe::TcpConnect { port }, 200),
-            addr: loopback(port),
-        };
+        let target = ProbeTarget::healthcheck(
+            hc(HealthProbe::TcpConnect { port }, 200),
+            loopback(port),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(
             matches!(status, ProbeStatus::Starting | ProbeStatus::Timeout),
@@ -463,8 +561,8 @@ mod tests {
     #[tokio::test]
     async fn http_get_ready_on_200() {
         let port = spawn_one_shot(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::HttpGet {
                     path: "/healthz".into(),
                     port,
@@ -472,8 +570,8 @@ mod tests {
                 },
                 1000,
             ),
-            addr: loopback(port),
-        };
+            loopback(port),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(matches!(status, ProbeStatus::Ready), "got {status:?}");
     }
@@ -481,8 +579,8 @@ mod tests {
     #[tokio::test]
     async fn http_get_unhealthy_on_503() {
         let port = spawn_one_shot(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n").await;
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::HttpGet {
                     path: "/healthz".into(),
                     port,
@@ -490,8 +588,8 @@ mod tests {
                 },
                 1000,
             ),
-            addr: loopback(port),
-        };
+            loopback(port),
+        );
         let status = run_probe(Some(&target)).await;
         match status {
             ProbeStatus::Unhealthy { reason } => assert!(reason.contains("503")),
@@ -502,8 +600,8 @@ mod tests {
     #[tokio::test]
     async fn http_get_expect_status_match_is_ready() {
         let port = spawn_one_shot(b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\n\r\n").await;
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::HttpGet {
                     path: "/healthz".into(),
                     port,
@@ -511,8 +609,8 @@ mod tests {
                 },
                 1000,
             ),
-            addr: loopback(port),
-        };
+            loopback(port),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(matches!(status, ProbeStatus::Ready), "got {status:?}");
     }
@@ -522,8 +620,8 @@ mod tests {
         let listener = TcpListener::bind(loopback(0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::HttpGet {
                     path: "/healthz".into(),
                     port,
@@ -531,8 +629,8 @@ mod tests {
                 },
                 200,
             ),
-            addr: loopback(port),
-        };
+            loopback(port),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(
             matches!(status, ProbeStatus::Starting | ProbeStatus::Timeout),
@@ -553,8 +651,8 @@ mod tests {
                 drop(sock);
             }
         });
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::HttpGet {
                     path: "/healthz".into(),
                     port,
@@ -562,8 +660,8 @@ mod tests {
                 },
                 100,
             ),
-            addr: loopback(port),
-        };
+            loopback(port),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(matches!(status, ProbeStatus::Timeout), "got {status:?}");
     }
@@ -572,23 +670,23 @@ mod tests {
 
     #[tokio::test]
     async fn exec_exit_zero_is_ready() {
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::Exec {
                     argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
                 },
                 1000,
             ),
-            addr: loopback(0),
-        };
+            loopback(0),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(matches!(status, ProbeStatus::Ready), "got {status:?}");
     }
 
     #[tokio::test]
     async fn exec_nonzero_is_unhealthy_with_exit_in_reason() {
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::Exec {
                     argv: vec![
                         "/bin/sh".into(),
@@ -598,8 +696,8 @@ mod tests {
                 },
                 1000,
             ),
-            addr: loopback(0),
-        };
+            loopback(0),
+        );
         let status = run_probe(Some(&target)).await;
         match status {
             ProbeStatus::Unhealthy { reason } => {
@@ -612,25 +710,25 @@ mod tests {
 
     #[tokio::test]
     async fn exec_timeout_when_command_hangs() {
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::Exec {
                     argv: vec!["/bin/sh".into(), "-c".into(), "sleep 10".into()],
                 },
                 100,
             ),
-            addr: loopback(0),
-        };
+            loopback(0),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(matches!(status, ProbeStatus::Timeout), "got {status:?}");
     }
 
     #[tokio::test]
     async fn exec_empty_argv_is_unhealthy() {
-        let target = ProbeTarget {
-            healthcheck: hc(HealthProbe::Exec { argv: vec![] }, 1000),
-            addr: loopback(0),
-        };
+        let target = ProbeTarget::healthcheck(
+            hc(HealthProbe::Exec { argv: vec![] }, 1000),
+            loopback(0),
+        );
         let status = run_probe(Some(&target)).await;
         match status {
             ProbeStatus::Unhealthy { reason } => assert!(reason.contains("empty")),
@@ -640,15 +738,15 @@ mod tests {
 
     #[tokio::test]
     async fn exec_unknown_binary_is_unhealthy() {
-        let target = ProbeTarget {
-            healthcheck: hc(
+        let target = ProbeTarget::healthcheck(
+            hc(
                 HealthProbe::Exec {
                     argv: vec!["/no/such/binary/zzz".into()],
                 },
                 1000,
             ),
-            addr: loopback(0),
-        };
+            loopback(0),
+        );
         let status = run_probe(Some(&target)).await;
         assert!(
             matches!(status, ProbeStatus::Unhealthy { .. }),
@@ -662,5 +760,103 @@ mod tests {
     async fn no_target_returns_ready() {
         let status = run_probe(None).await;
         assert!(matches!(status, ProbeStatus::Ready));
+    }
+
+    // ── run_probe: the control channel (R715-F3 / W315) ────────────────────────
+
+    /// Stand up a real conforming producer via the helper crate, so these
+    /// exercise the actual wire rather than a hand-rolled stand-in.
+    fn producer(
+        dir: &tempfile::TempDir,
+        status: procctl::ProcStatus,
+    ) -> (procctl::ControlServer, std::path::PathBuf) {
+        let sock = dir.path().join("control.sock");
+        let server = procctl::serve_at(&sock, move || status.clone()).unwrap();
+        (server, sock)
+    }
+
+    #[tokio::test]
+    async fn a_workload_reporting_running_is_ready() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_srv, sock) = producer(&tmp, procctl::ProcStatus::new(procctl::ProcState::Running));
+        let status = run_probe(Some(&ProbeTarget::control(sock))).await;
+        assert!(matches!(status, ProbeStatus::Ready), "got {status:?}");
+    }
+
+    /// The whole point: a process that is up, has bound everything it is going
+    /// to bind, and is *still booting* gets to say so.
+    #[tokio::test]
+    async fn a_workload_reporting_starting_is_not_ready() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_srv, sock) = producer(
+            &tmp,
+            procctl::ProcStatus::new(procctl::ProcState::Starting).with_detail("replaying WAL 3/7"),
+        );
+        let status = run_probe(Some(&ProbeTarget::control(sock))).await;
+        assert!(matches!(status, ProbeStatus::Starting), "got {status:?}");
+    }
+
+    /// A workload that says it failed is unhealthy *and* explains itself — the
+    /// `detail` line is the one that replaces grepping a log tail.
+    #[tokio::test]
+    async fn a_workload_reporting_failed_is_unhealthy_in_its_own_words() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_srv, sock) = producer(
+            &tmp,
+            procctl::ProcStatus::new(procctl::ProcState::Failed).with_detail("no GPU"),
+        );
+        match run_probe(Some(&ProbeTarget::control(sock))).await {
+            ProbeStatus::Unhealthy { reason } => {
+                assert!(reason.contains("failed"), "{reason}");
+                assert!(reason.contains("no GPU"), "{reason}");
+            }
+            other => panic!("expected Unhealthy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_draining_workload_is_not_ready() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_srv, sock) = producer(&tmp, procctl::ProcStatus::new(procctl::ProcState::Draining));
+        assert!(matches!(
+            run_probe(Some(&ProbeTarget::control(sock))).await,
+            ProbeStatus::Unhealthy { .. }
+        ));
+    }
+
+    /// "Hasn't bound its socket yet" and "never will" are indistinguishable
+    /// from here, and calling the first one unhealthy fails a workload for
+    /// starting slowly. Yubaba's `failure_threshold` is what eventually decides.
+    #[tokio::test]
+    async fn an_unbound_control_socket_reads_as_starting_not_unhealthy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = ProbeTarget::control(tmp.path().join("never-bound.sock"));
+        let status = run_probe(Some(&target)).await;
+        assert!(matches!(status, ProbeStatus::Starting), "got {status:?}");
+    }
+
+    /// The ladder, asserted: a listener is accepting on the declared
+    /// healthcheck's port — which would read `Ready` on its own — and the
+    /// workload says it is still starting. The workload wins.
+    #[tokio::test]
+    async fn the_control_channel_outranks_an_accepting_port() {
+        let listener = TcpListener::bind(loopback(0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_srv, sock) = producer(&tmp, procctl::ProcStatus::new(procctl::ProcState::Starting));
+
+        let port_only =
+            ProbeTarget::healthcheck(hc(HealthProbe::TcpConnect { port }, 1000), loopback(port));
+        assert!(
+            matches!(run_probe(Some(&port_only)).await, ProbeStatus::Ready),
+            "precondition: the port alone reads as ready",
+        );
+
+        let mut both = port_only.clone();
+        both.control = Some(sock);
+        assert!(
+            matches!(run_probe(Some(&both)).await, ProbeStatus::Starting),
+            "a declared channel must supersede the port",
+        );
     }
 }

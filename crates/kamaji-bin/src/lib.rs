@@ -78,4 +78,4 @@ pub use server::{
 
 /// Keep-alive native bundle backend (R599-F10). Only with `bundle-serving`.
 #[cfg(feature = "bundle-serving")]
-pub use server::{BundleBackend, DEFAULT_BUNDLE_PORT};
+pub use server::{BundleBackend, BundleDeployRecord, DEFAULT_BUNDLE_PORT};

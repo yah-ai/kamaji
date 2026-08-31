@@ -36,6 +36,12 @@ docker-integration = []
 # JIT + R600 cert-rotation both drive the kamaji-held listen socket).
 native-integration = ["dep:libc", "socket-custody"]
 
+# Firecracker microVM backend (R605-F8 / W325 §5). Shells out to the VMM,
+# e2fsprogs and iproute2, so it adds no Rust deps beyond libc for the teardown
+# signal — the cost of this backend is the node's guest kernel + rootfs, not
+# the dependency graph.
+microvm-integration = ["dep:libc"]
+
 # Socket-custodian primitive (R599-F9): kamaji binds+holds a workload's listen
 # socket (optionally in a mesh netns) and hands the fd to the workload process
 # over its pingora upgrade socket via SCM_RIGHTS. Shared core under R599-F6
@@ -62,14 +68,18 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "fs", "time", "process"] }
 tokio-stream = { version = "0.1", features = ["io-util"] }
 tracing = "0.1"
-workload-spec = { package = "yah-workload-spec", version = "0.8.22" }
+# R555-F4 (W235 §(c)): `admission-verify` brings in the Ed25519 half of
+# `workload_spec::admission`. Not optional — deciding what is allowed to run
+# is kamaji's job description, and a build that could silently omit the
+# admission gate is a build an operator cannot tell apart from one that has it.
+workload-spec = { package = "yah-workload-spec", version = "0.8.29", features = ["admission-verify"] }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.22", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.29", default-features = false }
 
 # SIGTERM for the native backend's graceful stop (optional — native-integration).
 libc = { version = "0.2", optional = true }
@@ -80,7 +90,7 @@ libc = { version = "0.2", optional = true }
 nix = { version = "0.29", optional = true, features = ["socket", "sched", "uio"] }
 
 # Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
-kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.22" }
+kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.29" }
 
 [dev-dependencies]
 tempfile = "3"

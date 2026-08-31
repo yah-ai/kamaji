@@ -164,6 +164,9 @@ mod tests {
             native: probe(Backend::Native, native),
             containerd: probe(Backend::Containerd, containerd),
             docker: probe(Backend::Docker, docker),
+            // Never available in these tests: `Inlined::pick` is the desktop's
+            // backend chooser and the desktop has no microVM story (R605-F8).
+            microvm: probe(Backend::MicroVm, false),
         }
     }
 

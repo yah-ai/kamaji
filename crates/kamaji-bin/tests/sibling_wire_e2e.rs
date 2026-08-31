@@ -414,7 +414,10 @@ async fn scripted_backend(listener: UnixListener) {
                 spec,
                 mesh,
             } => match spec {
-                workload_spec::Workload::Container(decoded) => {
+                ref w @ workload_spec::Workload::Container(_) => {
+                    let decoded = w
+                        .container_spec()
+                        .expect("the wire only ever carries the digest-pinned form");
                     // Prove the spec survived the postcard wire on the server
                     // side — nested ImageRef + the three-element env Vec.
                     assert_eq!(

@@ -581,6 +581,13 @@ impl Kamaji for DockerRuntime {
         spec: &WorkloadSpec,
         mesh: &MeshAssignment,
     ) -> Result<DeployResult> {
+        // Signed-recipe admission (R555-F4 / W235 §(c)). This backend serves
+        // pond and dev hosts rather than the shared fleet, so it is not where
+        // the RCE surface lives — but a gate a workload can dodge by naming a
+        // different backend is not a gate, and the check is one line.
+        workload_spec::admission::check(spec)
+            .map_err(|e| anyhow!("workload {} not admitted: {e}", spec.name))?;
+
         let ident = &spec.expose.mesh.identity;
         let name = Self::container_name(ident).to_string();
         let image = Self::image_ref(spec);

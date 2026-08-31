@@ -774,6 +774,13 @@ impl Kamaji for ContainerdRuntime {
             );
         }
 
+        // Signed-recipe admission (R555-F4 / W235 §(c)). Deliberately AFTER the
+        // two tier guards and BEFORE anything is torn down or created: the tier
+        // checks are free and name a spec bug, this one may involve crypto and
+        // names a trust decision, and neither should have side effects.
+        workload_spec::admission::check(spec)
+            .map_err(|e| anyhow::anyhow!("workload {} not admitted: {e}", spec.name))?;
+
         // Idempotent redeploy: reap any prior generation(s) — BOTH pod slots —
         // reset the slot cell, and release any held custody listen socket.
         let _ = self.teardown_workload(&spec.expose.mesh.identity).await;

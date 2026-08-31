@@ -25,25 +25,39 @@
 //! - Requests serialize as `YubabaToKamaji` postcard frames; responses
 //!   deserialize from `KamajiToYubaba`. The codec is shared with
 //!   `app/yah/kamaji`'s server.
-//! - Kamaji processes a connection serially (`handle_message` per frame),
-//!   so the client matches: one in-flight request at a time, gated by a
-//!   `tokio::sync::Mutex<Inner>`. Concurrent callers queue, which mirrors
-//!   how yubaba's HTTP handlers already serialize on the runtime trait.
+//! - The socket halves are owned by two background tasks — a **reader** that
+//!   demuxes replies to waiters by [`RequestId`], and a **writer** fed by an
+//!   mpsc queue. Callers never touch the socket; they park on a `oneshot`.
 //! - On connect, the client exchanges `Hello`/`Welcome` to verify the
 //!   protocol version and capture Kamaji's build version for tracing.
 //!
-//! ## Why a serial mutex, not a multiplex actor
+//! ## Why a demux actor, not a serial mutex
 //!
-//! `RequestId` is in the wire format so the protocol *can* multiplex, but
-//! Kamaji's current dispatcher (`handle_message`) replies in receipt order
-//! per connection. Until Kamaji grows out-of-order replies, the simpler
-//! mutex+serial shape is correct and easier to reason about. When Kamaji
-//! later sends pushed messages (`WorkloadStarted`, `WorkloadExited`,
-//! `DrainCompleted`), this client will need a background reader that demuxes
-//! responses from pushes by `RequestId`; the public API stays the same.
+//! This client used to hold a `Mutex<Inner>` across `write_frame` then
+//! `read_frame`, correlating by position rather than by `RequestId`. That is
+//! **not cancel-safe**, and the failure is permanent rather than transient:
+//! drop the calling future between the write and the read — which is exactly
+//! what axum does to a handler when an HTTP client times out or disconnects —
+//! and the request id is consumed while Kamaji's reply stays queued in the
+//! socket. Every later call then reads the *previous* call's reply. The
+//! connection is off-by-one forever, `check_rid` can only report it
+//! (`expected 89, got 88`), and nothing short of a yubaba restart clears it.
+//!
+//! Owning both halves in tasks fixes both directions. A cancelled caller drops
+//! its `oneshot::Receiver`, so its reply is discarded instead of being handed
+//! to the next caller; and because the actual `write_all` happens in the writer
+//! task rather than in the caller's future, a cancel can never leave a partial
+//! frame on the wire.
+//!
+//! Demuxing by id is also what lets pushed messages coexist with replies:
+//! `WorkloadStarted` / `WorkloadExited` carry no `RequestId` at all, so under
+//! the old positional scheme the first one Kamaji ever sent would have been
+//! delivered to some unrelated caller as its reply.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -53,8 +67,9 @@ use kamaji_proto::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream};
-use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
 /// Default yubaba ↔ Kamaji socket path used when no override is provided.
 ///
@@ -92,24 +107,57 @@ pub enum ClientError {
     #[error("kamaji replied with unexpected variant: {0}")]
     Unexpected(String),
 
-    /// Kamaji replied with a [`RequestId`] that did not match the request.
-    #[error("kamaji response request_id mismatch (expected {expected:?}, got {got:?})")]
-    RequestIdMismatch { expected: RequestId, got: RequestId },
-
     /// Kamaji handshake rejected our protocol version.
     #[error("kamaji rejected handshake (version {wanted:?})")]
     HandshakeRefused { wanted: ProtocolVersion },
 }
 
-/// Per-connection state. Held behind a `Mutex` so concurrent callers
-/// serialize their requests onto the single socket.
-#[derive(Debug)]
-struct Inner {
-    rd: OwnedReadHalf,
-    wr: OwnedWriteHalf,
-    /// Read buffer carried between calls so a frame split across two reads
-    /// still decodes cleanly.
-    buf: Vec<u8>,
+/// Waiters for in-flight requests, keyed by the id they were sent with.
+///
+/// The reader task removes an entry when it delivers, and a caller's
+/// [`PendingGuard`] removes it if the caller goes away first — so a cancelled
+/// request leaves nothing behind for the next reply to land on.
+#[derive(Debug, Default)]
+struct Shared {
+    pending: Mutex<HashMap<RequestId, oneshot::Sender<KamajiToYubaba>>>,
+    /// Set once either task exits. Read before enqueuing so a request onto a
+    /// dead connection fails fast instead of parking forever.
+    dead: AtomicBool,
+}
+
+impl Shared {
+    /// Mark the connection dead and drop every waiter's sender, which wakes
+    /// each parked caller with [`ClientError::PeerClosed`].
+    fn shutdown(&self) {
+        self.dead.store(true, Ordering::Release);
+        self.pending.lock().unwrap().clear();
+    }
+
+    /// Fail every waiter with a copy of an error Kamaji sent without a
+    /// `RequestId`. See [`reader_loop`] for why this is a broadcast.
+    fn fail_all(&self, code: ErrorCode, message: &str) {
+        let waiters: Vec<_> = self.pending.lock().unwrap().drain().collect();
+        for (rid, tx) in waiters {
+            let _ = tx.send(KamajiToYubaba::Error {
+                request_id: Some(rid),
+                code,
+                message: message.to_string(),
+            });
+        }
+    }
+}
+
+/// Removes a caller's pending entry on drop, including when the drop is a
+/// cancellation. Delivery already removed it, so the common path is a no-op.
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    rid: RequestId,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.pending.lock().unwrap().remove(&self.rid);
+    }
 }
 
 /// Kamaji-side metadata learned during the handshake. Used for tracing
@@ -130,7 +178,20 @@ pub struct KamajiClient {
     socket: PathBuf,
     next_request_id: AtomicU64,
     info: ConstableInfo,
-    inner: Mutex<Inner>,
+    shared: Arc<Shared>,
+    /// Encoded frames queued for the writer task. Unbounded so enqueuing has
+    /// no `.await` in it, which is what keeps [`KamajiClient::request`]'s send
+    /// leg uncancellable.
+    outbound: mpsc::UnboundedSender<Vec<u8>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for KamajiClient {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 impl KamajiClient {
@@ -140,20 +201,19 @@ impl KamajiClient {
     pub async fn connect(socket: impl Into<PathBuf>) -> Result<Self, ClientError> {
         let socket = socket.into();
         let stream = UnixStream::connect(&socket).await?;
-        let (rd, wr) = stream.into_split();
-        let mut inner = Inner {
-            rd,
-            wr,
-            buf: Vec::with_capacity(4096),
-        };
+        let (mut rd, mut wr) = stream.into_split();
+        // Carried into the reader task: the handshake read may have pulled the
+        // leading bytes of a following frame off the socket already.
+        let mut buf = Vec::with_capacity(4096);
 
-        // Handshake — write Hello, read Welcome (or Error).
+        // Handshake — write Hello, read Welcome (or Error). Runs inline on the
+        // caller's future rather than in the tasks, so a refused version or a
+        // dead socket surfaces from `connect` itself.
         let hello = YubabaToKamaji::Hello {
             version: ProtocolVersion::CURRENT,
         };
-        let inner_mut: &mut Inner = &mut inner;
-        write_frame(&mut inner_mut.wr, &hello).await?;
-        let reply = read_frame(&mut inner_mut.rd, &mut inner_mut.buf).await?;
+        write_frame(&mut wr, &hello).await?;
+        let reply = read_frame(&mut rd, &mut buf).await?;
         let info = match reply {
             KamajiToYubaba::Welcome {
                 version,
@@ -174,11 +234,20 @@ impl KamajiClient {
             "kamaji handshake complete"
         );
 
+        let shared = Arc::new(Shared::default());
+        let (outbound, rx) = mpsc::unbounded_channel();
+        let tasks = vec![
+            tokio::spawn(reader_loop(rd, buf, Arc::clone(&shared))),
+            tokio::spawn(writer_loop(wr, rx, Arc::clone(&shared))),
+        ];
+
         Ok(Self {
             socket,
             next_request_id: AtomicU64::new(1),
             info,
-            inner: Mutex::new(inner),
+            shared,
+            outbound,
+            tasks,
         })
     }
 
@@ -192,6 +261,14 @@ impl KamajiClient {
         &self.info
     }
 
+    /// True once the reader or writer task has exited — a request sent now
+    /// would fail immediately with [`ClientError::PeerClosed`]. Used by
+    /// [`KamajiSibling`]'s reconnect watchdog to detect a dropped sibling
+    /// without waiting for a caller to notice first.
+    pub fn is_dead(&self) -> bool {
+        self.shared.dead.load(Ordering::Acquire)
+    }
+
     fn next_request_id(&self) -> RequestId {
         RequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -203,13 +280,7 @@ impl KamajiClient {
             .request(YubabaToKamaji::List { request_id }, request_id)
             .await?;
         match reply {
-            KamajiToYubaba::WorkloadList {
-                request_id: rid,
-                entries,
-            } => {
-                check_rid(request_id, rid)?;
-                Ok(entries)
-            }
+            KamajiToYubaba::WorkloadList { entries, .. } => Ok(entries),
             other => Err(ClientError::Unexpected(format!("{other:?}"))),
         }
     }
@@ -255,12 +326,9 @@ impl KamajiClient {
             .await?;
         match reply {
             KamajiToYubaba::Ack {
-                request_id: rid,
                 kind: kamaji_proto::AckKind::Deploy,
-            } => {
-                check_rid(request_id, rid)?;
-                Ok(())
-            }
+                ..
+            } => Ok(()),
             other => Err(ClientError::Unexpected(format!("{other:?}"))),
         }
     }
@@ -280,12 +348,7 @@ impl KamajiClient {
             )
             .await?;
         match reply {
-            KamajiToYubaba::Ack {
-                request_id: rid, ..
-            } => {
-                check_rid(request_id, rid)?;
-                Ok(())
-            }
+            KamajiToYubaba::Ack { .. } => Ok(()),
             other => Err(ClientError::Unexpected(format!("{other:?}"))),
         }
     }
@@ -310,14 +373,41 @@ impl KamajiClient {
             .await?;
         match reply {
             KamajiToYubaba::DrainAck {
-                request_id: rid,
-                accepted,
-                reason,
-                ..
-            } => {
-                check_rid(request_id, rid)?;
-                Ok((accepted, reason))
-            }
+                accepted, reason, ..
+            } => Ok((accepted, reason)),
+            other => Err(ClientError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// `YubabaToKamaji::DeployStatus` — where an asynchronous bundle deploy
+    /// has got to (R330-F33).
+    ///
+    /// A bundle [`deploy_envelope`] acks on admission, so this is how a caller
+    /// learns whether the node actually materialized and forked it. Returns
+    /// `(state, detail)`; `detail` is the failure reason on
+    /// [`WorkloadState::Failed`] and `None` otherwise. An id kamaji never
+    /// admitted comes back as [`ClientError::Remote`] with
+    /// [`ErrorCode::UnknownWorkload`], which a polling caller must treat as
+    /// terminal rather than as "not yet".
+    ///
+    /// [`deploy_envelope`]: Self::deploy_envelope
+    /// [`WorkloadState::Failed`]: kamaji_proto::WorkloadState::Failed
+    pub async fn deploy_status(
+        &self,
+        id: &WorkloadId,
+    ) -> Result<(kamaji_proto::WorkloadState, Option<String>), ClientError> {
+        let request_id = self.next_request_id();
+        let reply = self
+            .request(
+                YubabaToKamaji::DeployStatus {
+                    request_id,
+                    id: id.clone(),
+                },
+                request_id,
+            )
+            .await?;
+        match reply {
+            KamajiToYubaba::DeployStatusResult { state, detail, .. } => Ok((state, detail)),
             other => Err(ClientError::Unexpected(format!("{other:?}"))),
         }
     }
@@ -335,32 +425,43 @@ impl KamajiClient {
             )
             .await?;
         match reply {
-            KamajiToYubaba::ProbeResult {
-                request_id: rid,
-                status,
-                ..
-            } => {
-                check_rid(request_id, rid)?;
-                Ok(status)
-            }
+            KamajiToYubaba::ProbeResult { status, .. } => Ok(status),
             other => Err(ClientError::Unexpected(format!("{other:?}"))),
         }
     }
 
-    /// Send `req`, await one reply, surface `Error{code,message}` payloads as
-    /// [`ClientError::Remote`]. Holds the inner mutex across the round-trip
-    /// so the next caller's frame can't interleave on the wire.
+    /// Register a waiter under `rid`, queue `req` for the writer task, and park
+    /// until the reader routes the matching reply back. `Error{code,message}`
+    /// payloads surface as [`ClientError::Remote`].
+    ///
+    /// Cancel-safe in both directions: the only `.await` a caller holds is on
+    /// the `oneshot`, so dropping this future discards that request's reply
+    /// (via [`PendingGuard`]) and cannot desynchronize anyone else's, nor leave
+    /// a half-written frame on the wire.
     async fn request(
         &self,
         req: YubabaToKamaji,
-        expected_rid: RequestId,
+        rid: RequestId,
     ) -> Result<KamajiToYubaba, ClientError> {
-        let mut guard = self.inner.lock().await;
-        // Deref the MutexGuard so disjoint-field borrows of rd/wr/buf are
-        // visible to the borrow checker (Deref-target borrows would block).
-        let inner: &mut Inner = &mut guard;
-        write_frame(&mut inner.wr, &req).await?;
-        let reply = read_frame(&mut inner.rd, &mut inner.buf).await?;
+        let bytes = encode_frame(&req)?;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.shared.pending.lock().unwrap();
+            if self.shared.dead.load(Ordering::Acquire) {
+                return Err(ClientError::PeerClosed);
+            }
+            pending.insert(rid, tx);
+        }
+        let _guard = PendingGuard {
+            shared: &self.shared,
+            rid,
+        };
+
+        self.outbound
+            .send(bytes)
+            .map_err(|_| ClientError::PeerClosed)?;
+        let reply = rx.await.map_err(|_| ClientError::PeerClosed)?;
+
         if let KamajiToYubaba::Error {
             request_id,
             code,
@@ -373,24 +474,72 @@ impl KamajiClient {
                 %message,
                 "kamaji returned Error for request"
             );
-            // The wire only carries Some(request_id) when Kamaji correlates
-            // it to a specific request; an Error with None is a connection-level
-            // failure (e.g. malformed frame) and shouldn't be silently mapped.
-            if let Some(rid) = request_id {
-                check_rid(expected_rid, rid)?;
-            }
             return Err(ClientError::Remote { code, message });
         }
         Ok(reply)
     }
 }
 
-fn check_rid(expected: RequestId, got: RequestId) -> Result<(), ClientError> {
-    if expected == got {
-        Ok(())
-    } else {
-        Err(ClientError::RequestIdMismatch { expected, got })
+/// Owns the read half: decode frames, route each to its waiter, and fail every
+/// waiter when the connection ends.
+async fn reader_loop(mut rd: OwnedReadHalf, mut buf: Vec<u8>, shared: Arc<Shared>) {
+    loop {
+        let msg = match read_frame(&mut rd, &mut buf).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                debug!(error = %e, "kamaji reader loop ended");
+                break;
+            }
+        };
+
+        // The correlation table lives on the proto enum (R746-B11) so it is
+        // exhaustive: a reply variant appended here cannot silently be routed
+        // as a push.
+        match msg.reply_request_id() {
+            Some(rid) => {
+                let waiter = shared.pending.lock().unwrap().remove(&rid);
+                match waiter {
+                    Some(tx) => {
+                        // Send fails only if the caller was cancelled between
+                        // the remove and here; the reply is then correctly
+                        // dropped rather than handed to the next caller.
+                        let _ = tx.send(msg);
+                    }
+                    None => debug!(?rid, "kamaji reply with no waiter; dropped"),
+                }
+            }
+            // An `Error` with no id is by definition not tied to a request, yet
+            // Kamaji sends one for an unhandled message kind and keeps the
+            // connection open — a live yubaba talking to an older kamaji hits
+            // exactly that. There is no way to tell whose failure it is, so
+            // every waiter gets it: wrong-but-loud beats parking them all until
+            // the socket happens to close.
+            None => match &msg {
+                KamajiToYubaba::Error { code, message, .. } => {
+                    warn!(?code, %message, "kamaji error with no request_id; failing all waiters");
+                    shared.fail_all(*code, message);
+                }
+                other => debug!(?other, "kamaji push frame; no consumer"),
+            },
+        }
     }
+    shared.shutdown();
+}
+
+/// Owns the write half. Frames are written here rather than in the caller's
+/// future so a cancelled caller can never truncate one mid-frame.
+async fn writer_loop(
+    mut wr: OwnedWriteHalf,
+    mut outbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    shared: Arc<Shared>,
+) {
+    while let Some(bytes) = outbound.recv().await {
+        if let Err(e) = wr.write_all(&bytes).await {
+            debug!(error = %e, "kamaji writer loop ended");
+            break;
+        }
+    }
+    shared.shutdown();
 }
 
 async fn write_frame(wr: &mut OwnedWriteHalf, msg: &YubabaToKamaji) -> Result<(), ClientError> {
@@ -531,7 +680,7 @@ impl crate::Kamaji for KamajiClient {
         mesh: &crate::MeshAssignment,
     ) -> anyhow::Result<crate::DeployResult> {
         let id = WorkloadId::new(&spec.name);
-        let workload_envelope = workload_spec::Workload::Container(spec.clone());
+        let workload_envelope = workload_spec::Workload::container(spec.clone());
         self.deploy_envelope(&id, &workload_envelope, wire_mesh(mesh))
             .await
             .map_err(|e| anyhow::anyhow!("kamaji deploy_workload: {e}"))?;
@@ -593,7 +742,7 @@ impl crate::Kamaji for KamajiClient {
         mesh: &crate::MeshAssignment,
     ) -> anyhow::Result<crate::DeployResult> {
         let id = WorkloadId::new(&spec.name);
-        let workload_envelope = workload_spec::Workload::Container(spec.clone());
+        let workload_envelope = workload_spec::Workload::container(spec.clone());
         let request_id = self.next_request_id();
         let reply = self
             .request(
@@ -608,11 +757,9 @@ impl crate::Kamaji for KamajiClient {
             .map_err(|e| anyhow::anyhow!("kamaji graceful_upgrade_workload: {e}"))?;
         match reply {
             KamajiToYubaba::Ack {
-                request_id: rid,
                 kind: kamaji_proto::AckKind::GracefulUpgrade,
+                ..
             } => {
-                check_rid(request_id, rid)
-                    .map_err(|e| anyhow::anyhow!("kamaji graceful_upgrade ack: {e}"))?;
                 Ok(crate::DeployResult {
                     container_id: id.0,
                     mesh_ip: mesh.mesh_ip,
@@ -663,6 +810,137 @@ pub async fn connect_with_timeout(
     result.with_context(|| format!("connecting to kamaji at {}", socket.display()))
 }
 
+/// How often [`KamajiSibling`]'s watchdog polls [`KamajiClient::is_dead`]
+/// between reconnect attempts.
+const RECONNECT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// First reconnect retry delay after a failed dial; doubles on each further
+/// failure up to [`RECONNECT_MAX_BACKOFF`]. Same shape as
+/// [`crate::native::ALWAYS_RESTART_DELAY`]'s "don't hot-loop a down peer"
+/// concern, just with backoff since a socket that's down for a `cargo
+/// build` deploy can stay down for tens of seconds.
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A [`KamajiClient`] handle that transparently reconnects after the sibling
+/// process restarts.
+///
+/// A bare `KamajiClient` is a one-shot connection (see the module docs'
+/// "demux actor" rationale for why it can't just retry a write in place):
+/// once Kamaji's process exits — e.g. `systemctl restart kamaji` for a
+/// binary swap — every call on the old client fails forever with
+/// [`ClientError::PeerClosed`], and nothing except restarting the *caller*
+/// re-dials. Observed live 2026-08-13: a kamaji binary swap left yubaba
+/// answering every workload call with PeerClosed until yubaba itself was
+/// restarted.
+///
+/// `KamajiSibling` owns a background watchdog that polls
+/// [`KamajiClient::is_dead`], clears the published handle to `None` the
+/// moment it trips (so callers see "kamaji unavailable" rather than a
+/// client that can only ever error), and redials with backoff until it
+/// reconnects. Every [`KamajiSibling::current`] caller and every
+/// [`KamajiSibling::subscribe`] watcher observes the swap without doing
+/// any reconnect bookkeeping itself.
+#[derive(Clone)]
+pub struct KamajiSibling {
+    socket: Arc<Path>,
+    rx: tokio::sync::watch::Receiver<Option<Arc<KamajiClient>>>,
+}
+
+impl KamajiSibling {
+    /// Wrap an already-connected `client` and start the reconnect watchdog.
+    /// `socket` is redialled on every reconnect; `connect_timeout` bounds
+    /// each individual dial attempt (mirrors [`connect_with_timeout`]).
+    pub fn new(client: KamajiClient, socket: impl Into<PathBuf>, connect_timeout: Duration) -> Self {
+        let socket: Arc<Path> = socket.into().into();
+        let (tx, rx) = tokio::sync::watch::channel(Some(Arc::new(client)));
+        tokio::spawn(reconnect_watchdog(tx, socket.to_path_buf(), connect_timeout));
+        Self { socket, rx }
+    }
+
+    /// The current client, or `None` while a reconnect is in flight.
+    pub fn current(&self) -> Option<Arc<KamajiClient>> {
+        self.rx.borrow().clone()
+    }
+
+    /// The socket path this sibling dials and redials — stable across
+    /// reconnects, unlike [`Self::current`].
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// A receiver that wakes on every reconnect (never on the initial
+    /// connect, since that value is already the receiver's seed). Callers
+    /// that want to reconcile state once Kamaji comes back — e.g. re-check
+    /// which workloads it lost — `.changed().await` this in a loop.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<Arc<KamajiClient>>> {
+        self.rx.clone()
+    }
+}
+
+/// Background task backing [`KamajiSibling`]. Exits once every handle
+/// (the original plus every `subscribe()` clone) is dropped, per
+/// `watch::Sender::is_closed`.
+async fn reconnect_watchdog(
+    tx: tokio::sync::watch::Sender<Option<Arc<KamajiClient>>>,
+    socket: PathBuf,
+    connect_timeout: Duration,
+) {
+    loop {
+        // Poll until the published client dies (or was already cleared by a
+        // prior failed reconnect attempt).
+        loop {
+            if tx.is_closed() {
+                return;
+            }
+            let dead = tx.borrow().as_ref().is_none_or(|c| c.is_dead());
+            if dead {
+                break;
+            }
+            tokio::time::sleep(RECONNECT_POLL_INTERVAL).await;
+        }
+        if tx.is_closed() {
+            return;
+        }
+        // Clear immediately: a caller mid-reconnect should see "no kamaji"
+        // (and fall back / wait) rather than a handle that will only ever
+        // answer PeerClosed.
+        if tx.send(None).is_err() {
+            return;
+        }
+        warn!(socket = %socket.display(), "kamaji sibling connection lost; reconnecting");
+
+        let mut backoff = RECONNECT_INITIAL_BACKOFF;
+        loop {
+            match connect_with_timeout(socket.clone(), connect_timeout).await {
+                Ok(client) => {
+                    info!(
+                        socket = %socket.display(),
+                        kamaji_version = %client.info().kamaji_version,
+                        "kamaji sibling reconnected"
+                    );
+                    if tx.send(Some(Arc::new(client))).is_err() {
+                        return;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    if tx.is_closed() {
+                        return;
+                    }
+                    debug!(
+                        socket = %socket.display(),
+                        error = %e,
+                        next_attempt_in = ?backoff,
+                        "kamaji reconnect attempt failed"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,68 +948,100 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
+    /// Server side of one test connection. Lets a test drive the wire
+    /// explicitly — how many requests it reads before replying, in what order
+    /// it replies, and what it interleaves between replies.
+    struct ServerConn {
+        stream: tokio::net::UnixStream,
+        buf: Vec<u8>,
+    }
+
+    impl ServerConn {
+        /// Next request from the client. Panics on EOF — a test that expects
+        /// the client to go away should simply stop calling this.
+        async fn recv(&mut self) -> YubabaToKamaji {
+            let mut tmpbuf = [0u8; 4096];
+            loop {
+                match decode_frame::<YubabaToKamaji>(&self.buf) {
+                    Ok((m, n)) => {
+                        self.buf.drain(..n);
+                        return m;
+                    }
+                    Err(CodecError::Truncated { .. }) => {
+                        let n = self.stream.read(&mut tmpbuf).await.unwrap();
+                        assert!(n > 0, "client closed the connection");
+                        self.buf.extend_from_slice(&tmpbuf[..n]);
+                    }
+                    Err(e) => panic!("decode req: {e}"),
+                }
+            }
+        }
+
+        async fn send(&mut self, msg: &KamajiToYubaba) {
+            let bytes = encode_frame(msg).unwrap();
+            self.stream.write_all(&bytes).await.unwrap();
+        }
+    }
+
+    /// Spin up an in-process "kamaji" on a tempdir socket, complete the
+    /// handshake, then hand the connection to `drive`.
+    async fn scripted_server<F, Fut>(drive: F) -> (tempfile::TempDir, PathBuf)
+    where
+        F: FnOnce(ServerConn) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("kamaji.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut conn = ServerConn {
+                stream,
+                buf: Vec::with_capacity(4096),
+            };
+            assert!(matches!(conn.recv().await, YubabaToKamaji::Hello { .. }));
+            conn.send(&KamajiToYubaba::Welcome {
+                version: ProtocolVersion::CURRENT,
+                kamaji_version: "test-0.0.1".into(),
+            })
+            .await;
+            drive(conn).await;
+        });
+        (tmp, sock)
+    }
+
     /// Spin up a one-shot in-process "kamaji" on a tempdir socket that
     /// answers the first incoming request with the closure's reply.
     async fn one_shot_server(
         expect_after_hello: impl FnOnce(YubabaToKamaji) -> KamajiToYubaba + Send + 'static,
     ) -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("kamaji.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let welcome = KamajiToYubaba::Welcome {
-            version: ProtocolVersion::CURRENT,
-            kamaji_version: "test-0.0.1".into(),
-        };
-        let answer = std::sync::Arc::new(std::sync::Mutex::new(Some(expect_after_hello)));
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = Vec::with_capacity(4096);
-            let mut tmpbuf = [0u8; 4096];
+        scripted_server(|mut conn| async move {
+            let req = conn.recv().await;
+            let reply = expect_after_hello(req);
+            conn.send(&reply).await;
+        })
+        .await
+    }
 
-            // Read Hello.
-            let hello = loop {
-                match decode_frame::<YubabaToKamaji>(&buf) {
-                    Ok((m, n)) => {
-                        buf.drain(..n);
-                        break m;
-                    }
-                    Err(CodecError::Truncated { .. }) => {
-                        let n = stream.read(&mut tmpbuf).await.unwrap();
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&tmpbuf[..n]);
-                    }
-                    Err(e) => panic!("decode hello: {e}"),
-                }
-            };
-            assert!(matches!(hello, YubabaToKamaji::Hello { .. }));
-            let bytes = encode_frame(&welcome).unwrap();
-            stream.write_all(&bytes).await.unwrap();
+    /// The id a request went out with, so a scripted server can echo it back.
+    fn request_id_of(req: &YubabaToKamaji) -> RequestId {
+        match req {
+            YubabaToKamaji::List { request_id }
+            | YubabaToKamaji::Deploy { request_id, .. }
+            | YubabaToKamaji::Stop { request_id, .. }
+            | YubabaToKamaji::Drain { request_id, .. }
+            | YubabaToKamaji::Probe { request_id, .. } => *request_id,
+            other => panic!("no request_id on {other:?}"),
+        }
+    }
 
-            // Read the next request and reply via the closure.
-            let req = loop {
-                match decode_frame::<YubabaToKamaji>(&buf) {
-                    Ok((m, n)) => {
-                        buf.drain(..n);
-                        break m;
-                    }
-                    Err(CodecError::Truncated { .. }) => {
-                        let n = stream.read(&mut tmpbuf).await.unwrap();
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&tmpbuf[..n]);
-                    }
-                    Err(e) => panic!("decode req: {e}"),
-                }
-            };
-            let answer = answer.lock().unwrap().take().expect("answer used once");
-            let reply = answer(req);
-            let bytes = encode_frame(&reply).unwrap();
-            stream.write_all(&bytes).await.unwrap();
-        });
-        (tmp, sock)
+    fn entry(name: &str) -> WorkloadEntry {
+        WorkloadEntry {
+            mesh_ident: None,
+            id: WorkloadId::new(name),
+            state: WorkloadState::Running,
+            pid: Some(1),
+        }
     }
 
     #[tokio::test]
@@ -853,6 +1163,81 @@ mod tests {
         }
     }
 
+    /// R746-B11 regression. `DeployStatusResult` was missing from the client's
+    /// correlation table, so this reply was routed as a spontaneous push and
+    /// dropped — the caller parked on its oneshot until the socket closed.
+    /// The bug was invisible for the unknown-id case (that answers with
+    /// `Error`, which *was* correlated), which is why the live symptom was a
+    /// route that 404s instantly for a workload with no deploy record and
+    /// hangs forever for the one workload that has one.
+    ///
+    /// The `timeout` is the assertion: without it a regression hangs the test
+    /// binary instead of failing it.
+    #[tokio::test]
+    async fn deploy_status_result_is_routed_back_to_its_caller() {
+        let (_tmp, sock) = one_shot_server(|req| {
+            let (rid, id) = match req {
+                YubabaToKamaji::DeployStatus { request_id, id } => (request_id, id),
+                other => panic!("expected DeployStatus, got {other:?}"),
+            };
+            KamajiToYubaba::DeployStatusResult {
+                request_id: rid,
+                id,
+                state: WorkloadState::Failed,
+                detail: Some("materialize failed".into()),
+            }
+        })
+        .await;
+        let client = KamajiClient::connect(sock).await.unwrap();
+        let (state, detail) = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.deploy_status(&WorkloadId::new("yah-marketing")),
+        )
+        .await
+        .expect("deploy_status must answer, not park on a dropped reply")
+        .expect("deploy_status");
+        assert_eq!(state, WorkloadState::Failed);
+        assert_eq!(detail.as_deref(), Some("materialize failed"));
+    }
+
+    /// The other half of the same route: an id kamaji never admitted comes
+    /// back as `UnknownWorkload`, which a polling caller must treat as
+    /// terminal. This arm always worked; it is pinned so a future change to
+    /// the correlation table can't fix one arm by breaking the other.
+    #[tokio::test]
+    async fn deploy_status_for_an_unadmitted_id_is_a_remote_unknown_workload() {
+        let (_tmp, sock) = one_shot_server(|req| {
+            let rid = match req {
+                YubabaToKamaji::DeployStatus { request_id, .. } => request_id,
+                other => panic!("expected DeployStatus, got {other:?}"),
+            };
+            KamajiToYubaba::Error {
+                request_id: Some(rid),
+                code: ErrorCode::UnknownWorkload,
+                message: "no deploy on record".into(),
+            }
+        })
+        .await;
+        let client = KamajiClient::connect(sock).await.unwrap();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.deploy_status(&WorkloadId::new("nope")),
+        )
+        .await
+        .expect("deploy_status must answer")
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Remote {
+                    code: ErrorCode::UnknownWorkload,
+                    ..
+                }
+            ),
+            "expected Remote/UnknownWorkload, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn connect_with_timeout_fails_on_missing_socket() {
         let tmp = tempfile::tempdir().unwrap();
@@ -865,6 +1250,223 @@ mod tests {
             msg.contains("connecting to kamaji"),
             "error should mention the socket path: {msg}"
         );
+    }
+
+    // ── KamajiSibling reconnect watchdog ────────────────────────────────────
+
+    /// The regression this wrapper exists for, live 2026-08-13: a bare
+    /// `KamajiClient` never recovers from its peer restarting — every call
+    /// answers `PeerClosed` forever. Accepts two connections in sequence on
+    /// the same socket path (simulating `systemctl restart kamaji` between
+    /// them) and asserts `KamajiSibling::current()` lands on the second
+    /// generation without the caller doing anything.
+    #[tokio::test]
+    async fn kamaji_sibling_reconnects_after_the_peer_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("kamaji.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        tokio::spawn(async move {
+            // Generation 1: handshake, then hang up immediately.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut conn = ServerConn {
+                stream,
+                buf: Vec::with_capacity(4096),
+            };
+            assert!(matches!(conn.recv().await, YubabaToKamaji::Hello { .. }));
+            conn.send(&KamajiToYubaba::Welcome {
+                version: ProtocolVersion::CURRENT,
+                kamaji_version: "gen-1".into(),
+            })
+            .await;
+            drop(conn);
+
+            // Generation 2: handshake and stay up for the rest of the test.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut conn = ServerConn {
+                stream,
+                buf: Vec::with_capacity(4096),
+            };
+            assert!(matches!(conn.recv().await, YubabaToKamaji::Hello { .. }));
+            conn.send(&KamajiToYubaba::Welcome {
+                version: ProtocolVersion::CURRENT,
+                kamaji_version: "gen-2".into(),
+            })
+            .await;
+            std::future::pending::<()>().await;
+        });
+
+        let first = KamajiClient::connect(&sock).await.unwrap();
+        assert_eq!(first.info().kamaji_version, "gen-1");
+
+        let sibling = KamajiSibling::new(first, sock.clone(), Duration::from_secs(2));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(c) = sibling.current() {
+                if c.info().kamaji_version == "gen-2" {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "KamajiSibling never reconnected to the second generation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // ── Cancel-safety and demux ────────────────────────────────────────────
+
+    /// The regression this client's demux exists for. A caller that gives up
+    /// mid-request — an axum handler dropped because its HTTP client timed out
+    /// — used to consume a request id while its reply stayed queued on the
+    /// socket, handing it to the *next* caller and leaving the connection
+    /// permanently off-by-one (`expected 89, got 88`) until yubaba restarted.
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_desync_the_next_one() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            // Stall the first reply past the caller's patience, then answer
+            // both in receipt order, exactly as kamaji does.
+            let first = request_id_of(&conn.recv().await);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            conn.send(&KamajiToYubaba::WorkloadList {
+                request_id: first,
+                entries: vec![entry("abandoned-first-reply")],
+            })
+            .await;
+
+            let second = request_id_of(&conn.recv().await);
+            conn.send(&KamajiToYubaba::WorkloadList {
+                request_id: second,
+                entries: vec![entry("correct-second-reply")],
+            })
+            .await;
+        })
+        .await;
+
+        let client = KamajiClient::connect(sock).await.unwrap();
+
+        let abandoned = tokio::time::timeout(Duration::from_millis(20), client.list()).await;
+        assert!(abandoned.is_err(), "first call should have timed out");
+
+        let entries = client.list().await.expect("second list after a cancelled one");
+        assert_eq!(
+            entries[0].id,
+            WorkloadId::new("correct-second-reply"),
+            "the second caller was handed the abandoned reply — the connection desynced"
+        );
+    }
+
+    /// Replies are routed by `RequestId`, so kamaji answering out of order (or
+    /// a future kamaji answering concurrently) reaches the right caller.
+    #[tokio::test]
+    async fn concurrent_requests_are_demuxed_by_request_id() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let first = request_id_of(&conn.recv().await);
+            let second = request_id_of(&conn.recv().await);
+            // Answer the second request first.
+            conn.send(&KamajiToYubaba::Ack {
+                request_id: second,
+                kind: AckKind::Stop,
+            })
+            .await;
+            conn.send(&KamajiToYubaba::WorkloadList {
+                request_id: first,
+                entries: vec![entry("for-the-list-caller")],
+            })
+            .await;
+        })
+        .await;
+
+        let client = KamajiClient::connect(sock).await.unwrap();
+        let stop_id = WorkloadId::new("foo");
+        let (list, stop) = tokio::join!(client.list(), client.stop(&stop_id));
+        assert_eq!(list.unwrap()[0].id, WorkloadId::new("for-the-list-caller"));
+        stop.expect("stop should get its own ack");
+    }
+
+    /// Pushed lifecycle events carry no `RequestId` at all. Positional
+    /// correlation would hand the first one kamaji ever sends to whichever
+    /// caller happened to be waiting.
+    #[tokio::test]
+    async fn a_pushed_lifecycle_event_is_not_delivered_as_a_reply() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let rid = request_id_of(&conn.recv().await);
+            conn.send(&KamajiToYubaba::WorkloadStarted {
+                id: WorkloadId::new("some-other-workload"),
+                pid: 7,
+            })
+            .await;
+            conn.send(&KamajiToYubaba::WorkloadList {
+                request_id: rid,
+                entries: vec![entry("the-actual-reply")],
+            })
+            .await;
+        })
+        .await;
+
+        let client = KamajiClient::connect(sock).await.unwrap();
+        let entries = client.list().await.expect("push must not be read as the reply");
+        assert_eq!(entries[0].id, WorkloadId::new("the-actual-reply"));
+    }
+
+    /// Kamaji answers an unhandled message kind with `Error { request_id:
+    /// None }` and keeps the connection open — the shape a newer yubaba hits
+    /// against an older kamaji. Uncorrelatable, so every waiter gets it rather
+    /// than parking until the socket happens to close.
+    #[tokio::test]
+    async fn an_uncorrelated_error_fails_the_waiter_instead_of_hanging_it() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let _ = conn.recv().await;
+            conn.send(&KamajiToYubaba::Error {
+                request_id: None,
+                code: ErrorCode::Internal,
+                message: "unhandled message kind".into(),
+            })
+            .await;
+            // Hold the connection open, so this proves the fail-all path and
+            // not the connection-died path.
+            std::future::pending::<()>().await;
+        })
+        .await;
+
+        let client = KamajiClient::connect(sock).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), client.list())
+            .await
+            .expect("caller must not park forever")
+            .unwrap_err();
+        match err {
+            ClientError::Remote { code, message } => {
+                assert_eq!(code, ErrorCode::Internal);
+                assert_eq!(message, "unhandled message kind");
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    /// A connection that dies mid-request wakes everyone parked on it, and
+    /// subsequent calls fail fast rather than queueing onto a dead socket.
+    #[tokio::test]
+    async fn a_dead_connection_wakes_parked_callers_and_fails_later_ones() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let _ = conn.recv().await;
+            drop(conn);
+        })
+        .await;
+
+        let client = KamajiClient::connect(sock).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), client.list())
+            .await
+            .expect("caller must not park forever")
+            .unwrap_err();
+        assert!(matches!(err, ClientError::PeerClosed), "got {err:?}");
+
+        let err = tokio::time::timeout(Duration::from_secs(2), client.list())
+            .await
+            .expect("a request onto a dead connection must fail fast")
+            .unwrap_err();
+        assert!(matches!(err, ClientError::PeerClosed), "got {err:?}");
     }
 
     // ── Kamaji trait impl tests ────────────────────────────────────────────

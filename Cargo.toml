@@ -1,6 +1,10 @@
 [workspace]
 members = [
     "crates/kamaji-proto",
+    # R715-F3 / W315: the producer-side helper for the process-control channel.
+    # Homed here because kamaji owns the `WorkloadState` vocabulary the channel
+    # reuses — helper and enum move together or they drift.
+    "crates/procctl",
     "crates/kamaji-containerd-core",
     "crates/kamaji",
     "crates/kamaji-bin",
@@ -9,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.22"
+version = "0.8.29"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

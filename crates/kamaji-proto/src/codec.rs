@@ -196,7 +196,7 @@ mod tests {
         let msg = YubabaToKamaji::Deploy {
             request_id: RequestId(7),
             id: WorkloadId::new("forge-b3"),
-            spec: Workload::Container(spec),
+            spec: Workload::container(spec),
             mesh: None,
         };
         let bytes = encode_frame(&msg).unwrap();
@@ -225,7 +225,7 @@ mod tests {
         let msg = YubabaToKamaji::GracefulUpgrade {
             request_id: RequestId(9),
             id: WorkloadId::new("passway-ingress"),
-            spec: Workload::Container(spec),
+            spec: Workload::container(spec),
         };
         let bytes = encode_frame(&msg).unwrap();
         let (decoded, consumed) = decode_frame::<YubabaToKamaji>(&bytes).unwrap();
@@ -632,7 +632,7 @@ mod tests {
         assert_warden_round_trips(YubabaToKamaji::Deploy {
             request_id: RequestId(1),
             id: WorkloadId::new("forge-w"),
-            spec: Workload::Container(WorkloadSpec::for_forge(
+            spec: Workload::container(WorkloadSpec::for_forge(
                 "w",
                 ImageRef {
                     registry: "ghcr.io".into(),
@@ -674,6 +674,186 @@ mod tests {
         assert_warden_round_trips(YubabaToKamaji::List {
             request_id: RequestId(5),
         });
+
+        // DeployStatus (R330-F33).
+        assert_warden_round_trips(YubabaToKamaji::DeployStatus {
+            request_id: RequestId(6),
+            id: WorkloadId::new("svc-6"),
+        });
+    }
+
+    /// The two R330-F33 variants were **appended**, so every pre-existing
+    /// variant must keep the postcard discriminant it had before. Postcard is
+    /// positional and non-self-describing: inserting a variant in the middle
+    /// renumbers everything after it, and the resulting frames still *decode* —
+    /// as the wrong variant. Nothing else in the suite would catch that, so
+    /// these bytes are pinned deliberately.
+    ///
+    /// Byte 4 is the discriminant (bytes 0..4 are the LE length prefix).
+    #[test]
+    fn appending_variants_did_not_shift_existing_discriminants() {
+        use workload_spec::{ImageRef, TierTag, Workload, WorkloadSpec};
+
+        let spec = || {
+            Workload::container(WorkloadSpec::for_forge(
+                "w",
+                ImageRef {
+                    registry: "ghcr.io".into(),
+                    repository: "yah/forge".into(),
+                    tag: "v1".into(),
+                    digest:
+                        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                            .into(),
+                },
+                TierTag("private".into()),
+                vec![8080],
+            ))
+        };
+        let id = || WorkloadId::new("svc");
+        let rid = RequestId(1);
+
+        let warden: Vec<(u8, YubabaToKamaji)> = vec![
+            (
+                0,
+                YubabaToKamaji::Hello {
+                    version: ProtocolVersion::CURRENT,
+                },
+            ),
+            (
+                1,
+                YubabaToKamaji::Deploy {
+                    request_id: rid,
+                    id: id(),
+                    spec: spec(),
+                    mesh: None,
+                },
+            ),
+            (
+                2,
+                YubabaToKamaji::Stop {
+                    request_id: rid,
+                    id: id(),
+                },
+            ),
+            (
+                3,
+                YubabaToKamaji::Drain {
+                    request_id: rid,
+                    id: id(),
+                    budget: DrainBudget {
+                        flush_ms: 1,
+                        checkpoint_ms: 1,
+                    },
+                },
+            ),
+            (
+                4,
+                YubabaToKamaji::Probe {
+                    request_id: rid,
+                    id: id(),
+                },
+            ),
+            (5, YubabaToKamaji::List { request_id: rid }),
+            (
+                6,
+                YubabaToKamaji::GracefulUpgrade {
+                    request_id: rid,
+                    id: id(),
+                    spec: spec(),
+                },
+            ),
+            // Appended by R330-F33 — must come after GracefulUpgrade.
+            (
+                7,
+                YubabaToKamaji::DeployStatus {
+                    request_id: rid,
+                    id: id(),
+                },
+            ),
+        ];
+        for (want, msg) in warden {
+            let bytes = encode_frame(&msg).unwrap();
+            assert_eq!(bytes[4], want, "discriminant moved for {msg:?}");
+        }
+
+        let constable: Vec<(u8, KamajiToYubaba)> = vec![
+            (
+                0,
+                KamajiToYubaba::Welcome {
+                    version: ProtocolVersion::CURRENT,
+                    kamaji_version: "0".into(),
+                },
+            ),
+            (
+                1,
+                KamajiToYubaba::Ack {
+                    request_id: rid,
+                    kind: AckKind::Deploy,
+                },
+            ),
+            (
+                2,
+                KamajiToYubaba::Error {
+                    request_id: Some(rid),
+                    code: ErrorCode::Internal,
+                    message: "x".into(),
+                },
+            ),
+            (3, KamajiToYubaba::WorkloadStarted { id: id(), pid: 1 }),
+            (
+                4,
+                KamajiToYubaba::WorkloadExited {
+                    id: id(),
+                    exit: ExitStatus::Exited(0),
+                },
+            ),
+            (
+                5,
+                KamajiToYubaba::ProbeResult {
+                    request_id: rid,
+                    id: id(),
+                    status: ProbeStatus::Ready,
+                },
+            ),
+            (
+                6,
+                KamajiToYubaba::DrainAck {
+                    request_id: rid,
+                    id: id(),
+                    accepted: true,
+                    reason: None,
+                },
+            ),
+            (
+                7,
+                KamajiToYubaba::DrainCompleted {
+                    request_id: rid,
+                    id: id(),
+                    outcome: DrainOutcome::Unsupported,
+                },
+            ),
+            (
+                8,
+                KamajiToYubaba::WorkloadList {
+                    request_id: rid,
+                    entries: vec![],
+                },
+            ),
+            // Appended by R330-F33.
+            (
+                9,
+                KamajiToYubaba::DeployStatusResult {
+                    request_id: rid,
+                    id: id(),
+                    state: WorkloadState::Pending,
+                    detail: None,
+                },
+            ),
+        ];
+        for (want, msg) in constable {
+            let bytes = encode_frame(&msg).unwrap();
+            assert_eq!(bytes[4], want, "discriminant moved for {msg:?}");
+        }
     }
 
     /// Every `KamajiToYubaba` variant survives the framed postcard wire —
@@ -827,6 +1007,25 @@ mod tests {
                 },
             ],
         });
+
+        // DeployStatusResult (R330-F33) — every state, and both `detail`
+        // shapes: the failure reason is the whole point of the variant, so a
+        // `None`-only round-trip would not prove much.
+        for state in [
+            WorkloadState::Pending,
+            WorkloadState::Starting,
+            WorkloadState::Running,
+            WorkloadState::Failed,
+        ] {
+            for detail in [None, Some("materialize bundle abc: blob 404".to_string())] {
+                assert_constable_round_trips(KamajiToYubaba::DeployStatusResult {
+                    request_id: RequestId(17),
+                    id: WorkloadId::new("svc"),
+                    state,
+                    detail,
+                });
+            }
+        }
     }
 
     /// Every `workload_spec::Workload` variant that can ride a `Deploy` frame
@@ -859,7 +1058,7 @@ mod tests {
             // `skip_serializing_if` strip.
             (
                 "container-for-forge",
-                Workload::Container(WorkloadSpec::for_forge(
+                Workload::container(WorkloadSpec::for_forge(
                     "b3",
                     image(),
                     TierTag("private".into()),
@@ -867,7 +1066,7 @@ mod tests {
                 )),
             ),
             // Container — full spec, every optional populated.
-            ("container-full", Workload::Container(full_container_spec())),
+            ("container-full", Workload::container(full_container_spec())),
             // MesofactStatic — nests an `ImageRef` (InContainer build) and a
             // second `WorkloadSpec` (the SSR companion).
             (
@@ -875,7 +1074,7 @@ mod tests {
                 Workload::MesofactStatic(MesofactStaticWorkload {
                     schema_version: SchemaVersion::V1,
                     build: BuildConfig {
-                        command: "bun run build".into(),
+                        command: Some("bun run build".into()),
                         out_dir: PathBuf::from("dist"),
                         render_command: None,
                     },
@@ -980,7 +1179,7 @@ mod tests {
         let msg = YubabaToKamaji::Deploy {
             request_id: RequestId(30),
             id: WorkloadId::new("forge-pinned"),
-            spec: Workload::Container(WorkloadSpec::for_forge(
+            spec: Workload::container(WorkloadSpec::for_forge(
                 "pinned",
                 image,
                 TierTag("private".into()),
