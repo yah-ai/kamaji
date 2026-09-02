@@ -292,6 +292,9 @@ impl DockerRuntime {
                 container_id: di.id,
                 status,
                 mesh_ip,
+                // R844-F2: namespaced container — the declared port is the
+                // bound port, so this backend resolves nothing.
+                ports: Vec::new(),
             },
             pid,
             workload_id,
@@ -654,6 +657,7 @@ impl Kamaji for DockerRuntime {
             container_id,
             mesh_ip: mesh.mesh_ip,
             task_pid,
+            ports: Vec::new(),
         })
     }
 

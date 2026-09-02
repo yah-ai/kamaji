@@ -33,6 +33,15 @@ use serde::{Deserialize, Serialize};
 /// materialized, turning a deploy failure into a silent success. The bump is
 /// what turns that into a handshake refusal instead.
 ///
+/// V4 (R844-F2) added `ports` to [`crate::WorkloadEntry`] — the resolved
+/// listen port(s) kamaji actually bound, which is the return path automatic
+/// port allocation needs. Same postcard positionality as V2: a field appended
+/// to an existing *struct* shifts every byte after it, so an old yubaba
+/// decoding a V4 `WorkloadList` runs off into the next entry and a new yubaba
+/// decoding a V3 one runs off the end. `#[serde(default)]` does not help —
+/// postcard has no field names to notice are missing. The bump turns that into
+/// a handshake refusal naming the version.
+///
 /// The blast radius is one node: this protocol runs over a node-local UDS, and
 /// yubaba and kamaji self-install as a pair, so the skew window is a restart
 /// rather than a rolling fleet upgrade.
@@ -42,6 +51,7 @@ pub enum ProtocolVersion {
     V1,
     V2,
     V3,
+    V4,
 }
 
 impl Default for ProtocolVersion {
@@ -52,5 +62,5 @@ impl Default for ProtocolVersion {
 
 impl ProtocolVersion {
     /// The version this build of `kamaji-proto` produces by default.
-    pub const CURRENT: Self = Self::V3;
+    pub const CURRENT: Self = Self::V4;
 }

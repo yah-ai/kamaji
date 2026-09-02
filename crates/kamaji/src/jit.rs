@@ -84,6 +84,13 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 /// lifecycle; this is the registry entry.
 struct JitHandle {
     mesh_ip: Ipv4Addr,
+    /// Port the custodian actually bound and holds for this workload (R844-F2).
+    ///
+    /// Parsed off `listen_addr` rather than read from the spec, because on this
+    /// tier the custodian's socket *is* the workload's listener: it outlives
+    /// every forked child, so the held socket's port is the resolved port by
+    /// definition and cannot drift from what a child was told to expect.
+    ports: Vec<u16>,
     /// pid of the currently-live serve child, or `0` when idle (no resident
     /// process — the whole point of the on-demand tier).
     pid: Arc<AtomicU32>,
@@ -178,6 +185,11 @@ impl JitRuntime {
             ident.0.clone(),
             JitHandle {
                 mesh_ip: mesh.mesh_ip,
+                ports: listen_addr
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .into_iter()
+                    .collect(),
                 pid,
                 status: status_rx,
                 shutdown: shutdown_tx,
@@ -197,6 +209,7 @@ impl JitRuntime {
                 container_id: format!("jit-{}", h.pid.load(Ordering::SeqCst)),
                 status: h.status.borrow().clone(),
                 mesh_ip: Some(h.mesh_ip),
+                ports: h.ports.clone(),
             })
             .collect()
     }
@@ -209,6 +222,7 @@ impl JitRuntime {
             container_id: format!("jit-{}", h.pid.load(Ordering::SeqCst)),
             status: h.status.borrow().clone(),
             mesh_ip: Some(h.mesh_ip),
+            ports: h.ports.clone(),
         })
     }
 

@@ -127,6 +127,13 @@ pub mod socket_custody;
 #[cfg(feature = "testing")]
 pub mod fake;
 
+/// Listen-port allocation (R844-F2): the one contract the local (camp) and
+/// remote (kamaji) supervisors both answer through, so a workload that runs
+/// both ways does not learn its port from two mechanisms that can disagree.
+/// Unconditional — a supervisor that cannot say what port it gave a workload is
+/// not a shape any build should be able to select.
+pub mod ports;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -252,6 +259,22 @@ pub struct DeployResult {
     pub container_id: String,
     pub mesh_ip: Ipv4Addr,
     pub task_pid: u32,
+    /// Port(s) the supervisor **actually bound** for this workload (R844-F2).
+    ///
+    /// Distinct from the workload's *declared* ports (`spec.expose.mesh.ports`
+    /// for a container, `serve_bundle.port` for a W272 bundle): a declared port
+    /// is a request, this is the answer. They coincide whenever the workload
+    /// declared one — [`ports::PortAllocator::resolve`] returns a declared port
+    /// unchanged — and diverge exactly when it did not and the supervisor
+    /// allocated instead.
+    ///
+    /// Empty means "this backend does not resolve ports", not "no ports": a
+    /// container backend puts the workload in its own namespace, where the
+    /// declared port *is* the bound port and there is nothing to resolve.
+    /// Consumers must fall back to the declared ports on empty rather than
+    /// treating the workload as undialable.
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 /// Point-in-time state snapshot for one deployed workload.
@@ -261,6 +284,17 @@ pub struct WorkloadState {
     pub container_id: String,
     pub status: WorkloadStatus,
     pub mesh_ip: Option<Ipv4Addr>,
+    /// Port(s) the supervisor currently has bound for this workload — same
+    /// meaning as [`DeployResult::ports`], observed rather than returned.
+    ///
+    /// This field is what makes a moved port *correctable*. `DeployResult` gets
+    /// the resolved port into a service record once, at admission; this one
+    /// rides every `list_workloads()` sweep, so a workload that restarted onto
+    /// a different port updates the record instead of leaving it advertising a
+    /// port nothing is listening on. A stale-but-healthy-looking record is a
+    /// strictly worse failure than an absent one, because nothing detects it.
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 /// Lifecycle status of a deployed workload.

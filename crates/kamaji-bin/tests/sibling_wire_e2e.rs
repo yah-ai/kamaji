@@ -446,6 +446,7 @@ async fn scripted_backend(listener: UnixListener) {
                         id: id.clone(),
                         state: WorkloadState::Running,
                         pid: Some(4242),
+                        ports: Vec::new(),
                     });
                     KamajiToYubaba::Ack {
                         request_id,

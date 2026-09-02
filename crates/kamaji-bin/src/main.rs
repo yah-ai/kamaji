@@ -34,10 +34,13 @@ struct Args {
     bundle_cache_dir: Option<PathBuf>,
     /// R2 bucket holding the published bundle store (blobs + manifests).
     bundle_origin: Option<String>,
-    /// Loopback port served bundles bind. Falls back to `$KAMAJI_BUNDLE_PORT`,
-    /// then the compiled-in default. Only consumed by the bundle backend; the
-    /// no-feature build still *parses* it (so `--bundle-port` isn't an "unknown
-    /// argument") but has nothing to apply it to.
+    /// Node-wide port override for served bundles, falling back to
+    /// `$KAMAJI_BUNDLE_PORT`. R844-F2: unset no longer means "the compiled-in
+    /// default" — it means the node ALLOCATES a free port per bundle, which is
+    /// what lets two bundles co-tenant a node without either mirror naming a
+    /// port. Only consumed by the bundle backend; the no-feature build still
+    /// *parses* it (so `--bundle-port` isn't an "unknown argument") but has
+    /// nothing to apply it to.
     #[cfg_attr(not(feature = "bundle-serving"), allow(dead_code))]
     bundle_port: Option<u16>,
     /// Attach the docker/OrbStack backend for `Deploy { Container }` (R626-F1).
@@ -224,9 +227,11 @@ fn print_help() {
     println!("                                blobs are content-addressed and digest-verified");
     println!("                                (default: $KAMAJI_BUNDLE_ORIGIN; required with");
     println!("                                --bundle-cache-dir)");
-    println!("      --bundle-port PORT        loopback port served bundles bind on 127.0.0.1");
+    println!("      --bundle-port PORT        pin every served bundle to one node-wide port");
     println!(
-        "                                (default: $KAMAJI_BUNDLE_PORT, else {})",
+        "                                (default: $KAMAJI_BUNDLE_PORT, else allocate a free");
+    println!(
+        "                                port per bundle{})",
         bundle_port_default_str()
     );
     println!("  -h, --help                Print this message and exit");
@@ -282,16 +287,20 @@ fn microvm_memory_cap_mb() -> u32 {
     half_mb.max(FLOOR_MB)
 }
 
-/// The compiled-in bundle port default, or a note that this build can't serve
-/// bundles at all (feature off).
+/// Suffix for the `--bundle-port` help line: names the historical testbed port
+/// an operator might want to ask for by hand (R844-F2 stopped applying it as a
+/// silent default), or a note that this build can't serve bundles at all.
 fn bundle_port_default_str() -> String {
     #[cfg(feature = "bundle-serving")]
     {
-        kamaji_bin::DEFAULT_BUNDLE_PORT.to_string()
+        format!(
+            "; pass {} for the pre-R844 single-bundle testbed shape",
+            kamaji_bin::DEFAULT_BUNDLE_PORT
+        )
     }
     #[cfg(not(feature = "bundle-serving"))]
     {
-        "n/a — built without --features bundle-serving".to_string()
+        " (n/a — built without --features bundle-serving)".to_string()
     }
 }
 
@@ -625,7 +634,7 @@ async fn attach_bundle_backend(
     tracing::info!(
         cache_dir = %cache_dir.display(),
         origin = %origin,
-        bind_port = backend.bind_port,
+        bind_port = ?backend.bind_port,
         "bundle backend attached (keep-alive serve_bundle workloads; \
          unauthenticated content-addressed origin)"
     );

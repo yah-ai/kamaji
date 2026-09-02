@@ -152,6 +152,16 @@ struct SpawnedChild {
 /// supervisor task; this is the caller-side handle onto it.
 struct WorkloadHandle {
     mesh_ip: Ipv4Addr,
+    /// Port(s) this workload's argv actually told it to bind (R844-F2).
+    ///
+    /// A native workload is a plain host process in the host's own network
+    /// namespace, so `expose.mesh.ports` on the spec we forked is not a
+    /// *declaration* the way a container's is — it is the bind address already
+    /// resolved, and for the W272 bundle path it is literally parsed back off
+    /// the `--listen` argument so it cannot drift from what the child binds.
+    /// Recording it here is what lets `list_workloads` report a resolved port
+    /// on every sweep.
+    ports: Vec<u16>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     /// The pid of the currently-running child, or `0` when no child is running
@@ -688,6 +698,7 @@ impl Kamaji for NativeRuntime {
             ident.0,
             WorkloadHandle {
                 mesh_ip: mesh.mesh_ip,
+                ports: spec.expose.mesh.ports.clone(),
                 stdout_path,
                 stderr_path,
                 pid,
@@ -701,6 +712,7 @@ impl Kamaji for NativeRuntime {
             container_id: format!("native-{start_pid}"),
             mesh_ip: mesh.mesh_ip,
             task_pid: start_pid,
+            ports: spec.expose.mesh.ports.clone(),
         })
     }
 
@@ -713,6 +725,7 @@ impl Kamaji for NativeRuntime {
                 container_id: format!("native-{}", h.pid.load(Ordering::SeqCst)),
                 status: h.status.borrow().clone(),
                 mesh_ip: Some(h.mesh_ip),
+                ports: h.ports.clone(),
             })
             .collect())
     }
@@ -724,6 +737,7 @@ impl Kamaji for NativeRuntime {
             container_id: format!("native-{}", h.pid.load(Ordering::SeqCst)),
             status: h.status.borrow().clone(),
             mesh_ip: Some(h.mesh_ip),
+            ports: h.ports.clone(),
         }))
     }
 
@@ -854,6 +868,9 @@ impl Kamaji for NativeRuntime {
             container_id: format!("native-{new_pid}"),
             mesh_ip: mesh.mesh_ip,
             task_pid: new_pid,
+            // A graceful upgrade is explicitly the *same* listener handed to a
+            // new generation, so the resolved port is unchanged by construction.
+            ports: spec.expose.mesh.ports.clone(),
         })
     }
 

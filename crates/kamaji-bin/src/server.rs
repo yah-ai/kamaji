@@ -350,14 +350,35 @@ pub struct BundleBackend {
     /// no in-memory state beyond root+budget — recency is on-disk), so the
     /// blocking materialize never parks the async dispatch loop.
     pub cache_budget: u64,
-    /// **Fallback** port for a bundle that declares none — the node-wide
-    /// default, overridable via `KAMAJI_BUNDLE_PORT`. Testbed convention
-    /// (passway → 8080).
+    /// Node-wide port **override**, when the operator set one
+    /// (`--bundle-port` / `KAMAJI_BUNDLE_PORT`). `None` — the fleet's actual
+    /// configuration — means no override.
     ///
-    /// R599-F12 demoted this from *the* port to the fallback: a bundle now
-    /// carries its own `serve_bundle.port`, and while every bundle shared this
-    /// one value a node could host exactly one of them.
-    pub bind_port: u16,
+    /// R599-F12 demoted this from *the* port to a fallback: a bundle carries
+    /// its own `serve_bundle.port`, and while every bundle shared this one
+    /// value a node could host exactly one of them.
+    ///
+    /// R844-F2 demoted it again, from a fallback to an override, and that is
+    /// the type change: it was `u16`, defaulting to [`DEFAULT_BUNDLE_PORT`]
+    /// whenever the operator set nothing. A silent node-wide default is
+    /// indistinguishable from a pin — every bundle that declared no port got
+    /// 8080, so the second bundle on a node could not bind at all. Unset now
+    /// means *allocate*, via [`kamaji::ports::PortAllocator`]. An operator who
+    /// really does want every bundle on one known port can still say so, and
+    /// then owns the collision.
+    ///
+    /// `Some(0)` is the ephemeral sentinel (tests, and anyone who wants
+    /// "anything free"): it declares nothing, so allocation takes over.
+    pub bind_port: Option<u16>,
+    /// R844-F2: this node's listen-port allocator, persisted at
+    /// `<state_dir>/ports.json`.
+    ///
+    /// A bundle that declares no port gets one from here instead of colliding
+    /// on a node-wide default, and the ledger is what makes that port survive
+    /// a kamaji restart — a keep-alive bundle whose port moved would leave the
+    /// rendered ingress upstream naming a dead listener, which looks healthy
+    /// and so is worse than an absent record.
+    pub ports: Arc<kamaji::ports::LedgerPorts>,
     /// R755-B5: where admitted bundle deploys are recorded so a kamaji restart
     /// can replay them — `<state_dir>/deploys/<id>.json`, one
     /// [`BundleDeployRecord`] per live workload. Written at admission, removed
@@ -402,10 +423,11 @@ impl BundleBackend {
         cache_dir: impl Into<PathBuf>,
         state_dir: impl Into<PathBuf>,
     ) -> Self {
+        // R844-F2: no `.unwrap_or(DEFAULT_BUNDLE_PORT)`. Unset means allocate,
+        // not "8080" — see the field docs.
         let bind_port = std::env::var("KAMAJI_BUNDLE_PORT")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_BUNDLE_PORT);
+            .and_then(|v| v.parse().ok());
         let state_dir = state_dir.into();
         Self {
             native: Arc::new(kamaji::native::NativeRuntime::new(state_dir.clone())),
@@ -414,8 +436,52 @@ impl BundleBackend {
             cache_dir: cache_dir.into(),
             cache_budget: 0,
             bind_port,
+            ports: Arc::new(kamaji::ports::LedgerPorts::open(&state_dir)),
             records_dir: state_dir.join("deploys"),
         }
+    }
+
+    /// What port this node has been *told* to serve `bundle` on, if any
+    /// (R844-F2).
+    ///
+    /// Two sources, in order, and both are explicit statements by a human:
+    ///
+    /// 1. The bundle's own `serve_bundle.port` — R599-F12's per-workload
+    ///    declaration, which the mirror's `[providers.bundle] port` key writes.
+    /// 2. The node-wide override an operator passed as `--bundle-port` /
+    ///    `KAMAJI_BUNDLE_PORT`.
+    ///
+    /// `None` means nobody said, which is now the *normal* case and the one
+    /// [`Self::resolve_port`] allocates for. `0` is the ephemeral sentinel and
+    /// reads as "nobody said" too.
+    ///
+    /// Honouring a declaration verbatim is what makes removing the mirror's
+    /// `port` key a safe change rather than a behavioural one: while the pin is
+    /// still written, nothing about the resolved port moves.
+    pub fn declared_port(&self, bundle: &workload_spec::MesofactServeBundle) -> Option<u16> {
+        bundle.port.or(self.bind_port).filter(|&p| p != 0)
+    }
+
+    /// Resolve the port `ident` will actually bind on `bind_ip` (R844-F2).
+    ///
+    /// `preferred` is [`Self::declared_port`]'s answer (or a value derived from
+    /// it, as the revalidate receiver's `+1` is). When it is `Some`, it comes
+    /// back unchanged; when it is `None`, a free port is allocated from the
+    /// node's ledger and remembered for this ident across kamaji restarts.
+    ///
+    /// The returned port is what gets forked into the workload's `--listen`,
+    /// parsed back onto `expose.mesh.ports`, and reported to yubaba on the next
+    /// `List` — one value, one path, no place for a second opinion.
+    pub fn resolve_port(
+        &self,
+        ident: &str,
+        bind_ip: std::net::Ipv4Addr,
+        preferred: Option<u16>,
+    ) -> std::result::Result<u16, String> {
+        use kamaji::ports::PortAllocator;
+        self.ports
+            .resolve(ident, std::net::IpAddr::V4(bind_ip), preferred)
+            .map_err(|e| format!("could not resolve a listen port for {ident}: {e:#}"))
     }
 
     fn record_path(&self, id: &WorkloadId) -> PathBuf {
@@ -475,13 +541,19 @@ impl BundleBackend {
         out
     }
 
-    /// Override the node-wide fallback port. An explicit operator flag wins
-    /// over the `KAMAJI_BUNDLE_PORT` env default picked in [`new`]. A bundle
-    /// that declares its own `serve_bundle.port` wins over both (R599-F12).
+    /// Set the node-wide port override. An explicit operator flag wins over
+    /// the `KAMAJI_BUNDLE_PORT` env value picked in [`new`]. A bundle that
+    /// declares its own `serve_bundle.port` wins over both (R599-F12).
+    ///
+    /// `0` is the ephemeral sentinel: it declares nothing, so
+    /// [`BundleBackend::resolve_port`] allocates. That is what it already meant
+    /// in practice — a `:0` listen address let the OS pick — except that the
+    /// picked port used to be invisible, because `expose.mesh.ports` was parsed
+    /// off the literal `:0` rather than off what the kernel assigned.
     ///
     /// [`new`]: BundleBackend::new
     pub fn with_bind_port(mut self, port: u16) -> Self {
-        self.bind_port = port;
+        self.bind_port = Some(port);
         self
     }
 
@@ -492,9 +564,14 @@ impl BundleBackend {
     }
 }
 
-/// Node-wide fallback port for a bundle that declares no `serve_bundle.port`
-/// (R599-F10; demoted to a fallback by R599-F12). Mirrors the 2026-07-06
-/// ingress testbed (passway → :8080).
+/// The historical node-wide bundle port (R599-F10; demoted to a fallback by
+/// R599-F12). Mirrors the 2026-07-06 ingress testbed (passway → :8080).
+///
+/// **R844-F2 retired it as a fallback.** Nothing applies this value any more —
+/// a bundle that declares no port is *allocated* one
+/// ([`BundleBackend::resolve_port`]). It survives as the documented suggestion
+/// in `--bundle-port`'s help text, so an operator who wants the old testbed
+/// shape can ask for it by name instead of receiving it by accident.
 #[cfg(feature = "bundle-serving")]
 pub const DEFAULT_BUNDLE_PORT: u16 = 8080;
 
@@ -2149,13 +2226,19 @@ async fn run_bundle_keepalive(
     // command=[--bundle <dir> --listen <addr>]) and fork it.
     //
     // R599-F12: the bind address is the workload's mesh address when yubaba
-    // admitted one, loopback otherwise; the port is the workload's own declared
-    // `serve_bundle.port`, falling back to the node-wide default. Those two
-    // together are what close R599-F10's follow-up — a mesh-bound listener is
-    // reachable from another node, and a per-workload port means the node is no
-    // longer limited to the one bundle that fits on 8080.
+    // admitted one, loopback otherwise. Those two together are what close
+    // R599-F10's follow-up — a mesh-bound listener is reachable from another
+    // node, and a per-workload port means the node is no longer limited to the
+    // one bundle that fits on 8080.
+    //
+    // R844-F2: the port now comes from the node's allocator rather than
+    // `bundle.port.unwrap_or(backend.bind_port)`. A declared port still wins
+    // verbatim; an undeclared one is allocated and remembered, instead of
+    // silently landing on the node-wide 8080 that made "per-workload port" true
+    // only for bundles whose operator had written one down.
     let bind_ip = native_bind_ip(mesh);
-    let port = bundle.port.unwrap_or(backend.bind_port);
+    let declared = backend.declared_port(bundle);
+    let port = backend.resolve_port(&id.0, bind_ip, declared)?;
     let listen = format!("{bind_ip}:{port}");
     // R556-T12: `bundle.env` is the deploy-resolved serve environment. Until it
     // existed, the static / SSR server was the one bundle process forked with
@@ -2194,7 +2277,7 @@ async fn run_bundle_keepalive(
     // static server stays up (reap it via Stop), but a declared receiver
     // that silently didn't start is the failure to avoid.
     if let Some(rv) = revalidate {
-        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, port)
+        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, declared)
             .await
             .map_err(|e| {
                 format!("mesofact revalidate receiver for {} failed to start: {e}", id.0)
@@ -2244,8 +2327,15 @@ async fn run_bundle_on_demand(
     // *kamaji itself* binds and holds as socket custodian, so the mesh address
     // has to be right at deploy time — a JIT bundle that armed on loopback is
     // unreachable off-node for the whole life of the workload.
+    //
+    // R844-F2: same allocator as keep-alive, and the custody makes it *more*
+    // stable rather than less — kamaji holds this socket across every fork and
+    // idle-reap, so an on-demand workload never reallocates on wake and the
+    // rendered ingress upstream never has to re-resolve mid-flight. The ledger
+    // covers the one case custody cannot: kamaji itself restarting.
     let bind_ip = native_bind_ip(mesh);
-    let port = bundle.port.unwrap_or(backend.bind_port);
+    let declared = backend.declared_port(bundle);
+    let port = backend.resolve_port(&id.0, bind_ip, declared)?;
     let listen = format!("{bind_ip}:{port}");
     // R556-T12: same deploy-resolved env as the keep-alive path. A JIT bundle
     // forks on the first connection, so a credential missing here would surface
@@ -2270,7 +2360,7 @@ async fn run_bundle_on_demand(
     // accept pokes at any time), independent of the static server's JIT
     // idle-reaping. Fork it against the same materialized bundle.
     if let Some(rv) = revalidate {
-        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, port)
+        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, declared)
             .await
             .map_err(|e| {
                 format!("mesofact revalidate receiver for {} failed to start: {e}", id.0)
@@ -2454,11 +2544,22 @@ async fn fork_revalidate_receiver(
     serve_bin: &Path,
     receiver: &workload_spec::MesofactRevalidateReceiver,
     bind_ip: std::net::Ipv4Addr,
-    serve_port: u16,
+    declared_serve_port: Option<u16>,
 ) -> std::result::Result<(), String> {
-    let rv_port = revalidate_port(serve_port);
-    let listen = format!("{bind_ip}:{rv_port}");
     let rv_id = WorkloadId(format!("{}-revalidate", id.0));
+    // R844-F2: the `+1` derivation applies to a *declared* serve port only.
+    // Deriving it from the RESOLVED port would be a co-tenancy bug: with the
+    // static server's port allocated, `port + 1` is an arbitrary number the
+    // allocator may already have handed to another workload on this node, so
+    // the pair that R599-F12 kept disjoint would start colliding exactly when
+    // nobody declares ports — the case this ticket makes normal. Undeclared,
+    // the receiver gets its own ledger entry under `<id>-revalidate`.
+    let rv_port = backend.resolve_port(
+        &rv_id.0,
+        bind_ip,
+        declared_serve_port.map(revalidate_port),
+    )?;
+    let listen = format!("{bind_ip}:{rv_port}");
     let spec = bundle_workload_spec_revalidate(&rv_id, serve_bin, bundle_dir, &listen, receiver);
     let mesh = kamaji::MeshAssignment::inlined(bind_ip);
     backend
@@ -2590,13 +2691,17 @@ async fn fork_feed_tier(
         .map_err(|e| format!("native fork of almanac-feed failed: {e:#}"))
 }
 
-/// Port the revalidate receiver binds, given its bundle's serving port
-/// (R599-F12).
+/// Port the revalidate receiver binds, given its bundle's **declared** serving
+/// port (R599-F12).
 ///
 /// It rides the port immediately above the static server's, on the same
 /// address, so a bundle occupies one contiguous pair. Deriving it from the
 /// *workload's* port rather than the node default is what keeps two bundles on
 /// one node from colliding once their static servers have been separated.
+///
+/// R844-F2: input is the DECLARED port, never the resolved one — see
+/// [`fork_revalidate_receiver`] for why deriving from an allocated port
+/// re-introduces exactly the collision this function exists to avoid.
 ///
 /// Two edges: `0` is the tests' OS-assigned-ephemeral sentinel and stays
 /// ephemeral (rather than binding privileged port 1), and a declared port at
@@ -2828,6 +2933,11 @@ fn runtime_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
         state,
         pid,
         mesh_ident: Some(s.ident.0),
+        // R844-F2: these backends fork plain host processes (or hold the
+        // listen socket themselves), so the port they report is the port
+        // something is actually bound to on this node — the fact yubaba needs
+        // and previously had no channel for.
+        ports: s.ports,
     }
 }
 
@@ -2863,6 +2973,9 @@ fn docker_workload_to_entry(w: kamaji::docker::DockerWorkload) -> WorkloadEntry 
         state,
         pid: w.pid,
         mesh_ident: Some(w.state.ident.0),
+        // A docker container is namespaced: the declared port is the bound
+        // port, so the backend resolves nothing and this stays empty.
+        ports: w.state.ports,
     }
 }
 
@@ -2991,6 +3104,17 @@ async fn stop_workload(
             let mut registry = ctx.registry.lock().await;
             registry.remove_probe(&id);
             registry.remove_deploy_progress(&id);
+        }
+        // R844-F2: and the port reservations. A ledger nobody prunes is a
+        // leak that only shows up as pressure — every stopped-and-never-
+        // redeployed workload would hold a port out of the pool forever.
+        // Both the static server and its revalidate receiver are reserved
+        // under their own idents; `release` is idempotent, so releasing a
+        // receiver that never existed is free.
+        {
+            use kamaji::ports::PortAllocator;
+            backend.ports.release(&id.0);
+            backend.ports.release(&format!("{}-revalidate", id.0));
         }
         // R755-B5: and the on-disk admission record, or the next restart would
         // resurrect a workload the operator stopped.
@@ -3158,6 +3282,7 @@ mod tests {
                 state: WireWorkloadState::Pending,
                 pid: None,
                 mesh_ident: None,
+                ports: Vec::new(),
             },
             // The truth, as the native bundle runtime renders it.
             WorkloadEntry {
@@ -3165,6 +3290,7 @@ mod tests {
                 state: WireWorkloadState::Running,
                 pid: Some(67749),
                 mesh_ident: Some("yah-marketing".into()),
+                ports: Vec::new(),
             },
         ];
         let out = dedupe_workload_entries(entries);
@@ -3183,12 +3309,14 @@ mod tests {
             state: WireWorkloadState::Running,
             pid: Some(42),
             mesh_ident: Some("w".into()),
+            ports: Vec::new(),
         };
         let pending = WorkloadEntry {
             id: WorkloadId::new("w"),
             state: WireWorkloadState::Pending,
             pid: None,
             mesh_ident: None,
+            ports: Vec::new(),
         };
         for entries in [
             vec![pending.clone(), running.clone()],
@@ -3209,6 +3337,7 @@ mod tests {
             state: WireWorkloadState::Running,
             pid: Some(pid),
             mesh_ident: Some(id.into()),
+            ports: Vec::new(),
         };
         let out = dedupe_workload_entries(vec![mk("a", 1), mk("b", 2), mk("c", 3)]);
         assert_eq!(out.len(), 3);
@@ -3226,12 +3355,14 @@ mod tests {
                 state: WireWorkloadState::Exited,
                 pid: None,
                 mesh_ident: None,
+                ports: Vec::new(),
             },
             WorkloadEntry {
                 id: WorkloadId::new("w"),
                 state: WireWorkloadState::Starting,
                 pid: None,
                 mesh_ident: None,
+                ports: Vec::new(),
             },
         ]);
         assert_eq!(out.len(), 1);
@@ -3955,6 +4086,7 @@ mod tests {
                 container_id: "deadbeef".into(),
                 status: kamaji::WorkloadStatus::Running,
                 mesh_ip: None,
+                ports: Vec::new(),
             },
             pid: Some(4242),
             workload_id: "forge-abc".into(),
@@ -3982,6 +4114,7 @@ mod tests {
                     last_finished_at_unix_ms: 1,
                 },
                 mesh_ip: None,
+                ports: Vec::new(),
             },
             pid: None,
             workload_id: "svc".into(),
@@ -4782,6 +4915,262 @@ mod tests {
             assert!(
                 message.contains("runtimes/mesofact/0.8.20/"),
                 "the message must name what it looked for, got: {message}"
+            );
+        }
+
+        // ── R844-F2: automatic port allocation + the resolved-port return ──
+
+        /// THE motivating case, end to end through the real Deploy handler.
+        /// Two bundles, one node, NEITHER declaring a port: both come up, on
+        /// distinct ports, and `List` reports each one's actual port back to
+        /// yubaba.
+        ///
+        /// Before this ticket the second deploy landed on the same node-wide
+        /// 8080 as the first, and `List` reported no port at all — so even when
+        /// the bind happened to work there was no way for the ingress renderer
+        /// to learn where to send traffic.
+        #[tokio::test]
+        async fn two_undeclared_bundles_co_tenant_a_node_on_distinct_reported_ports() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            // No `.with_bind_port(...)`: this is the fleet's actual shape once
+            // the mirror stops naming a port, and the case the old code could
+            // not serve twice.
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(BundleBackend::new(
+                Arc::clone(&store),
+                cache.path(),
+                state.path(),
+            )));
+
+            for (rid, id) in [(1_844u64, "yah-marketing"), (1_845, "noisetable-com")] {
+                let reply = handle_message(
+                    YubabaToKamaji::Deploy {
+                        request_id: RequestId(rid),
+                        id: WorkloadId::new(id),
+                        spec: serve_bundle_workload_on_port(
+                            &digest,
+                            BundleLifecycle::KeepAlive,
+                            None,
+                        ),
+                        mesh: None,
+                    },
+                    &ctx,
+                )
+                .await;
+                assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+                await_deploy_ok(&ctx, id).await;
+            }
+
+            let entries = match handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(1_846),
+                },
+                &ctx,
+            )
+            .await
+            {
+                KamajiToYubaba::WorkloadList { entries, .. } => entries,
+                other => panic!("expected WorkloadList, got {other:?}"),
+            };
+
+            let port_of = |id: &str| -> u16 {
+                let e = entries
+                    .iter()
+                    .find(|e| e.id == WorkloadId::new(id))
+                    .unwrap_or_else(|| panic!("{id} missing from List: {entries:?}"));
+                assert_eq!(e.state, WorkloadState::Running, "{id} is not Running");
+                assert_eq!(
+                    e.ports.len(),
+                    1,
+                    "{id} must report exactly the one port it bound, got {:?}",
+                    e.ports
+                );
+                e.ports[0]
+            };
+
+            let marketing = port_of("yah-marketing");
+            let noisetable = port_of("noisetable-com");
+            assert_ne!(marketing, 0, "an unresolved :0 is not a reportable port");
+            assert_ne!(
+                marketing, noisetable,
+                "co-tenants must not be handed the same port"
+            );
+            assert_ne!(
+                marketing, DEFAULT_BUNDLE_PORT,
+                "allocation must not fall back to the well-known port this ticket removes"
+            );
+        }
+
+        /// A bundle that DOES declare a port still binds exactly that one, and
+        /// now also reports it back. This is the half that makes step 3
+        /// (deleting the mirror's `port` key) a safe change rather than a
+        /// behavioural one: while the pin is written, nothing moves.
+        #[tokio::test]
+        async fn a_declared_port_is_bound_verbatim_and_reported_back() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(BundleBackend::new(
+                Arc::clone(&store),
+                cache.path(),
+                state.path(),
+            )));
+
+            // A port picked from the ephemeral range so the test does not fight
+            // whatever else this machine is running.
+            let declared = kamaji::ports::pick_free_port(kamaji::ports::LOOPBACK).unwrap();
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(1_847),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec: serve_bundle_workload_on_port(
+                        &digest,
+                        BundleLifecycle::KeepAlive,
+                        Some(declared),
+                    ),
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            await_deploy_ok(&ctx, "yah-marketing").await;
+
+            let entries = match handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(1_848),
+                },
+                &ctx,
+            )
+            .await
+            {
+                KamajiToYubaba::WorkloadList { entries, .. } => entries,
+                other => panic!("expected WorkloadList, got {other:?}"),
+            };
+            let e = entries
+                .iter()
+                .find(|e| e.id == WorkloadId::new("yah-marketing"))
+                .expect("deployed bundle must be listed");
+            assert_eq!(e.ports, vec![declared]);
+        }
+
+        /// An allocated port is STABLE across a kamaji restart. A keep-alive
+        /// bundle whose port moved would leave the ingress upstream rendered
+        /// from the first run naming a dead listener — which still reads as
+        /// healthy, so nothing detects it.
+        #[tokio::test]
+        async fn an_allocated_port_survives_a_kamaji_restart() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+
+            let listed_port = |ctx: &Arc<ServerCtx>| {
+                let ctx = Arc::clone(ctx);
+                async move {
+                    match handle_message(
+                        YubabaToKamaji::List {
+                            request_id: RequestId(1_849),
+                        },
+                        &ctx,
+                    )
+                    .await
+                    {
+                        KamajiToYubaba::WorkloadList { entries, .. } => entries
+                            .iter()
+                            .find(|e| e.id == WorkloadId::new("yah-marketing"))
+                            .unwrap_or_else(|| panic!("not listed: {entries:?}"))
+                            .ports
+                            .clone(),
+                        other => panic!("expected WorkloadList, got {other:?}"),
+                    }
+                }
+            };
+
+            let first = Arc::new(ServerCtx::new().with_bundle_backend(BundleBackend::new(
+                Arc::clone(&store),
+                cache.path(),
+                state.path(),
+            )));
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(1_850),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec: serve_bundle_workload_on_port(&digest, BundleLifecycle::KeepAlive, None),
+                    mesh: None,
+                },
+                &first,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            await_deploy_ok(&first, "yah-marketing").await;
+            let before = listed_port(&first).await;
+            assert_eq!(before.len(), 1);
+
+            // Systemd stops kamaji: children are killed, the process goes away.
+            first
+                .bundle
+                .as_ref()
+                .unwrap()
+                .native
+                .teardown_workload(&workload_spec::MeshIdent("yah-marketing".into()))
+                .await
+                .unwrap();
+            drop(first);
+
+            // The restarted daemon replays its deploy record — and must give
+            // the workload back the port the ledger remembers, not a new one.
+            let second = Arc::new(ServerCtx::new().with_bundle_backend(BundleBackend::new(
+                Arc::clone(&store),
+                cache.path(),
+                state.path(),
+            )));
+            assert_eq!(second.resume_bundle_workloads().await, 1);
+            await_deploy_ok(&second, "yah-marketing").await;
+            assert_eq!(
+                listed_port(&second).await,
+                before,
+                "a resumed keep-alive bundle must come back on the same port"
+            );
+        }
+
+        /// The `--bundle-port` / `KAMAJI_BUNDLE_PORT` override is still honoured
+        /// when an operator sets it explicitly — R844-F2 removed the SILENT
+        /// default, not the operator's ability to pin.
+        #[test]
+        fn an_explicit_node_override_still_wins_over_allocation() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let state = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let pinned =
+                BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                    .with_bind_port(9100);
+            let bundle = workload_spec::MesofactServeBundle {
+                digest: workload_spec::BlakeHash("0".repeat(64)),
+                runtime: "self".into(),
+                lifecycle: BundleLifecycle::KeepAlive,
+                port: None,
+                env: Default::default(),
+            };
+            assert_eq!(pinned.declared_port(&bundle), Some(9100));
+            assert_eq!(
+                pinned
+                    .resolve_port("yah-marketing", std::net::Ipv4Addr::LOCALHOST, Some(9100))
+                    .unwrap(),
+                9100
+            );
+
+            // And the unset default allocates rather than returning 8080.
+            let unpinned =
+                BundleBackend::new(store, cache.path(), state.path());
+            assert_eq!(
+                unpinned.declared_port(&bundle),
+                None,
+                "unset must mean allocate, not DEFAULT_BUNDLE_PORT"
             );
         }
 

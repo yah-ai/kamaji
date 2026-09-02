@@ -189,6 +189,30 @@ pub struct WorkloadEntry {
     /// `None` for backends/entries that don't stamp a mesh-ident label (R590-B9).
     #[serde(default)]
     pub mesh_ident: Option<String>,
+    /// Port(s) kamaji **actually bound** for this workload (R844-F2).
+    ///
+    /// This is the return half of automatic port allocation. Before it existed,
+    /// yubaba could only learn a bundle's port from the pin an operator wrote
+    /// into the mirror (`[providers.bundle] port`), because the port kamaji
+    /// resolved — the workload's own declared port, or kamaji's node-wide
+    /// `KAMAJI_BUNDLE_PORT` fallback, or now an allocated one — lived entirely
+    /// inside kamaji's process and had no channel back. That is why a node
+    /// could serve exactly one bundle: the only port yubaba could name was a
+    /// well-known one.
+    ///
+    /// Carried on the *list* response rather than the deploy ack on purpose. A
+    /// bundle `Deploy` acks on admission (`ProtocolVersion::V3`), before the
+    /// tree is materialized and long before anything binds, so the ack cannot
+    /// carry a port that does not exist yet. Riding the list makes the same
+    /// field do double duty: it publishes the port initially *and* corrects it
+    /// if the workload later comes back on a different one.
+    ///
+    /// Empty means "no resolved port known for this entry" — a backend that
+    /// does not resolve ports, or an entry that has not bound yet. It does not
+    /// mean the workload is portless; the caller falls back to whatever the
+    /// workload declared.
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 /// Mesh-plane placement for a deployed workload (R599-F12) — yubaba's

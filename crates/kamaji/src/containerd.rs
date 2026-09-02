@@ -453,6 +453,12 @@ impl ContainerdRuntime {
             container_id: container_id.to_string(),
             mesh_ip: mesh.mesh_ip,
             task_pid,
+            // R844-F2: a container gets its own network namespace, so its
+            // declared `expose.mesh.ports` *is* the bound port — there is
+            // nothing for this backend to resolve, and empty is the honest
+            // answer rather than echoing the declaration back as if it were a
+            // measurement. Callers fall back to the spec on empty.
+            ports: Vec::new(),
         })
     }
 
@@ -849,6 +855,8 @@ impl Kamaji for ContainerdRuntime {
                 container_id: c.id,
                 status,
                 mesh_ip,
+                // See `deploy_workload` — namespaced, so nothing to resolve.
+                ports: Vec::new(),
             });
         }
 
@@ -889,6 +897,7 @@ impl Kamaji for ContainerdRuntime {
             container_id: c.id,
             status,
             mesh_ip,
+            ports: Vec::new(),
         }))
     }
 

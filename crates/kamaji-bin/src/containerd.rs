@@ -797,6 +797,11 @@ impl ContainerdBackend {
                 id: WorkloadId::new(c.id),
                 state,
                 pid,
+                // R844-F2: a containerd container has its own network
+                // namespace, so its declared port is the bound port and this
+                // backend resolves nothing. Empty means "no resolved port
+                // known", not "portless" — the caller falls back to the spec.
+                ports: Vec::new(),
             });
         }
         Ok(entries)

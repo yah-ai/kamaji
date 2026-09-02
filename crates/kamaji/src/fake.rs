@@ -157,6 +157,7 @@ impl FakeRuntime {
                     container_id: String::new(),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
+                    ports: Vec::new(),
                 },
                 logs: vec![],
             })
@@ -202,6 +203,7 @@ impl FakeRuntime {
                     container_id: format!("fake-{key}"),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
+                    ports: Vec::new(),
                 },
                 logs: vec![],
             });
@@ -301,6 +303,7 @@ impl Kamaji for FakeRuntime {
                     container_id: container_id.clone(),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
+                    ports: Vec::new(),
                 },
                 logs: vec![],
             });
@@ -308,11 +311,16 @@ impl Kamaji for FakeRuntime {
         entry.state.status = WorkloadStatus::Running;
         entry.state.container_id = container_id.clone();
         entry.state.mesh_ip = Some(mesh_ip);
+        // R844-F2: the fake stands in for a native supervisor, so it reports
+        // the spec's ports as resolved. A fake that always answered "no
+        // resolved port" would make every test of the return path vacuous.
+        entry.state.ports = spec.expose.mesh.ports.clone();
 
         Ok(DeployResult {
             container_id,
             mesh_ip,
             task_pid: 1, // fake PID
+            ports: spec.expose.mesh.ports.clone(),
         })
     }
 
@@ -386,17 +394,20 @@ impl Kamaji for FakeRuntime {
                     container_id: container_id.clone(),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
+                    ports: Vec::new(),
                 },
                 logs: vec![],
             });
         entry.state.status = WorkloadStatus::Running;
         entry.state.container_id = container_id.clone();
         entry.state.mesh_ip = Some(mesh_ip);
+        entry.state.ports = spec.expose.mesh.ports.clone();
 
         Ok(DeployResult {
             container_id,
             mesh_ip,
             task_pid: 1,
+            ports: spec.expose.mesh.ports.clone(),
         })
     }
 

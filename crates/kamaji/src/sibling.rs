@@ -648,12 +648,29 @@ fn wire_mesh(mesh: &crate::MeshAssignment) -> Option<&crate::MeshAssignment> {
     }
 }
 
+/// Project one wire [`WorkloadEntry`] into the runtime's richer
+/// [`crate::WorkloadState`].
+///
+/// **`ident` prefers `mesh_ident`** (R844-F2). The two differ on the container
+/// backends: `id` is the containerd/docker container id (`forge-<uuid>`), while
+/// `mesh_ident` is `expose.mesh.identity` — the handle yubaba's own bookkeeping
+/// keys on. Keyed on `id`, yubaba's service-record sweep matched no container
+/// record and retracted every one of them on the first pass. The native/bundle
+/// backends set both to the same string, so this changes nothing there. `None`
+/// falls back to `id`, which is all a backend that stamps no mesh label can
+/// offer.
 fn entry_to_workload_state(entry: WorkloadEntry) -> crate::WorkloadState {
+    let ident = entry.mesh_ident.clone().unwrap_or_else(|| entry.id.0.clone());
     crate::WorkloadState {
-        ident: crate::MeshIdent(entry.id.0.clone()),
+        ident: crate::MeshIdent(ident),
         container_id: entry.id.0,
         status: proto_state_to_status(entry.state),
         mesh_ip: None,
+        // R844-F2: the resolved listen port(s), carried across the wire so the
+        // service-record sweep can publish and correct them. This is the whole
+        // return path — without it a port kamaji allocated is invisible to the
+        // thing that renders the ingress upstream.
+        ports: entry.ports,
     }
 }
 
@@ -688,6 +705,13 @@ impl crate::Kamaji for KamajiClient {
             container_id: id.0,
             mesh_ip: mesh.mesh_ip,
             task_pid: 0,
+            // R844-F2: empty on purpose, and this is the load-bearing reason
+            // the return path rides `list` rather than the deploy reply. A
+            // sibling `Deploy` acks on *admission* (ProtocolVersion::V3) —
+            // before the bundle tree is materialized and long before anything
+            // binds — so there is no resolved port in existence yet to report.
+            // The first `list_workloads` sweep after the fork carries it.
+            ports: Vec::new(),
         })
     }
 
@@ -764,6 +788,9 @@ impl crate::Kamaji for KamajiClient {
                     container_id: id.0,
                     mesh_ip: mesh.mesh_ip,
                     task_pid: 0,
+                    // Same as `deploy_workload`: the ack carries no resolved
+                    // port, and a graceful upgrade keeps the listener anyway.
+                    ports: Vec::new(),
                 })
             }
             other => Err(anyhow::anyhow!(
@@ -1041,6 +1068,7 @@ mod tests {
             id: WorkloadId::new(name),
             state: WorkloadState::Running,
             pid: Some(1),
+            ports: Vec::new(),
         }
     }
 
@@ -1071,6 +1099,7 @@ mod tests {
                     id: WorkloadId::new("foo"),
                     state: WorkloadState::Running,
                     pid: Some(42),
+                    ports: Vec::new(),
                 }],
             }
         })
@@ -1500,12 +1529,14 @@ mod tests {
                         id: WorkloadId::new("svc-a"),
                         state: WorkloadState::Running,
                         pid: Some(1000),
+                        ports: Vec::new(),
                     },
                     WorkloadEntry {
                         mesh_ident: None,
                         id: WorkloadId::new("svc-b"),
                         state: WorkloadState::Exited,
                         pid: None,
+                        ports: Vec::new(),
                     },
                 ],
             }
@@ -1534,6 +1565,7 @@ mod tests {
                     id: WorkloadId::new("target"),
                     state: WorkloadState::Running,
                     pid: Some(42),
+                    ports: Vec::new(),
                 }],
             }
         })
