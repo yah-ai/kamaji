@@ -41,7 +41,7 @@ use containerd_client::{
         tasks_client::TasksClient,
         version_client::VersionClient,
         Container, CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest,
-        DeleteTaskRequest, GetContainerRequest, KillRequest, ListContainersRequest, StartRequest,
+        GetContainerRequest, KillRequest, ListContainersRequest, StartRequest,
     },
     tonic, with_namespace,
 };
@@ -269,25 +269,29 @@ impl ContainerdRuntime {
         let mut tasks = self.tasks_client();
         let mut ctrs = self.containers_client();
 
-        // Kill the task (best-effort; container may not be running).
-        let kill_req = KillRequest {
-            container_id: container_id.to_string(),
-            exec_id: String::new(),
-            signal: 9, // SIGKILL
-            all: true,
-        };
-        let kill_req = with_namespace!(kill_req, self.namespace);
-        let _ = tasks.kill(kill_req).await;
-
-        // Brief delay so the task exits before we try to delete.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Delete the task record.
-        let del_task_req = DeleteTaskRequest {
-            container_id: container_id.to_string(),
-        };
-        let del_task_req = with_namespace!(del_task_req, self.namespace);
-        let _ = tasks.delete(del_task_req).await;
+        // Kill the task and WAIT for containerd to actually reap it.
+        //
+        // R854: this used to be a blind `sleep(500ms)` between the kill and the
+        // delete, with the delete's result discarded. Containerd refuses to
+        // delete a task that has not reached STOPPED, so any exit slower than
+        // half a second left the task alive while the *container* delete below
+        // succeeded anyway — and the next deploy's CreateTask collided with the
+        // orphan ("task <ident>: already exists"). `reap_task` returns only once
+        // containerd reports no task, and says so when it can't.
+        if let Err(e) = kcc::reap_task(
+            &mut tasks,
+            &self.namespace,
+            container_id,
+            kcc::TASK_REAP_TIMEOUT,
+        )
+        .await
+        {
+            tracing::warn!(
+                container_id = %container_id,
+                error = %format!("{e:#}"),
+                "task reap did not complete; a redeploy may collide with the survivor"
+            );
+        }
 
         // Delete the container record.
         let del_req = DeleteContainerRequest {
@@ -349,9 +353,29 @@ impl ContainerdRuntime {
                 .await
                 .ok();
 
-        // Deployment env: the mesh IP (as before) plus any caller extras
-        // (PASSWAY_UPGRADE on the incoming graceful-upgrade container).
+        // Deployment env: the mesh IP (as before), the `PORT` / `PORT_<NAME>`
+        // contract (R844-T13), plus any caller extras (PASSWAY_UPGRADE on the
+        // incoming graceful-upgrade container).
+        //
+        // A container gets its own network namespace, so the declared
+        // `expose.mesh.ports` *is* the bound port here — there is nothing to
+        // resolve, which is also why `DeployResult::ports` stays empty on this
+        // backend. Naming them through `name_anonymous_ports` anyway is what
+        // makes a workload read the same variable on a container as it does on
+        // the native backend, where the number really was allocated.
+        //
+        // Skipped where the spec already names the variable: `deploy_env` is
+        // applied *after* the spec's literal env (asserted by
+        // `oci_spec_injects_mesh_ip_after_literal_env`), so injecting
+        // unconditionally would make this the one backend where the contract
+        // overrides an explicit operator value instead of yielding to it.
         let mut deploy_env = vec![format!("YAH_MESH_IP={}", mesh.mesh_ip)];
+        let spec_names: Vec<&str> = spec.env.iter().map(|e| e.name.as_str()).collect();
+        for (k, v) in crate::ports::port_env(&crate::declared_port_names(&spec.expose.mesh)) {
+            if !spec_names.contains(&k.as_str()) {
+                deploy_env.push(format!("{k}={v}"));
+            }
+        }
         deploy_env.extend(extra_env.iter().cloned());
 
         // Build OCI spec (with pod placement) and wrap it as protobuf.Any.
@@ -416,6 +440,10 @@ impl ContainerdRuntime {
             .with_context(|| format!("preparing rootfs for {container_id}"))?;
 
         // Create + start the task (execution instance).
+        //
+        // R854: via `create_task_reaping_stale`, so a task record that outlived
+        // the caller's teardown is reaped and the create retried once, instead
+        // of failing the whole deploy on "already exists".
         let task_pid = {
             let mut tasks = self.tasks_client();
             let req = CreateTaskRequest {
@@ -429,12 +457,9 @@ impl ContainerdRuntime {
                 options: None,
                 ..Default::default()
             };
-            let req = with_namespace!(req, self.namespace);
-            let resp = tasks
-                .create(req)
+            kcc::create_task_reaping_stale(&mut tasks, &self.namespace, req)
                 .await
-                .with_context(|| format!("creating task for {container_id}"))?;
-            resp.into_inner().pid
+                .with_context(|| format!("creating task for {container_id}"))?
         };
         {
             let mut tasks = self.tasks_client();
@@ -458,7 +483,7 @@ impl ContainerdRuntime {
             // nothing for this backend to resolve, and empty is the honest
             // answer rather than echoing the declaration back as if it were a
             // measurement. Callers fall back to the spec on empty.
-            ports: Vec::new(),
+            ports: Default::default(),
         })
     }
 
@@ -752,6 +777,13 @@ impl Kamaji for ContainerdRuntime {
         spec: &WorkloadSpec,
         mesh: &MeshAssignment,
     ) -> Result<DeployResult> {
+        // R844-F21: a name-only port asks this backend to allocate, and it
+        // cannot — see `crate::reject_unresolved_ports`. Refused here rather
+        // than dropped, so the manifest's author learns the spelling does not
+        // apply to a container instead of watching a named port silently fail
+        // to appear in the service record.
+        crate::reject_unresolved_ports(&spec.name, &spec.expose.mesh, crate::Backend::Containerd)?;
+
         // Host networking is a privileged escape hatch — it drops network
         // isolation so the container binds host ports directly. Guard it to the
         // infra tier so an ordinary tenant workload cannot request it (bind
@@ -856,7 +888,7 @@ impl Kamaji for ContainerdRuntime {
                 status,
                 mesh_ip,
                 // See `deploy_workload` — namespaced, so nothing to resolve.
-                ports: Vec::new(),
+                ports: Default::default(),
             });
         }
 
@@ -897,7 +929,7 @@ impl Kamaji for ContainerdRuntime {
             container_id: c.id,
             status,
             mesh_ip,
-            ports: Vec::new(),
+            ports: Default::default(),
         }))
     }
 
@@ -1283,7 +1315,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.to_string()),
-                    ports: vec![],
+                    ports: MeshExpose::anonymous_ports([]),
                     allow_from: vec![],
                 },
                 public: None,

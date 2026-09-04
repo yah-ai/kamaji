@@ -58,6 +58,11 @@ struct Args {
     /// attaches the backend; `None` leaves microVM-marked deploys refused.
     #[cfg_attr(not(feature = "microvm"), allow(dead_code))]
     microvm_dir: Option<PathBuf>,
+    /// State dir for the per-tenant passway JIT tier (R852-F1), holding each
+    /// cold passway's stdout/stderr capture across forks. `Some(dir)` attaches
+    /// the tier; `None` leaves tenant-passway deploys refused.
+    #[cfg_attr(not(feature = "tenant-passway"), allow(dead_code))]
+    tenant_passway_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> std::result::Result<Args, ParseError> {
@@ -100,6 +105,12 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
 
     // R605-F8: microVM backend opt-in, same discipline again.
     let mut microvm_dir: Option<PathBuf> = std::env::var_os("KAMAJI_MICROVM_DIR").map(PathBuf::from);
+
+    // R852-F1: per-tenant passway tier opt-in. Same discipline once more — a
+    // node that is not a public front door must not start binding tenant
+    // sockets because a variable was inherited.
+    let mut tenant_passway_dir: Option<PathBuf> =
+        std::env::var_os("KAMAJI_TENANT_PASSWAY_DIR").map(PathBuf::from);
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -152,6 +163,13 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--microvm-dir"))?,
                 );
             }
+            "--tenant-passway-dir" => {
+                tenant_passway_dir = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or(ParseError::MissingValue("--tenant-passway-dir"))?,
+                );
+            }
             // Bare `--docker` inherits DOCKER_HOST; `--docker-host URL` pins one.
             "--docker" => docker_host = Some(String::new()),
             "--docker-host" => {
@@ -174,6 +192,7 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         docker_host,
         native_exec_dir,
         microvm_dir,
+        tenant_passway_dir,
     })
 }
 
@@ -191,6 +210,7 @@ fn print_help() {
     println!(
         "Usage: kamaji [--socket PATH] [--containerd-socket PATH] [--docker | --docker-host URL]\n              \
          [--native-exec-dir PATH] [--microvm-dir PATH]\n              \
+         [--tenant-passway-dir PATH]\n              \
          [--bundle-cache-dir PATH] [--bundle-origin URL] [--bundle-port PORT]"
     );
     println!();
@@ -218,6 +238,12 @@ fn print_help() {
     println!("                                Needs /dev/kvm openable by this user and");
     println!("                                CAP_NET_ADMIN for guest networking (default:");
     println!("                                $KAMAJI_MICROVM_DIR, else such deploys are refused)");
+    println!("      --tenant-passway-dir PATH  hold one TLS listen socket per enrolled custom");
+    println!("                                domain and fork a cold `passway` on the first");
+    println!("                                connection, capturing logs under PATH. This is the");
+    println!("                                free-tier front door: 10k idle domains cost 10k held");
+    println!("                                fds, not 10k processes (default:");
+    println!("                                $KAMAJI_TENANT_PASSWAY_DIR, else such deploys are refused)");
     println!("      --bundle-cache-dir PATH   node bundle root for serving published W272 mesofact");
     println!("                                bundles: <root>/bundles, <root>/runtimes, <root>/state");
     println!("                                (default: $KAMAJI_BUNDLE_CACHE_DIR, else serve-bundle");
@@ -227,11 +253,11 @@ fn print_help() {
     println!("                                blobs are content-addressed and digest-verified");
     println!("                                (default: $KAMAJI_BUNDLE_ORIGIN; required with");
     println!("                                --bundle-cache-dir)");
-    println!("      --bundle-port PORT        pin every served bundle to one node-wide port");
+    println!("      --bundle-port PORT        DEPRECATED node-wide port pin (R844-F14). Ports are");
+    println!("                                allocated per bundle and published; a pin here is");
+    println!("                                REFUSED at deploy, naming the port, rather than");
     println!(
-        "                                (default: $KAMAJI_BUNDLE_PORT, else allocate a free");
-    println!(
-        "                                port per bundle{})",
+        "                                aiming every bundle on this node at one slot{}",
         bundle_port_default_str()
     );
     println!("  -h, --help                Print this message and exit");
@@ -288,13 +314,13 @@ fn microvm_memory_cap_mb() -> u32 {
 }
 
 /// Suffix for the `--bundle-port` help line: names the historical testbed port
-/// an operator might want to ask for by hand (R844-F2 stopped applying it as a
-/// silent default), or a note that this build can't serve bundles at all.
+/// (R844-F2 stopped applying it as a silent default; R844-F14 stopped honouring
+/// it when asked for), or a note that this build can't serve bundles at all.
 fn bundle_port_default_str() -> String {
     #[cfg(feature = "bundle-serving")]
     {
         format!(
-            "; pass {} for the pre-R844 single-bundle testbed shape",
+            " (the pre-R844 single-bundle testbed shape was {})",
             kamaji_bin::DEFAULT_BUNDLE_PORT
         )
     }
@@ -499,6 +525,35 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
         anyhow::bail!(
             "--native-exec-dir requires the kamaji binary be built with \
              --features native-exec"
+        );
+    }
+
+    // ── per-tenant passway tier (R852-F1 / W267) ─────────────────────────────
+    // One held TLS listen socket per enrolled custom domain, forking a cold
+    // `passway` on the first connection. Explicit opt-in like the others: this
+    // binds node sockets that a public SNI demux routes real tenant traffic to.
+    #[cfg(feature = "tenant-passway")]
+    {
+        ctx = if let Some(dir) = &args.tenant_passway_dir {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                anyhow::anyhow!("creating tenant-passway state dir {}: {e}", dir.display())
+            })?;
+            tracing::info!(
+                state_dir = %dir.display(),
+                "per-tenant passway tier attached; each enrolled custom domain's TLS backend \
+                 socket will be held here and forked on demand"
+            );
+            ctx.with_tenant_passway(Arc::new(kamaji::jit::JitRuntime::new(dir)))
+        } else {
+            tracing::debug!("no --tenant-passway-dir; tenant-passway deploys will be refused");
+            ctx
+        };
+    }
+    #[cfg(not(feature = "tenant-passway"))]
+    if args.tenant_passway_dir.is_some() {
+        anyhow::bail!(
+            "--tenant-passway-dir requires the kamaji binary be built with \
+             --features tenant-passway"
         );
     }
 

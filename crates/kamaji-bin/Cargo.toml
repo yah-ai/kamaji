@@ -84,19 +84,32 @@ bundle-serving = [
     "yah-mesofact-bundle/store",
 ]
 
+# R852-F1 / W267 §"Free-tier ingress at 10k domains": per-tenant passways on
+# the JIT tier. kamaji binds+holds each enrolled custom domain's TLS backend
+# socket (the address the SNI demux splices to) and forks a `passway` on the
+# first connection, which self-reaps on its idle TTL — so 10k cold domains cost
+# 10k held fds rather than 10k resident processes.
+#
+# Same runtime as `bundle-serving` (`kamaji::jit`) and no extra Rust deps, but a
+# separate feature because they are separate deployments: a node fronting tenant
+# domains needs no bundle store, and a bundle-serving node need not be a public
+# front door. When off, a tenant-passway deploy reports a build-aware
+# BackendRefused rather than being silently ignored.
+tenant-passway = ["dep:kamaji", "kamaji/native-integration"]
+
 [dependencies]
-kamaji-proto = { path = "../kamaji-proto", version = "0.8.30" }
+kamaji-proto = { path = "../kamaji-proto", version = "0.8.32" }
 # R555-F4 (W235 §(c)): `admission-verify` brings in the Ed25519 half of
 # `workload_spec::admission`. Not optional — deciding what is allowed to run
 # is kamaji's job description, and a build that could silently omit the
 # admission gate is a build an operator cannot tell apart from one that has it.
-workload-spec = { package = "yah-workload-spec", version = "0.8.30", features = ["admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.32", features = ["admission-verify"] }
 # R715-F3 / W315 — the process-control channel. `client` is the consumer half
 # the probe runner dials; `kamaji` gives it the ProcState -> WorkloadState
 # conversion as an exhaustive match, which is what keeps "believed verbatim"
 # true. Pure std + serde + tokio (already linked), so no RSS cost worth
 # weighing against W154's memory budget.
-kamaji-procctl = { path = "../procctl", version = "0.8.30", features = ["client", "kamaji"] }
+kamaji-procctl = { path = "../procctl", version = "0.8.32", features = ["client", "kamaji"] }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -121,19 +134,19 @@ containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.30", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.32", default-features = false }
 # Socket-custodian primitive (R599-F9 / R600-F9) — kamaji holds the passway
 # listen fd and hands it to each generation so a cert reload drops no
 # connections. Only the `socket-custody` feature of kamaji is pulled in (just
 # `nix`); gated behind containerd-integration since only the fleet backend uses it.
-kamaji = { path = "../kamaji", optional = true, default-features = false, version = "0.8.30" }
+kamaji = { path = "../kamaji", optional = true, default-features = false, version = "0.8.32" }
 
 # R599-F10 node bundle backend (only linked with the `bundle-serving` feature).
 # yah-object-store is the R2/in-memory blob store; yah-mesofact-bundle (store
 # feature) materializes a W272 bundle from it into the node cache. Both live in
 # oss/yah-base, redirected to path by the root [patch.crates-io] block.
-yah-object-store = { version = "0.8.30", optional = true }
-yah-mesofact-bundle = { version = "0.8.30", optional = true }
+yah-object-store = { version = "0.8.32", optional = true }
+yah-mesofact-bundle = { version = "0.8.32", optional = true }
 
 # Linux-only syscall surface used by the native driver (R406-T5).
 # All three are permissive (MIT / Apache-2.0). The `landlock` crate is a thin

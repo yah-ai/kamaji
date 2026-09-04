@@ -244,6 +244,21 @@ pub struct Registry {
     /// absent here, which the Probe handler maps to [`ProbeStatus::Ready`] —
     /// i.e. "no probe declared ↔ trust the workload's existence".
     probes: HashMap<WorkloadId, ProbeTarget>,
+    /// Digest of the `Workload` each admitted deploy carried (R852-B4), keyed
+    /// by workload id and stamped onto `List` entries as
+    /// [`WorkloadEntry::spec_digest`].
+    ///
+    /// Kept **here** rather than in each backend for two reasons. The backends
+    /// hold a lowered spec (a `WorkloadSpec`, a container config), not the
+    /// `Workload` the caller sent, so only the dispatch layer still has the
+    /// value the caller can compare against. And a caller's question is about
+    /// its own declaration, not about a backend's internals — one recording
+    /// point keeps every backend's entries answering it the same way.
+    ///
+    /// In memory on purpose: after a kamaji restart nothing is bound, so the
+    /// honest answer to "is this workload still deployed with that spec" is
+    /// `None`/"redeploy", which is exactly what an empty map yields.
+    digests: HashMap<WorkloadId, kamaji_proto::SpecDigest>,
 }
 
 /// Per-Kamaji runtime context handed to [`handle_message`] (R406-T9).
@@ -273,6 +288,23 @@ pub struct ServerCtx {
     /// bundle-serving" `BackendRefused`, exactly like the containerd None arm.
     #[cfg(feature = "bundle-serving")]
     pub bundle: Option<BundleBackend>,
+    /// Optional per-tenant passway JIT tier (R852-F1 / W267 §"Free-tier ingress
+    /// at 10k domains"). `None` outside the `tenant-passway` feature build, or
+    /// when kamaji is started without `--tenant-passway-dir`. When `None`, a
+    /// `Deploy { TenantPassway }` returns a build-aware `BackendRefused`,
+    /// exactly like the containerd and bundle `None` arms.
+    ///
+    /// Deliberately a **separate** [`JitRuntime`] from [`BundleBackend::jit`],
+    /// for the reason [`ServerCtx::native`] is separate from
+    /// [`BundleBackend::native`]: that one is the custodian of each served
+    /// mesofact bundle's socket and keys on bundle identities, this one holds
+    /// one socket per *enrolled custom domain*. Sharing a runtime would put two
+    /// unrelated identity spaces in one map, and a node fronting tenant domains
+    /// is not the same deployment as one serving bundles.
+    ///
+    /// [`JitRuntime`]: kamaji::jit::JitRuntime
+    #[cfg(feature = "tenant-passway")]
+    pub tenant_passway: Option<Arc<kamaji::jit::JitRuntime>>,
     /// Optional docker/OrbStack backend (R626-F1). `None` outside the
     /// `docker-integration` feature build, or when kamaji is started without
     /// `--docker`. This is the pond / dev-host counterpart to `containerd`:
@@ -441,33 +473,47 @@ impl BundleBackend {
         }
     }
 
-    /// What port this node has been *told* to serve `bundle` on, if any
-    /// (R844-F2).
+    /// The numeric pin someone wrote down for `bundle`, if any (R844-F2,
+    /// reversed by R844-F14).
     ///
-    /// Two sources, in order, and both are explicit statements by a human:
+    /// Two sources, and both are a human writing a number:
     ///
     /// 1. The bundle's own `serve_bundle.port` — R599-F12's per-workload
     ///    declaration, which the mirror's `[providers.bundle] port` key writes.
     /// 2. The node-wide override an operator passed as `--bundle-port` /
     ///    `KAMAJI_BUNDLE_PORT`.
     ///
-    /// `None` means nobody said, which is now the *normal* case and the one
+    /// `None` means nobody wrote one, which is the *normal* case and the one
     /// [`Self::resolve_port`] allocates for. `0` is the ephemeral sentinel and
     /// reads as "nobody said" too.
     ///
-    /// Honouring a declaration verbatim is what makes removing the mirror's
-    /// `port` key a safe change rather than a behavioural one: while the pin is
-    /// still written, nothing about the resolved port moves.
-    pub fn declared_port(&self, bundle: &workload_spec::MesofactServeBundle) -> Option<u16> {
+    /// R844-F14: this is no longer honoured. A written-down number now rides
+    /// into [`kamaji::ports::PortSpec::pin`], where the allocator **rejects**
+    /// it unless it is world-fixed (80/443) — so a stale mirror pin fails at
+    /// bring-up naming the port, instead of quietly binding the number a
+    /// co-tenant on this node already holds.
+    pub fn declared_pin(&self, bundle: &workload_spec::MesofactServeBundle) -> Option<u16> {
         bundle.port.or(self.bind_port).filter(|&p| p != 0)
+    }
+
+    /// The port set a served bundle asks for: one port named
+    /// [`kamaji::ports::HTTP`], carrying whatever pin someone wrote down so the
+    /// allocator can reject it by name.
+    pub fn http_spec(
+        &self,
+        bundle: &workload_spec::MesofactServeBundle,
+    ) -> kamaji::ports::PortSpec {
+        kamaji::ports::PortSpec {
+            name: kamaji::ports::HTTP.to_string(),
+            pin: self.declared_pin(bundle),
+        }
     }
 
     /// Resolve the port `ident` will actually bind on `bind_ip` (R844-F2).
     ///
-    /// `preferred` is [`Self::declared_port`]'s answer (or a value derived from
-    /// it, as the revalidate receiver's `+1` is). When it is `Some`, it comes
-    /// back unchanged; when it is `None`, a free port is allocated from the
-    /// node's ledger and remembered for this ident across kamaji restarts.
+    /// A free port is allocated from the node's ledger and remembered for this
+    /// `(ident, name)` across kamaji restarts. A `spec` carrying a
+    /// non-world-fixed pin is an error, not a value — see [`Self::declared_pin`].
     ///
     /// The returned port is what gets forked into the workload's `--listen`,
     /// parsed back onto `expose.mesh.ports`, and reported to yubaba on the next
@@ -476,11 +522,11 @@ impl BundleBackend {
         &self,
         ident: &str,
         bind_ip: std::net::Ipv4Addr,
-        preferred: Option<u16>,
+        spec: kamaji::ports::PortSpec,
     ) -> std::result::Result<u16, String> {
         use kamaji::ports::PortAllocator;
         self.ports
-            .resolve(ident, std::net::IpAddr::V4(bind_ip), preferred)
+            .resolve_one(ident, std::net::IpAddr::V4(bind_ip), spec)
             .map_err(|e| format!("could not resolve a listen port for {ident}: {e:#}"))
     }
 
@@ -541,11 +587,16 @@ impl BundleBackend {
         out
     }
 
-    /// Set the node-wide port override. An explicit operator flag wins over
-    /// the `KAMAJI_BUNDLE_PORT` env value picked in [`new`]. A bundle that
-    /// declares its own `serve_bundle.port` wins over both (R599-F12).
+    /// Set the node-wide port override — an explicit operator flag over the
+    /// `KAMAJI_BUNDLE_PORT` env value picked in [`new`].
     ///
-    /// `0` is the ephemeral sentinel: it declares nothing, so
+    /// R844-F14: a non-zero value here now *fails* every bundle deploy on this
+    /// node, naming the port. It is kept rather than deleted so the refusal can
+    /// say which number it refused and where it came from; deleting the flag
+    /// would turn an operator's `--bundle-port 9100` into a silently ignored
+    /// argument, which is the failure this ticket exists to stop.
+    ///
+    /// `0` is the ephemeral sentinel: it pins nothing, so
     /// [`BundleBackend::resolve_port`] allocates. That is what it already meant
     /// in practice — a `:0` listen address let the OS pick — except that the
     /// picked port used to be invisible, because `expose.mesh.ports` was parsed
@@ -567,11 +618,12 @@ impl BundleBackend {
 /// The historical node-wide bundle port (R599-F10; demoted to a fallback by
 /// R599-F12). Mirrors the 2026-07-06 ingress testbed (passway → :8080).
 ///
-/// **R844-F2 retired it as a fallback.** Nothing applies this value any more —
-/// a bundle that declares no port is *allocated* one
-/// ([`BundleBackend::resolve_port`]). It survives as the documented suggestion
-/// in `--bundle-port`'s help text, so an operator who wants the old testbed
-/// shape can ask for it by name instead of receiving it by accident.
+/// **R844-F2 retired it as a fallback**, and **R844-F14 retired the ask
+/// as well**: a bundle's port is allocated ([`BundleBackend::resolve_port`]),
+/// and asking for this number by name — mirror pin or `--bundle-port` — is now
+/// refused, because one node-wide port is a single slot that the second bundle
+/// on a node cannot have. The constant survives as the historical value the
+/// help text and this doc name.
 #[cfg(feature = "bundle-serving")]
 pub const DEFAULT_BUNDLE_PORT: u16 = 8080;
 
@@ -612,6 +664,8 @@ impl ServerCtx {
             containerd: None,
             #[cfg(feature = "bundle-serving")]
             bundle: None,
+            #[cfg(feature = "tenant-passway")]
+            tenant_passway: None,
             #[cfg(feature = "docker-integration")]
             docker: None,
             #[cfg(feature = "native-exec")]
@@ -631,6 +685,8 @@ impl ServerCtx {
             containerd: None,
             #[cfg(feature = "bundle-serving")]
             bundle: None,
+            #[cfg(feature = "tenant-passway")]
+            tenant_passway: None,
             #[cfg(feature = "docker-integration")]
             docker: None,
             #[cfg(feature = "native-exec")]
@@ -663,6 +719,20 @@ impl ServerCtx {
     #[cfg(feature = "bundle-serving")]
     pub fn with_bundle_backend(mut self, backend: BundleBackend) -> Self {
         self.bundle = Some(backend);
+        self
+    }
+
+    /// Attach the per-tenant passway JIT tier (R852-F1). Only available with
+    /// the `tenant-passway` feature; the binary calls this in `main.rs` when
+    /// the operator passed `--tenant-passway-dir`.
+    ///
+    /// Opt-in rather than implied by the feature, for the same reason
+    /// [`with_docker`](Self::with_docker) is: a node that is not a public front
+    /// door should not start binding tenant sockets because the binary happens
+    /// to have been built with the capability.
+    #[cfg(feature = "tenant-passway")]
+    pub fn with_tenant_passway(mut self, jit: Arc<kamaji::jit::JitRuntime>) -> Self {
+        self.tenant_passway = Some(jit);
         self
     }
 
@@ -767,6 +837,36 @@ impl Registry {
     /// so a later `DeployStatus` doesn't report a stopped workload as `Running`.
     pub fn remove_deploy_progress(&mut self, id: &WorkloadId) -> Option<DeployProgress> {
         self.deploys.remove(id)
+    }
+
+    /// Record the digest of the `Workload` `id` was just deployed with
+    /// (R852-B4). Replaces any prior record — the last accepted deploy is what
+    /// this node is running, so a redeploy with a changed spec must not leave
+    /// the previous digest visible and read as "unchanged".
+    pub fn set_spec_digest(&mut self, id: WorkloadId, digest: kamaji_proto::SpecDigest) {
+        self.digests.insert(id, digest);
+    }
+
+    /// Drop the spec digest for `id` — called when the workload is torn down,
+    /// so a later redeploy of the same spec is not skipped as unchanged when
+    /// nothing is actually bound.
+    pub fn remove_spec_digest(&mut self, id: &WorkloadId) -> Option<kamaji_proto::SpecDigest> {
+        self.digests.remove(id)
+    }
+
+    /// Stamp each entry with the digest of the spec it was deployed with.
+    ///
+    /// Applied to the *merged, deduped* list, after every backend has reported,
+    /// so one recording point serves them all. An entry with no record keeps
+    /// `None` — unknown, which the caller reads as "redeploy" — and a record
+    /// with no live entry is simply never consulted, which is what makes a
+    /// stale record harmless rather than a resurrection.
+    pub fn stamp_spec_digests(&self, entries: &mut [WorkloadEntry]) {
+        for entry in entries.iter_mut() {
+            if entry.spec_digest.is_none() {
+                entry.spec_digest = self.digests.get(&entry.id).copied();
+            }
+        }
     }
 }
 
@@ -1055,6 +1155,20 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
                 );
             }
 
+            // Merge per-tenant passways (R852-F1). Same shape as the on-demand
+            // bundle merge above and a disjoint identity space: an armed-but-
+            // idle passway appears as present with no pid, which is the honest
+            // state of a zero-resident workload.
+            #[cfg(feature = "tenant-passway")]
+            if let Some(jit) = &ctx.tenant_passway {
+                entries.extend(
+                    jit.list_workloads()
+                        .await
+                        .into_iter()
+                        .map(runtime_state_to_entry),
+                );
+            }
+
             // Merge microVM guests (R605-F8). The runtime owns each guest's
             // live status the same way the bundle runtimes own theirs, and the
             // identities are disjoint from every other backend's — a guest is
@@ -1103,9 +1217,16 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             // a live native bundle workload, and containerd reports a
             // container-without-task as `Pending`/`pid: None`. Collapse to the
             // most-live row rather than emitting both.
+            let mut entries = dedupe_workload_entries(entries);
+            // R852-B4: stamp what each workload was deployed with, so a caller
+            // can tell an unchanged declaration from a changed one and stop
+            // re-deploying (on the JIT tier, re-binding) everything every
+            // sweep. After the dedupe: the surviving row is the one that goes
+            // out, and the digest is per-id, not per-backend.
+            ctx.registry.lock().await.stamp_spec_digests(&mut entries);
             KamajiToYubaba::WorkloadList {
                 request_id,
-                entries: dedupe_workload_entries(entries),
+                entries,
             }
         }
         YubabaToKamaji::Drain {
@@ -1155,7 +1276,20 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             request_id,
             id,
             spec,
-        } => graceful_upgrade_workload(ctx, request_id, id, spec).await,
+        } => {
+            // R852-B4: an accepted upgrade IS the workload's current spec, so
+            // the digest record moves with it. Leaving the pre-upgrade digest
+            // on record would make the next caller that re-declares the
+            // upgraded spec see a mismatch and issue a plain `Deploy` — a
+            // connection-dropping redeploy of the very workload the graceful
+            // path had just replaced without dropping one.
+            let digest = kamaji_proto::spec_digest(&spec);
+            let reply = graceful_upgrade_workload(ctx, request_id, id.clone(), spec).await;
+            if let (KamajiToYubaba::Ack { .. }, Some(digest)) = (&reply, digest) {
+                ctx.registry.lock().await.set_spec_digest(id, digest);
+            }
+            reply
+        }
         YubabaToKamaji::Stop { request_id, id } => stop_workload(ctx, request_id, id).await,
         YubabaToKamaji::Probe { request_id, id } => {
             // Clone the target so we don't hold the registry mutex across the
@@ -1232,8 +1366,38 @@ fn recipe_is_not_deployable(request_id: kamaji_proto::RequestId) -> KamajiToYuba
     }
 }
 
-#[allow(unused_variables)]
+/// Dispatch a `Deploy` to the backend its spec selects, and — on acceptance —
+/// record what it was deployed with (R852-B4).
+///
+/// The digest is taken **before** dispatch, because the arms below take the
+/// `Workload` apart and the value a caller compares against is the whole
+/// envelope it sent, not one variant's remains. It is recorded only on an
+/// `Ack`, so a refused deploy leaves no record and the next `List` reports the
+/// workload as unknown-spec rather than as deployed-with-something.
+///
+/// One caveat the field's doc also carries: on the bundle path an `Ack` means
+/// *admitted* (`ProtocolVersion::V3`), not running. A bundle that fails while
+/// materializing therefore leaves a digest behind — harmless, because the
+/// digest is only ever stamped onto an entry a backend still reports, and a
+/// caller comparing digests is deciding whether to *re-declare*, not whether
+/// the workload is healthy.
 async fn deploy_workload(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: WorkloadId,
+    spec: workload_spec::Workload,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
+) -> KamajiToYubaba {
+    let digest = kamaji_proto::spec_digest(&spec);
+    let reply = dispatch_deploy(ctx, request_id, id.clone(), spec, mesh).await;
+    if let (KamajiToYubaba::Ack { .. }, Some(digest)) = (&reply, digest) {
+        ctx.registry.lock().await.set_spec_digest(id, digest);
+    }
+    reply
+}
+
+#[allow(unused_variables)]
+async fn dispatch_deploy(
     ctx: &Arc<ServerCtx>,
     request_id: kamaji_proto::RequestId,
     id: WorkloadId,
@@ -1277,15 +1441,132 @@ async fn deploy_workload(
                     .to_string(),
             },
         },
+        // R852-F1: one cold passway per enrolled custom domain, on the same JIT
+        // tier the on-demand bundle path uses.
+        workload_spec::Workload::TenantPassway(w) => {
+            deploy_tenant_passway(ctx, request_id, &id, &w, mesh).await
+        }
         workload_spec::Workload::Almanac(_) | workload_spec::Workload::StaticAsset(_) => {
             KamajiToYubaba::Error {
                 request_id: Some(request_id),
                 code: ErrorCode::InvalidSpec,
-                message: "kamaji dispatches Workload::Container and serve-bundle \
-                          mesofact-static; almanac and static-asset live in yubaba's \
-                          reconcilers"
+                message: "kamaji dispatches Workload::Container, serve-bundle \
+                          mesofact-static and tenant-passway; almanac and static-asset live \
+                          in yubaba's reconcilers"
                     .to_string(),
             }
+        }
+    }
+}
+
+/// Deploy one **per-tenant passway** on the JIT tier (R852-F1 / W267
+/// §"Free-tier ingress at 10k domains").
+///
+/// kamaji binds and holds the domain's declared TLS backend socket — the
+/// address the SNI demux splices to — and forks `passway` on the first
+/// connection with that socket as fd 3. passway serves the handshake, then
+/// self-reaps on `PASSWAY_IDLE_TTL_SECS`; kamaji never releases the socket, so
+/// connections arriving between a reap and the next fork sit in the kernel
+/// accept queue and are served by the fresh child.
+///
+/// **The Ack means "socket bound and armed", not "a process is running"** — the
+/// same contract [`deploy_mesofact_bundle`]'s on-demand arm has, and the reason
+/// no probe target is registered (a `TcpConnect` probe would dial the held
+/// socket and fork the process on every interval, defeating the reap).
+///
+/// Unlike the bundle path there is nothing to materialize — the passway binary
+/// is a node artifact and the cert pair is already on disk — so this is
+/// synchronous: everything that can fail is decidable before the reply, which
+/// is what R330-F33 moved the bundle path off a task to avoid.
+///
+/// **Restart resume is deliberately absent**, and that is not the gap it looks
+/// like. The bundle path records each deploy on disk (R755-B5) because a node
+/// that forgets its sites needs an operator to re-run `yah cloud apply`. A
+/// tenant passway's source of truth is the enrollment set in the R2 cert store
+/// (`yubaba::cert_store::enrolled`), which the same sweep that publishes the
+/// demux routes already re-reads — so a kamaji restart re-arms from the
+/// authoritative set on the next sweep instead of from a node-local copy that
+/// could disagree with it.
+#[allow(unused_variables)]
+async fn deploy_tenant_passway(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: &WorkloadId,
+    w: &workload_spec::TenantPasswayWorkload,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
+) -> KamajiToYubaba {
+    #[cfg(feature = "tenant-passway")]
+    {
+        let Some(jit) = &ctx.tenant_passway else {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!(
+                    "no per-tenant passway tier configured on this kamaji instance to serve \
+                     {} ({}) — start kamaji with --tenant-passway-dir",
+                    id.0, w.domain
+                ),
+            };
+        };
+        // The listen address is DECLARED, not allocated: it is the same string
+        // the tenant's enrollment names as its demux backend, so an allocator
+        // choosing a port here would arm a socket nothing routes to. Reject a
+        // string that is not a bindable `host:port` now rather than at the
+        // first connection, where it would read as a hung domain.
+        if w.listen.parse::<std::net::SocketAddr>().is_err() {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::InvalidSpec,
+                message: format!(
+                    "tenant passway {} declares listen = {:?}, which is not a host:port socket \
+                     address. This string is the fd-table key passway's socket activation \
+                     matches on and the demux backend the enrollment routes to; a hostname here \
+                     is an outage discovered as a hung handshake.",
+                    w.domain, w.listen
+                ),
+            };
+        }
+
+        let spec = w.jit_spec(&id.0);
+        // The netns from the mesh assignment is what keeps the held socket
+        // routable when yubaba placed this workload on the mesh plane; without
+        // one it is a loopback bind, which is the normal shape here (the demux
+        // splices to it from the same node).
+        let mesh = runtime_mesh(mesh);
+
+        match jit.deploy_on_demand(&spec, &mesh, &w.listen).await {
+            Ok(()) => {
+                ctx.registry
+                    .lock()
+                    .await
+                    .set_deploy_progress(id.clone(), DeployProgress::at(WorkloadState::Running));
+                KamajiToYubaba::Ack {
+                    request_id,
+                    kind: kamaji_proto::AckKind::Deploy,
+                }
+            }
+            Err(e) => KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!(
+                    "binding/arming the per-tenant passway for {} on {} failed: {e:#}",
+                    w.domain, w.listen
+                ),
+            },
+        }
+    }
+    #[cfg(not(feature = "tenant-passway"))]
+    {
+        let _ = ctx;
+        KamajiToYubaba::Error {
+            request_id: Some(request_id),
+            code: ErrorCode::BackendRefused,
+            message: format!(
+                "tenant passway for {} (listen={}) admitted for {} but this kamaji was built \
+                 without the per-tenant passway tier — rebuild with --features tenant-passway \
+                 (R852-F1)",
+                w.domain, w.listen, id.0
+            ),
         }
     }
 }
@@ -1772,7 +2053,8 @@ fn validate_native_exec_spec(spec: &workload_spec::WorkloadSpec) -> Result<(), S
     feature = "docker-integration",
     feature = "bundle-serving",
     feature = "native-exec",
-    feature = "microvm"
+    feature = "microvm",
+    feature = "tenant-passway"
 ))]
 fn runtime_mesh(mesh: Option<&kamaji_proto::MeshAssignment>) -> kamaji::MeshAssignment {
     let Some(mesh) = mesh else {
@@ -2232,13 +2514,16 @@ async fn run_bundle_keepalive(
     // one bundle that fits on 8080.
     //
     // R844-F2: the port now comes from the node's allocator rather than
-    // `bundle.port.unwrap_or(backend.bind_port)`. A declared port still wins
-    // verbatim; an undeclared one is allocated and remembered, instead of
-    // silently landing on the node-wide 8080 that made "per-workload port" true
-    // only for bundles whose operator had written one down.
+    // `bundle.port.unwrap_or(backend.bind_port)` — allocated and remembered,
+    // instead of silently landing on the node-wide 8080 that made "per-workload
+    // port" true only for bundles whose operator had written one down.
+    //
+    // R844-F14: and a written-down number no longer wins. It rides in as
+    // `PortSpec.pin`, where a non-world-fixed pin FAILS this deploy naming the
+    // port — a stale mirror `[providers.bundle] port` is exactly the number
+    // that would otherwise land on a co-tenant's listener.
     let bind_ip = native_bind_ip(mesh);
-    let declared = backend.declared_port(bundle);
-    let port = backend.resolve_port(&id.0, bind_ip, declared)?;
+    let port = backend.resolve_port(&id.0, bind_ip, backend.http_spec(bundle))?;
     let listen = format!("{bind_ip}:{port}");
     // R556-T12: `bundle.env` is the deploy-resolved serve environment. Until it
     // existed, the static / SSR server was the one bundle process forked with
@@ -2277,7 +2562,7 @@ async fn run_bundle_keepalive(
     // static server stays up (reap it via Stop), but a declared receiver
     // that silently didn't start is the failure to avoid.
     if let Some(rv) = revalidate {
-        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, declared)
+        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip)
             .await
             .map_err(|e| {
                 format!("mesofact revalidate receiver for {} failed to start: {e}", id.0)
@@ -2334,8 +2619,7 @@ async fn run_bundle_on_demand(
     // rendered ingress upstream never has to re-resolve mid-flight. The ledger
     // covers the one case custody cannot: kamaji itself restarting.
     let bind_ip = native_bind_ip(mesh);
-    let declared = backend.declared_port(bundle);
-    let port = backend.resolve_port(&id.0, bind_ip, declared)?;
+    let port = backend.resolve_port(&id.0, bind_ip, backend.http_spec(bundle))?;
     let listen = format!("{bind_ip}:{port}");
     // R556-T12: same deploy-resolved env as the keep-alive path. A JIT bundle
     // forks on the first connection, so a credential missing here would surface
@@ -2360,7 +2644,7 @@ async fn run_bundle_on_demand(
     // accept pokes at any time), independent of the static server's JIT
     // idle-reaping. Fork it against the same materialized bundle.
     if let Some(rv) = revalidate {
-        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip, declared)
+        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip)
             .await
             .map_err(|e| {
                 format!("mesofact revalidate receiver for {} failed to start: {e}", id.0)
@@ -2453,9 +2737,19 @@ fn bundle_workload_spec(
                 identity: MeshIdent(id.0.clone()),
                 // Parsed back off `listen` rather than passed separately, so
                 // the declared port cannot drift from the one actually bound.
+                //
+                // Named `http` explicitly (R844-F17): the allocator that chose
+                // this number asked for it under that name
+                // (`ServeState::http_spec` -> `PortSpec::http()`), so stating
+                // it here means the service record publishes the name the
+                // allocator used rather than one `name_anonymous_ports`
+                // re-derives from the count. Same value either way today; the
+                // difference is that it stays right if a bundle ever serves a
+                // second listener.
                 ports: listen
                     .rsplit_once(':')
                     .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .map(|p| workload_spec::MeshPort::pinned(kamaji::ports::HTTP, p))
                     .into_iter()
                     .collect(),
                 allow_from: vec![],
@@ -2528,10 +2822,14 @@ fn bundle_workload_spec_jit(
 /// `<bundle>/app/dist/manifest.json`, and `--publish-config
 /// <bundle>/app/<publish_config>` — the `[publish]` block the bundle assembly
 /// staged next to `dist/` (creds still resolve from `env`, never the file).
-/// Bound to the port immediately above the static server's, on the same
-/// address, so it never collides with it and so two bundles on one node get
-/// two disjoint pairs (R599-F12). `env` (R2 creds + `MESOFACT_MIRROR_KEY`) is resolved deploy-side
-/// and set on the child; the node never sees keystore slot names.
+/// Bound to its own allocated port on the same address (R844-F14). It used to
+/// take the number immediately above the static server's, which only kept two
+/// bundles disjoint (R599-F12) while both had *declared* ports; with every
+/// number allocated, `serve + 1` is an arbitrary port the ledger may already
+/// have promised elsewhere on this node. A ledger entry under
+/// `<id>-revalidate` is the same guarantee without the arithmetic. `env` (R2
+/// creds + `MESOFACT_MIRROR_KEY`) is resolved deploy-side and set on the child;
+/// the node never sees keystore slot names.
 ///
 /// Registered under `<id>-revalidate` so it is a separate row from the static
 /// server in `List`/`Stop`. No probe target: the receiver's readiness is not on
@@ -2544,21 +2842,11 @@ async fn fork_revalidate_receiver(
     serve_bin: &Path,
     receiver: &workload_spec::MesofactRevalidateReceiver,
     bind_ip: std::net::Ipv4Addr,
-    declared_serve_port: Option<u16>,
 ) -> std::result::Result<(), String> {
     let rv_id = WorkloadId(format!("{}-revalidate", id.0));
-    // R844-F2: the `+1` derivation applies to a *declared* serve port only.
-    // Deriving it from the RESOLVED port would be a co-tenancy bug: with the
-    // static server's port allocated, `port + 1` is an arbitrary number the
-    // allocator may already have handed to another workload on this node, so
-    // the pair that R599-F12 kept disjoint would start colliding exactly when
-    // nobody declares ports — the case this ticket makes normal. Undeclared,
-    // the receiver gets its own ledger entry under `<id>-revalidate`.
-    let rv_port = backend.resolve_port(
-        &rv_id.0,
-        bind_ip,
-        declared_serve_port.map(revalidate_port),
-    )?;
+    // R844-F14: the receiver is its own ident with its own `http` port, not a
+    // number derived from the static server's. See this function's docs.
+    let rv_port = backend.resolve_port(&rv_id.0, bind_ip, kamaji::ports::PortSpec::http())?;
     let listen = format!("{bind_ip}:{rv_port}");
     let spec = bundle_workload_spec_revalidate(&rv_id, serve_bin, bundle_dir, &listen, receiver);
     let mesh = kamaji::MeshAssignment::inlined(bind_ip);
@@ -2691,30 +2979,6 @@ async fn fork_feed_tier(
         .map_err(|e| format!("native fork of almanac-feed failed: {e:#}"))
 }
 
-/// Port the revalidate receiver binds, given its bundle's **declared** serving
-/// port (R599-F12).
-///
-/// It rides the port immediately above the static server's, on the same
-/// address, so a bundle occupies one contiguous pair. Deriving it from the
-/// *workload's* port rather than the node default is what keeps two bundles on
-/// one node from colliding once their static servers have been separated.
-///
-/// R844-F2: input is the DECLARED port, never the resolved one — see
-/// [`fork_revalidate_receiver`] for why deriving from an allocated port
-/// re-introduces exactly the collision this function exists to avoid.
-///
-/// Two edges: `0` is the tests' OS-assigned-ephemeral sentinel and stays
-/// ephemeral (rather than binding privileged port 1), and a declared port at
-/// the top of the range saturates rather than wrapping into a privileged port.
-#[cfg(feature = "bundle-serving")]
-fn revalidate_port(serve_port: u16) -> u16 {
-    if serve_port == 0 {
-        0
-    } else {
-        serve_port.saturating_add(1)
-    }
-}
-
 /// Name of the feed-fetch binary — `bins/<triple>/almanac-feed` inside a
 /// self-contained bundle, and the filename it lands under in the node's
 /// runtime-asset cache for a vanilla one.
@@ -2738,6 +3002,27 @@ use yah_mesofact_bundle::FEED_BIN as FEED_BIN_NAME;
 ///
 /// Each feed's definition travels **by value** (`--feed <toml>`): the node has
 /// no copy of the camp's `.yah/almanac/` tree.
+///
+/// @yah:ticket(R844-B9, "yah-marketing-feed advertises the revalidate receiver's port — the feed tier binds nothing")
+/// @yah:status(review)
+/// @yah:at(2026-09-03T17:44:19Z)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:parent(R844)
+/// @yah:severity(P3)
+/// @yah:gotcha("MEASURED LIVE, not inferred. us-east-001 (100.64.0.3, yubaba+kamaji 0.8.30) `GET /workloads` after a clean `yah cloud apply --env cloud --service yah-marketing`: {\"id\":\"yah-marketing\",\"ports\":[8080]}, {\"id\":\"yah-marketing-revalidate\",\"ports\":[8081]}, {\"id\":\"yah-marketing-feed\",\"ports\":[8081]}. Two workloads advertising the same port on one node. The receiver genuinely binds 8081 (revalidate_port(8080) = serve+1); the FEED tier binds nothing at all and is a CLIENT of that address.")
+/// @yah:gotcha("THE CAUSE IS WRITTEN IN THE CODE'S OWN COMMENT, so this is confirmed rather than suspected. bundle_workload_spec_feed_tier (oss/kamaji/crates/kamaji-bin/src/server.rs:2742) takes `receiver_listen: &str` — the revalidate receiver's `bind_ip:8081` — and at :2777-2779 says verbatim `The fetcher binds nothing, so listen is meaningless to it; reuse the bundle archetype for the identity-image/native shape and overwrite argv`, then passes `receiver_listen` straight into bundle_workload_spec. The archetype derives expose.mesh.ports from that listen string (R599-F12 parses the port back off it), so `meaningless to it` became `advertised by it` the moment R844-F2 started reporting resolved ports up the wire. argv is overwritten; the expose is not.")
+/// @yah:next("PROPOSED FIX, small and contained: after `let mut spec = bundle_workload_spec(id, feed_bin, bundle_dir, receiver_listen, &env);` in bundle_workload_spec_feed_tier, clear the mesh expose alongside the existing `spec.command = Some(command);` — the fetcher binds nothing, so an empty port set is the honest answer and the comment at :2777 already argues for it. Add a test asserting the feed tier's spec exposes no port while the receiver's exposes serve+1. Keep passing `receiver_listen` in: it is still the right POKE target and the env/argv depend on it.")
+/// @yah:next("WHY THIS IS P3 AND NOT LIVE BREAKAGE, so nobody escalates it or dismisses it. Not breakage today: R844-F2's cold-admission gate requires `is_declared_serving(ident)` AND a resolved port, and yubaba never declared either sibling serving, so neither gets a service record — verified live, `?ready=true` on us-east-001 returns yah-marketing alone while all three workloads are Running. Not cosmetic either: it is the second instance of exactly the hazard R844-B6 describes. passway's addrs_from_body has no ident filter, so any future route into the registry that does not re-check the serving declaration would publish `-feed` as a dialable upstream on a port belonging to the revalidation receiver — apex traffic load-balanced onto a poke endpoint. It also makes `GET /workloads` lie to an operator diagnosing a port collision, which is the tool they would reach for first. Fix it while the gate is the only thing standing between the two.")
+/// @yah:handoff("FIXED as proposed, one line plus a test. oss/kamaji/crates/kamaji-bin/src/server.rs bundle_workload_spec_feed_tier now clears the archetype-derived mesh expose after overwriting argv: `spec.expose.mesh.ports.clear();` immediately after `spec.command = Some(command);`. receiver_listen is STILL passed in and still builds `--receiver http://{receiver_listen}` in argv plus the ALMANAC_MIRROR_KEY env projection — only the expose was wrong. The archetype (bundle_workload_spec, server.rs:2618-2629) parses the port back off `listen` into expose.mesh.ports (R599-F12); that is the exact line that turned `listen is meaningless to it` into `advertised by it`.")
+/// @yah:handoff("Tree anchor at handoff: 02bd22254ac4e4bb2de846c5ca565046da89e430 — the shared tree as I left it. Diff against it (`git diff 02bd22254ac4e4bb2de846c5ca565046da89e430..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:handoff("COMMENT REPLACED, not just amended. The old two-line comment stated the belief that made the bug invisible (`the fetcher binds nothing, so listen is meaningless to it`) without noting that the archetype nevertheless derives an expose from it. It now says the archetype does not know the fetcher binds nothing, names the R599-F12 parse as the mechanism, cites the measured us-east-001 double-8081 as the symptom, and states why receiver_listen stays in the signature (it is the POKE target).")
+/// @yah:handoff("TEST: server.rs tests::bundle_serving::feed_tier_declares_no_mesh_port_while_the_receiver_declares_serve_plus_one. Both halves from ONE receiver_listen string (`127.0.0.1:{revalidate_port(8080)}` = the same value that used to give the two specs the same number): asserts receiver_spec.expose.mesh.ports == [8081] AND feed_spec.expose.mesh.ports.is_empty(). Asserting only the empty side could not distinguish `cleared` from `the archetype never set a port at all`, which is the whole point. A third assert pins that clearing the expose did not disturb the poke target (argv still contains `http://127.0.0.1:8081`) - that is the regression a careless `pass an empty listen instead` fix would cause.")
+/// @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features bundle-serving --lib: BEFORE 251 passed / 0 failed; AFTER 252 passed / 0 failed. The +1 is the new test; no existing test moved. The port-reporting neighbours that could have regressed all still pass by name: two_undeclared_bundles_co_tenant_a_node_on_distinct_reported_ports, two_bundles_on_one_node_get_their_own_ports, keepalive_deploy_with_feeds_forks_the_fetch_tier_as_a_third_process, keepalive_deploy_with_receiver_forks_both_processes, an_allocated_port_survives_a_kamaji_restart.")
+/// @yah:verify("cargo check --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features bundle-serving: clean, exit 0. Two dead_code warnings are PRE-EXISTING and not mine - PidfdReaperHandle.events_tx (native.rs) and control_sock_from_spec (server.rs:1835); neither is a file region this ticket touched. Nothing committed: edits are uncommitted in the shared tree, both hunks confined to oss/kamaji/crates/kamaji-bin/src/server.rs (bundle_workload_spec_feed_tier body + one new #[test] in the bundle_serving test module). No cargo fmt run, no other file touched.")
+/// @yah:next("RE-MEASURE ON THE NEXT DEPLOY, not now - this fix only reaches a node when kamaji is rebuilt and rolled. Until then us-east-001 keeps reporting yah-marketing-feed on 8081. The confirmation is `GET /workloads` on 100.64.0.3 showing {\"id\":\"yah-marketing-feed\",\"ports\":[]} while yah-marketing-revalidate keeps [8081]; nothing else about the deploy should change, since argv and env are byte-identical to before.")
+/// @yah:verify("RE-VERIFIED on disk after the handoff, since this is a shared tree: `spec.expose.mesh.ports.clear();` is present at server.rs:2977 (immediately after `spec.command = Some(command);` at :2976), and the test is at server.rs:6203. Second full run: 252 passed / 0 failed, with feed_tier_declares_no_mesh_port_while_the_receiver_declares_serve_plus_one named ok; cargo check --features bundle-serving Finished, 0 errors, same 2 pre-existing dead_code warnings. One caveat on the 251 baseline: the camp skew guard flagged server.rs as modified mid-run, because my own edit landed while that background baseline was compiling — the count is still a valid pre-edit baseline (it did not contain the new test name), and 252-251 = exactly the one test added.")
+/// @yah:handoff("RELAY-LEADER SIGN-OFF (@Glimmerstone:dove, session:db829701, 2026-09-03). The feed tier no longer advertises a port it does not bind. `spec.expose.mesh.ports.clear()` at oss/kamaji/crates/kamaji-bin/src/server.rs:2978, immediately after `spec.command = Some(command)` at :2977 — the archetype derives BOTH from `receiver_listen` and only one of them was being overwritten, which is the whole bug in one line. `receiver_listen` correctly stays in the signature: it is still the POKE target the argv builds `--receiver http://{…}` from, and the env depends on it. The comment at :2961-2974 was rewritten to state what is TRUE (the archetype parses the port back off `listen` into expose.mesh.ports, per R599-F12) rather than the belief that hid the bug for so long (\"listen is meaningless to it\") — that rewrite is as valuable as the fix, since the old comment actively argued against noticing.")
+/// @yah:verify("RE-RUN BY ME on a settled tree: cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features bundle-serving --lib = 252 passed / 0 failed (baseline 251/0 measured by me before dispatch; +1 = the new test). cargo check --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features bundle-serving = ZERO errors. THE TEST ASSERTS BOTH HALVES FROM ONE INPUT, which is what makes it meaningful: feed_tier_declares_no_mesh_port_while_the_receiver_declares_serve_plus_one (server.rs:6204) drives bundle_workload_spec_revalidate and bundle_workload_spec_feed_tier from the SAME receiver_listen and asserts receiver_spec.expose.mesh.ports == [8081] AND feed_spec.expose.mesh.ports.is_empty() — one half alone could not distinguish \"cleared\" from \"never set\" — plus a third assertion that the poke target http://127.0.0.1:8081 survives in argv, which is the thing the fix must NOT break.")
 #[cfg(feature = "bundle-serving")]
 fn bundle_workload_spec_feed_tier(
     id: &WorkloadId,
@@ -2774,10 +3059,23 @@ fn bundle_workload_spec_feed_tier(
         .map(|key| [("ALMANAC_MIRROR_KEY".to_string(), key.clone())].into())
         .unwrap_or_default();
 
-    // The fetcher binds nothing, so `listen` is meaningless to it; reuse the
-    // bundle archetype for the identity-image/native shape and overwrite argv.
+    // Reuse the bundle archetype for the identity-image/native shape, then
+    // overwrite BOTH things it derives from `receiver_listen`.
+    //
+    // R844-B9: the fetcher binds nothing, but the archetype does not know that
+    // — it parses the port back off `listen` into `expose.mesh.ports`
+    // (R599-F12), so passing the RECEIVER's address in made the feed tier
+    // advertise the receiver's port as its own. Measured on us-east-001:
+    // `GET /workloads` reported yah-marketing-revalidate and yah-marketing-feed
+    // both on 8081. An empty port set is the honest declaration for a pure
+    // client, and `expose.mesh.ports` is the one place a serving port is
+    // declared — a would-be dialer must find nothing here.
+    //
+    // `receiver_listen` still belongs in the signature: it is the POKE target
+    // the argv above builds `--receiver http://{…}` from.
     let mut spec = bundle_workload_spec(id, feed_bin, bundle_dir, receiver_listen, &env);
     spec.command = Some(command);
+    spec.expose.mesh.ports.clear();
     spec
 }
 
@@ -2908,8 +3206,13 @@ fn dedupe_workload_entries(entries: Vec<WorkloadEntry>) -> Vec<WorkloadEntry> {
 /// `container_id` as `"<kind>-<pid>"` — the trait has no pid field — and a `0`
 /// pid means nothing is currently running (parked between exits, idle for JIT,
 /// or halted for a microVM). Was `bundle_state_to_entry` until R605-F8 gave it
-/// a third caller and the old name stopped being true.
-#[cfg(any(feature = "bundle-serving", feature = "microvm"))]
+/// a third caller and the old name stopped being true. R852-F1 added a fourth
+/// (the per-tenant passway JIT tier), which reports through the same trait.
+#[cfg(any(
+    feature = "bundle-serving",
+    feature = "microvm",
+    feature = "tenant-passway"
+))]
 fn runtime_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
     use kamaji::WorkloadStatus;
     use kamaji_proto::WorkloadState as WireState;
@@ -2937,7 +3240,18 @@ fn runtime_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
         // listen socket themselves), so the port they report is the port
         // something is actually bound to on this node — the fact yubaba needs
         // and previously had no channel for.
-        ports: s.ports,
+        //
+        // R844-F15: both spellings of the same fact. `named_ports` is the one
+        // a caller should read; `ports` stays populated because a peer that
+        // predates the named field would otherwise see a portless entry.
+        ports: s.ports.values().copied().collect(),
+        named_ports: s.ports,
+        // R852-B4: left `None` here and stamped by the `List` arm. A runtime
+        // holds a lowered `WorkloadSpec`, not the `Workload` the caller sent,
+        // so digesting it here would compare a *derived* value against the
+        // caller's declaration and never match — the one shape of this field
+        // that would be worse than not having it.
+        spec_digest: None,
     }
 }
 
@@ -2974,8 +3288,12 @@ fn docker_workload_to_entry(w: kamaji::docker::DockerWorkload) -> WorkloadEntry 
         pid: w.pid,
         mesh_ident: Some(w.state.ident.0),
         // A docker container is namespaced: the declared port is the bound
-        // port, so the backend resolves nothing and this stays empty.
-        ports: w.state.ports,
+        // port, so the backend resolves nothing and both of these stay empty.
+        ports: w.state.ports.values().copied().collect(),
+        named_ports: w.state.ports,
+        // R852-B4: stamped by the `List` arm from the deploy record, like every
+        // other backend's entries.
+        spec_digest: None,
     }
 }
 
@@ -3041,9 +3359,15 @@ async fn graceful_upgrade_workload(
                 }
             }
         }
+        // A tenant passway is not graceful-upgradable and does not need to be:
+        // it is zero-resident between requests, so a new cert or upstream set
+        // lands by re-deploying the declaration (which re-arms the socket) and
+        // is picked up by the next cold start. The R600-F9 SCM_RIGHTS dance
+        // exists to avoid dropping connections on a *resident* passway.
         workload_spec::Workload::MesofactStatic(_)
         | workload_spec::Workload::Almanac(_)
-        | workload_spec::Workload::StaticAsset(_) => KamajiToYubaba::Error {
+        | workload_spec::Workload::StaticAsset(_)
+        | workload_spec::Workload::TenantPassway(_) => KamajiToYubaba::Error {
             request_id: Some(request_id),
             code: ErrorCode::InvalidSpec,
             message: "kamaji only graceful-upgrades Workload::Container".to_string(),
@@ -3071,6 +3395,23 @@ async fn stop_workload(
                 message: format!("containerd teardown: {e}"),
             };
         }
+    }
+    // Route teardown to the per-tenant passway tier (R852-F1). Idempotent for
+    // the same reason the bundle arms below are, and this is the only path that
+    // *releases the held socket* — an unenrolled domain whose passway is never
+    // stopped leaves kamaji holding its `:8443` forever, which the next tenant
+    // handed that port discovers as a bind failure.
+    #[cfg(feature = "tenant-passway")]
+    if let Some(jit) = &ctx.tenant_passway {
+        let ident = workload_spec::MeshIdent(id.0.clone());
+        if let Err(e) = jit.teardown_workload(&ident).await {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!("tenant passway teardown: {e}"),
+            };
+        }
+        ctx.registry.lock().await.remove_deploy_progress(&id);
     }
     // Route teardown to the bundle backend (R599-F10). `teardown_workload` is
     // idempotent (Ok when the ident is absent), so calling it for every Stop —
@@ -3161,6 +3502,12 @@ async fn stop_workload(
             };
         }
     }
+    // R852-B4: and the spec digest. Unconditional (not per-backend) because
+    // `Stop` is: whatever held this id, nothing holds it now, so a later
+    // redeploy of the identical spec must NOT be skipped as unchanged. A
+    // record that outlived its workload is the one way this field could cause
+    // a missing deploy rather than a redundant one.
+    ctx.registry.lock().await.remove_spec_digest(&id);
     KamajiToYubaba::Ack {
         request_id,
         kind: kamaji_proto::AckKind::Stop,
@@ -3283,6 +3630,8 @@ mod tests {
                 pid: None,
                 mesh_ident: None,
                 ports: Vec::new(),
+                named_ports: Default::default(),
+                spec_digest: None,
             },
             // The truth, as the native bundle runtime renders it.
             WorkloadEntry {
@@ -3291,6 +3640,8 @@ mod tests {
                 pid: Some(67749),
                 mesh_ident: Some("yah-marketing".into()),
                 ports: Vec::new(),
+                named_ports: Default::default(),
+                spec_digest: None,
             },
         ];
         let out = dedupe_workload_entries(entries);
@@ -3310,6 +3661,8 @@ mod tests {
             pid: Some(42),
             mesh_ident: Some("w".into()),
             ports: Vec::new(),
+            named_ports: Default::default(),
+            spec_digest: None,
         };
         let pending = WorkloadEntry {
             id: WorkloadId::new("w"),
@@ -3317,6 +3670,8 @@ mod tests {
             pid: None,
             mesh_ident: None,
             ports: Vec::new(),
+            named_ports: Default::default(),
+            spec_digest: None,
         };
         for entries in [
             vec![pending.clone(), running.clone()],
@@ -3338,6 +3693,8 @@ mod tests {
             pid: Some(pid),
             mesh_ident: Some(id.into()),
             ports: Vec::new(),
+            named_ports: Default::default(),
+            spec_digest: None,
         };
         let out = dedupe_workload_entries(vec![mk("a", 1), mk("b", 2), mk("c", 3)]);
         assert_eq!(out.len(), 3);
@@ -3356,6 +3713,8 @@ mod tests {
                 pid: None,
                 mesh_ident: None,
                 ports: Vec::new(),
+                named_ports: Default::default(),
+                spec_digest: None,
             },
             WorkloadEntry {
                 id: WorkloadId::new("w"),
@@ -3363,6 +3722,8 @@ mod tests {
                 pid: None,
                 mesh_ident: None,
                 ports: Vec::new(),
+                named_ports: Default::default(),
+                spec_digest: None,
             },
         ]);
         assert_eq!(out.len(), 1);
@@ -4086,7 +4447,7 @@ mod tests {
                 container_id: "deadbeef".into(),
                 status: kamaji::WorkloadStatus::Running,
                 mesh_ip: None,
-                ports: Vec::new(),
+                ports: Default::default(),
             },
             pid: Some(4242),
             workload_id: "forge-abc".into(),
@@ -4114,7 +4475,7 @@ mod tests {
                     last_finished_at_unix_ms: 1,
                 },
                 mesh_ip: None,
-                ports: Vec::new(),
+                ports: Default::default(),
             },
             pid: None,
             workload_id: "svc".into(),
@@ -4166,7 +4527,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.into()),
-                    ports: vec![],
+                    ports: MeshExpose::anonymous_ports([]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -5004,12 +5365,17 @@ mod tests {
             );
         }
 
-        /// A bundle that DOES declare a port still binds exactly that one, and
-        /// now also reports it back. This is the half that makes step 3
-        /// (deleting the mirror's `port` key) a safe change rather than a
-        /// behavioural one: while the pin is written, nothing moves.
+        /// R844-F14, the reversal of R844-F2's "declared always wins": a bundle
+        /// that declares a NUMBER now fails its deploy, naming the port, rather
+        /// than binding it.
+        ///
+        /// The number in a mirror's `[providers.bundle] port` is either stale or
+        /// a co-tenancy collision waiting on this node — measured live on
+        /// us-east-001, where yah-marketing-revalidate and yah-marketing-feed
+        /// both sat on 8081. A refused deploy is visible; a second binder aimed
+        /// at a held socket is not.
         #[tokio::test]
-        async fn a_declared_port_is_bound_verbatim_and_reported_back() {
+        async fn a_declared_port_now_fails_the_deploy_naming_the_port() {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
             let digest = publish_self_bundle(store.as_ref(), true);
             let cache = tempfile::tempdir().unwrap();
@@ -5020,9 +5386,6 @@ mod tests {
                 state.path(),
             )));
 
-            // A port picked from the ephemeral range so the test does not fight
-            // whatever else this machine is running.
-            let declared = kamaji::ports::pick_free_port(kamaji::ports::LOOPBACK).unwrap();
             let reply = handle_message(
                 YubabaToKamaji::Deploy {
                     request_id: RequestId(1_847),
@@ -5030,8 +5393,45 @@ mod tests {
                     spec: serve_bundle_workload_on_port(
                         &digest,
                         BundleLifecycle::KeepAlive,
-                        Some(declared),
+                        Some(8080),
                     ),
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+
+            let (state, detail) = await_deploy(&ctx, "yah-marketing").await;
+            assert_eq!(state, WorkloadState::Failed);
+            let message = detail.expect("a failed deploy must carry its reason");
+            assert!(
+                message.contains("8080") && message.contains("\"http\""),
+                "the refusal must name the number AND the port it was written \
+                 for, got: {message}"
+            );
+        }
+
+        /// The same bundle with no number deploys and reports back an allocated
+        /// port — R599-F12's case under the new shape (the workload that used to
+        /// declare `serve_bundle.port` still lands on a live listener).
+        #[tokio::test]
+        async fn a_bundle_that_declares_no_number_lands_on_a_live_listener() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(BundleBackend::new(
+                Arc::clone(&store),
+                cache.path(),
+                state.path(),
+            )));
+
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(1_847),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec: serve_bundle_workload_on_port(&digest, BundleLifecycle::KeepAlive, None),
                     mesh: None,
                 },
                 &ctx,
@@ -5055,7 +5455,19 @@ mod tests {
                 .iter()
                 .find(|e| e.id == WorkloadId::new("yah-marketing"))
                 .expect("deployed bundle must be listed");
-            assert_eq!(e.ports, vec![declared]);
+            assert_eq!(e.ports.len(), 1, "one listener, one reported port");
+            let port = e.ports[0];
+            assert_ne!(port, 0, "an unresolved :0 is not a reportable port");
+            // The number the node reports is the number the ledger remembers
+            // for this workload's `http` port — one value, one path.
+            assert_eq!(
+                ctx.bundle
+                    .as_ref()
+                    .unwrap()
+                    .ports
+                    .reserved_port("yah-marketing", kamaji::ports::HTTP),
+                Some(port)
+            );
         }
 
         /// An allocated port is STABLE across a kamaji restart. A keep-alive
@@ -5138,17 +5550,22 @@ mod tests {
             );
         }
 
-        /// The `--bundle-port` / `KAMAJI_BUNDLE_PORT` override is still honoured
-        /// when an operator sets it explicitly — R844-F2 removed the SILENT
-        /// default, not the operator's ability to pin.
+        /// The `--bundle-port` / `KAMAJI_BUNDLE_PORT` node-wide override is a
+        /// written-down number like any other, and R844-F14 rejects it.
+        ///
+        /// R844-F2 had kept it as "the operator may pin and then owns the
+        /// collision". Option B (operator, 2026-09-03) says automatic and an
+        /// honoured operator number are mutually exclusive — and a NODE-WIDE
+        /// number is the worst of the two, since it aims every bundle on the
+        /// node at one port. It still reaches the allocator, so the refusal
+        /// names it instead of ignoring it.
         #[test]
-        fn an_explicit_node_override_still_wins_over_allocation() {
+        fn an_explicit_node_override_is_refused_rather_than_honoured() {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
             let state = tempfile::tempdir().unwrap();
             let cache = tempfile::tempdir().unwrap();
-            let pinned =
-                BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
-                    .with_bind_port(9100);
+            let pinned = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                .with_bind_port(9100);
             let bundle = workload_spec::MesofactServeBundle {
                 digest: workload_spec::BlakeHash("0".repeat(64)),
                 runtime: "self".into(),
@@ -5156,22 +5573,32 @@ mod tests {
                 port: None,
                 env: Default::default(),
             };
-            assert_eq!(pinned.declared_port(&bundle), Some(9100));
-            assert_eq!(
-                pinned
-                    .resolve_port("yah-marketing", std::net::Ipv4Addr::LOCALHOST, Some(9100))
-                    .unwrap(),
-                9100
-            );
+            assert_eq!(pinned.declared_pin(&bundle), Some(9100));
+            let err = pinned
+                .resolve_port(
+                    "yah-marketing",
+                    std::net::Ipv4Addr::LOCALHOST,
+                    pinned.http_spec(&bundle),
+                )
+                .expect_err("a node-wide pin must not resolve");
+            assert!(err.contains("9100") && err.contains("\"http\""), "got: {err}");
 
-            // And the unset default allocates rather than returning 8080.
-            let unpinned =
-                BundleBackend::new(store, cache.path(), state.path());
+            // And with nothing written down, allocation takes over — no 8080.
+            let unpinned = BundleBackend::new(store, cache.path(), state.path());
             assert_eq!(
-                unpinned.declared_port(&bundle),
+                unpinned.declared_pin(&bundle),
                 None,
                 "unset must mean allocate, not DEFAULT_BUNDLE_PORT"
             );
+            let port = unpinned
+                .resolve_port(
+                    "yah-marketing",
+                    std::net::Ipv4Addr::LOCALHOST,
+                    unpinned.http_spec(&bundle),
+                )
+                .unwrap();
+            assert_ne!(port, 0);
+            assert_ne!(port, DEFAULT_BUNDLE_PORT);
         }
 
         /// R746-F6, the node-side backstop. A bundle requiring a contract
@@ -5962,6 +6389,74 @@ mod tests {
             ));
         }
 
+        /// R844-B9: the feed tier is a pure CLIENT of the receiver — it binds
+        /// nothing — so it must declare no mesh port, while the receiver it
+        /// pokes declares serve+1. Both halves are asserted from the one
+        /// `receiver_listen` string that used to give them the same number:
+        /// asserting only the empty side cannot tell "cleared" from "the
+        /// archetype never set a port at all".
+        ///
+        /// Measured live before the fix (us-east-001, kamaji 0.8.30): `GET
+        /// /workloads` reported yah-marketing-revalidate and yah-marketing-feed
+        /// both on 8081. `expose.mesh.ports` is the one place a serving port is
+        /// declared, so that made the fetcher look dialable on an address
+        /// belonging to the revalidation receiver.
+        #[test]
+        fn feed_tier_declares_no_mesh_port_while_the_receiver_declares_serve_plus_one() {
+            use workload_spec::MesofactRevalidateReceiver;
+
+            let serve_port = 8080u16;
+            // R844-F14: the receiver's port is allocated under its own ident
+            // now, so this is just *a* listen address the spec was built from —
+            // what is under test is which spec declares it on `expose.mesh`.
+            let receiver_listen = format!("127.0.0.1:{}", serve_port + 1);
+            let receiver = MesofactRevalidateReceiver {
+                routes: vec![],
+                publish_config: "mesofact.config.toml".into(),
+                mirror_key_env: None,
+                env: BTreeMap::new(),
+                feeds: vec![],
+                feed_interval_secs: 300,
+                feed_project_prefix: None,
+                feed_runtime: None,
+            };
+
+            let receiver_spec = bundle_workload_spec_revalidate(
+                &WorkloadId::new("yah-marketing-revalidate"),
+                Path::new("/opt/yah/bin/mesofact"),
+                Path::new("/var/cache/yah/bundles/abc"),
+                &receiver_listen,
+                &receiver,
+            );
+            let feed_spec = bundle_workload_spec_feed_tier(
+                &WorkloadId::new("yah-marketing-feed"),
+                Path::new("/var/cache/yah/bundles/abc/bins/x/almanac-feed"),
+                Path::new("/var/cache/yah/bundles/abc"),
+                &receiver_listen,
+                &receiver,
+            );
+
+            assert_eq!(
+                receiver_spec.expose.mesh.numbers(),
+                vec![serve_port + 1],
+                "the receiver binds serve+1 and must declare it",
+            );
+            assert!(
+                feed_spec.expose.mesh.ports.is_empty(),
+                "the feed tier binds nothing, got {:?}",
+                feed_spec.expose.mesh.ports,
+            );
+            // …and it still pokes the receiver at that address.
+            assert!(
+                feed_spec
+                    .command
+                    .as_deref()
+                    .expect("feed spec always carries argv")
+                    .contains(&format!("http://{receiver_listen}")),
+                "clearing the expose must not disturb the poke target",
+            );
+        }
+
         /// R330-F31: declaring feeds without staging the `almanac-feed` sidecar
         /// is the failure that looks like success — the site serves, the data
         /// never moves. The deploy must refuse instead.
@@ -6521,11 +7016,11 @@ mod tests {
                  binding loopback is what made a bundle unreachable from another node",
             );
 
-            // The port is the workload's own; the node-wide default is only the
-            // fallback, and it is the fallback that limits a node to one bundle.
-            let node_default = 8080;
-            assert_eq!(Some(9001).unwrap_or(node_default), 9001);
-            assert_eq!(None.unwrap_or(node_default), 8080);
+            // The port half of that address is no longer anyone's to declare
+            // (R844-F14) — it comes from the node's ledger, which is what the
+            // co-tenancy tests below cover. Two literal `unwrap_or` assertions
+            // that used to sit here described the retired node-wide fallback
+            // and measured nothing but themselves.
         }
 
         /// Verify #1's kamaji half: a `Deploy` carrying a mesh assignment makes
@@ -6542,9 +7037,22 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            // Port 0 keeps the stub child off any real port; the assertion is
-            // about the *address kamaji resolved*, which the probe target
-            // records verbatim.
+            // R844-F14: nothing declares a number any more, so the assertion is
+            // about the *address kamaji resolved* — the IP half is the mesh
+            // assignment, the port half comes from the ledger, and the probe
+            // target records both verbatim.
+            //
+            // The ledger is seeded because allocation probes the address the
+            // workload will bind, and 100.64.0.3 does not exist on a test
+            // machine. A standing reservation is returned WITHOUT re-probing
+            // (that is what an on-demand redeploy and a kamaji restart both
+            // rely on), so this is the same path the node takes on its second
+            // deploy of a workload rather than a test-only shortcut.
+            std::fs::write(
+                state.path().join(kamaji::ports::LedgerPorts::FILE_NAME),
+                br#"{"version":2,"ports":{"yah-marketing":{"http":{"port":8443}}}}"#,
+            )
+            .unwrap();
             let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
@@ -6553,11 +7061,7 @@ mod tests {
                 YubabaToKamaji::Deploy {
                     request_id: RequestId(130),
                     id: WorkloadId::new("yah-marketing"),
-                    spec: serve_bundle_workload_on_port(
-                        &digest,
-                        BundleLifecycle::KeepAlive,
-                        Some(8443),
-                    ),
+                    spec: serve_bundle_workload_on_port(&digest, BundleLifecycle::KeepAlive, None),
                     mesh: Some(kamaji_proto::MeshAssignment {
                         mesh_ip: Ipv4Addr::new(100, 64, 0, 3),
                         wg_private_key: String::new(),
@@ -6581,10 +7085,17 @@ mod tests {
                 .await
                 .probe_target(&WorkloadId::new("yah-marketing"))
                 .expect("keep-alive deploy registers a probe target");
+            let resolved = ctx
+                .bundle
+                .as_ref()
+                .unwrap()
+                .ports
+                .reserved_port("yah-marketing", kamaji::ports::HTTP)
+                .expect("an undeclared bundle gets a ledger entry");
             assert_eq!(
                 target.addr.to_string(),
-                "100.64.0.3:8443",
-                "the bundle must be dialable at <mesh-ip>:<declared-port>",
+                format!("100.64.0.3:{resolved}"),
+                "the bundle must be dialable at <mesh-ip>:<allocated-port>",
             );
 
             // The same address is declared on the spec a proxy would read it
@@ -6597,7 +7108,7 @@ mod tests {
                 "100.64.0.3:8443",
                 &Default::default(),
             );
-            assert_eq!(spec.expose.mesh.ports, vec![8443]);
+            assert_eq!(spec.expose.mesh.numbers(), vec![8443]);
         }
 
         /// Verify #3: two bundles on ONE node. Before R599-F12 the port was a
@@ -6614,7 +7125,9 @@ mod tests {
             let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
-            for (rid, name, port) in [(140, "site-a", 8081u16), (141, "site-b", 8082u16)] {
+            // R844-F14: neither bundle names a number — that IS the co-tenancy
+            // case now, and the ledger is what keeps the two apart.
+            for (rid, name) in [(140, "site-a"), (141, "site-b")] {
                 let reply = handle_message(
                     YubabaToKamaji::Deploy {
                         request_id: RequestId(rid),
@@ -6622,7 +7135,7 @@ mod tests {
                         spec: serve_bundle_workload_on_port(
                             &digest,
                             BundleLifecycle::KeepAlive,
-                            Some(port),
+                            None,
                         ),
                         mesh: None,
                     },
@@ -6643,8 +7156,14 @@ mod tests {
             let b = registry
                 .probe_target(&WorkloadId::new("site-b"))
                 .expect("site-b probe target");
-            assert_eq!(a.addr.to_string(), "127.0.0.1:8081");
-            assert_eq!(b.addr.to_string(), "127.0.0.1:8082");
+            assert_eq!(a.addr.ip().to_string(), "127.0.0.1");
+            assert_eq!(b.addr.ip().to_string(), "127.0.0.1");
+            assert_ne!(a.addr.port(), 0);
+            assert_ne!(
+                a.addr.port(),
+                b.addr.port(),
+                "two bundles on one node must be probed at two addresses"
+            );
             drop(registry);
 
             // Both are live and distinct — one node, two bundles.
@@ -6665,23 +7184,355 @@ mod tests {
             }
         }
 
-        /// The revalidate receiver rides the port above its own bundle's, not
-        /// above the node default — otherwise two bundles' receivers collide
-        /// even after their static servers have been separated.
+        /// Two bundles' revalidate receivers get two ports, and neither
+        /// collides with either bundle's static server.
+        ///
+        /// R844-F14 replaced the `serve + 1` derivation this used to assert:
+        /// once every number is allocated, `+1` is an arbitrary port the ledger
+        /// may already have promised elsewhere on the node. Each receiver is
+        /// its own ident (`<id>-revalidate`) with its own ledger entry, which
+        /// is the same disjointness without the arithmetic.
         #[test]
-        fn each_bundles_receiver_rides_its_own_serve_port() {
-            assert_ne!(
-                revalidate_port(8081),
-                revalidate_port(8082),
-                "two bundles' receivers must not share a port"
+        fn each_bundles_receiver_gets_its_own_allocated_port() {
+            use kamaji::ports::{LedgerPorts, PortAllocator, PortSpec, LOOPBACK};
+
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = LedgerPorts::open(dir.path());
+            let port = |ident: &str| {
+                ledger
+                    .resolve_one(ident, LOOPBACK, PortSpec::http())
+                    .unwrap()
+            };
+            let ports = [
+                port("site-a"),
+                port("site-a-revalidate"),
+                port("site-b"),
+                port("site-b-revalidate"),
+            ];
+            let mut distinct = ports.to_vec();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                ports.len(),
+                "two bundles and their receivers must not share a port: {ports:?}"
             );
-            assert_eq!(revalidate_port(8081), 8082);
-            // 0 is the tests' OS-assigned-ephemeral sentinel: stay ephemeral
-            // rather than binding privileged port 1.
-            assert_eq!(revalidate_port(0), 0);
-            // A declared port at the top of the range must not wrap into a
-            // privileged one (or panic on the debug-build add).
-            assert_eq!(revalidate_port(u16::MAX), u16::MAX);
+        }
+    }
+    /// R852-F1 — the per-tenant passway routing arm.
+    ///
+    /// Nothing here forks a `passway`: the point under test is the half kamaji
+    /// owns, which is that a `Deploy { TenantPassway }` ends with the DECLARED
+    /// socket held. `oss/passway/crates/passway/tests/jit_cold_start.rs` proves
+    /// the other half (fd-3 adoption, serve, self-reap, re-fork) against the
+    /// real binary.
+    mod tenant_passway {
+        use super::*;
+        use workload_spec::{TenantPasswayWorkload, Workload};
+
+        /// A `127.0.0.1` port nobody is using, released before it is returned.
+        ///
+        /// Racy in principle; in practice the kernel does not hand the same
+        /// ephemeral port out twice in the microseconds between drop and
+        /// re-bind, and every alternative (a fixed port) is *reliably* flaky on
+        /// a machine running a dozen concurrent test binaries.
+        fn free_port() -> u16 {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind an ephemeral port")
+                .local_addr()
+                .expect("read it back")
+                .port()
+        }
+
+        fn deploy_msg(listen: &str) -> YubabaToKamaji {
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(1),
+                id: WorkloadId::new("passway.shop.tenant.io"),
+                spec: Workload::TenantPassway(TenantPasswayWorkload::cold(
+                    "shop.tenant.io",
+                    listen,
+                )),
+                mesh: None,
+            }
+        }
+
+        /// The whole contract in one test: the Ack means the declared socket is
+        /// bound and armed (not that a process is running), and Stop is what
+        /// releases it. A passway that is never stopped leaves kamaji holding
+        /// the port forever, which the next tenant handed it discovers as a
+        /// bind failure.
+        #[cfg(feature = "tenant-passway")]
+        #[tokio::test]
+        async fn deploy_arms_the_declared_socket_and_stop_releases_it() {
+            let dir = tempfile::tempdir().expect("temp state dir");
+            let ctx = Arc::new(
+                ServerCtx::new()
+                    .with_tenant_passway(Arc::new(kamaji::jit::JitRuntime::new(dir.path()))),
+            );
+            let port = free_port();
+            let listen = format!("127.0.0.1:{port}");
+
+            let reply = handle_message(deploy_msg(&listen), &ctx).await;
+            assert!(
+                matches!(
+                    reply,
+                    KamajiToYubaba::Ack {
+                        kind: AckKind::Deploy,
+                        ..
+                    }
+                ),
+                "expected a Deploy Ack, got {reply:?}"
+            );
+            assert!(
+                std::net::TcpListener::bind(&listen).is_err(),
+                "{listen} must be held by the custodian after the Ack — that IS the Ack"
+            );
+
+            // And it is visible as a workload, with no pid: the honest state of
+            // something that is armed and zero-resident.
+            let listed = handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(2),
+                },
+                &ctx,
+            )
+            .await;
+            match listed {
+                KamajiToYubaba::WorkloadList { entries, .. } => assert!(
+                    entries.iter().any(|e| e.id.0 == "passway.shop.tenant.io"),
+                    "an armed passway must appear in List, got {entries:?}"
+                ),
+                other => panic!("expected WorkloadList, got {other:?}"),
+            }
+
+            let stopped = handle_message(
+                YubabaToKamaji::Stop {
+                    request_id: RequestId(3),
+                    id: WorkloadId::new("passway.shop.tenant.io"),
+                },
+                &ctx,
+            )
+            .await;
+            assert!(
+                matches!(stopped, KamajiToYubaba::Ack { .. }),
+                "expected a Stop Ack, got {stopped:?}"
+            );
+            assert!(
+                std::net::TcpListener::bind(&listen).is_ok(),
+                "Stop must release the held socket, or the port leaks for the node's lifetime"
+            );
+        }
+
+        /// The listen string is the fd-table key AND the demux backend, so a
+        /// hostname is not a "resolve it later" convenience — it is a domain
+        /// that resolves, handshakes, and hangs. Refuse it at deploy, where the
+        /// error is attributable.
+        #[cfg(feature = "tenant-passway")]
+        #[tokio::test]
+        async fn a_listen_that_is_not_a_socket_address_is_refused_as_invalid_spec() {
+            let dir = tempfile::tempdir().expect("temp state dir");
+            let ctx = Arc::new(
+                ServerCtx::new()
+                    .with_tenant_passway(Arc::new(kamaji::jit::JitRuntime::new(dir.path()))),
+            );
+            match handle_message(deploy_msg("shop.tenant.io:8443"), &ctx).await {
+                KamajiToYubaba::Error { code, message, .. } => {
+                    assert!(matches!(code, ErrorCode::InvalidSpec), "{message}");
+                    assert!(message.contains("host:port"), "{message}");
+                }
+                other => panic!("expected InvalidSpec, got {other:?}"),
+            }
+        }
+
+        /// Built with the tier but not started with it: name the flag, don't
+        /// silently succeed. The Ack would otherwise claim a socket is armed
+        /// when nothing is listening.
+        #[cfg(feature = "tenant-passway")]
+        #[tokio::test]
+        async fn without_the_tier_attached_the_refusal_names_the_flag() {
+            let ctx = Arc::new(ServerCtx::new());
+            match handle_message(deploy_msg("127.0.0.1:8443"), &ctx).await {
+                KamajiToYubaba::Error { code, message, .. } => {
+                    assert!(matches!(code, ErrorCode::BackendRefused), "{message}");
+                    assert!(message.contains("--tenant-passway-dir"), "{message}");
+                }
+                other => panic!("expected BackendRefused, got {other:?}"),
+            }
+        }
+
+        /// R852-B4 — `List` reports what each workload was deployed WITH, so a
+        /// reconciler can skip a domain whose declaration has not changed
+        /// instead of tearing down and rebinding its socket every sweep.
+        ///
+        /// Asserted against `kamaji_proto::spec_digest` of the same `Workload`
+        /// the caller sent: that equality is the entire contract, and a digest
+        /// taken over anything kamaji *derived* (the lowered `WorkloadSpec`,
+        /// say) would never match a caller's declaration and would leave the
+        /// field looking present while being useless.
+        #[cfg(feature = "tenant-passway")]
+        #[tokio::test]
+        async fn the_list_reports_the_digest_of_the_spec_it_was_deployed_with() {
+            let dir = tempfile::tempdir().expect("temp state dir");
+            let ctx = Arc::new(
+                ServerCtx::new()
+                    .with_tenant_passway(Arc::new(kamaji::jit::JitRuntime::new(dir.path()))),
+            );
+            let listen = format!("127.0.0.1:{}", free_port());
+            let declared =
+                Workload::TenantPassway(TenantPasswayWorkload::cold("shop.tenant.io", &listen));
+
+            assert!(matches!(
+                handle_message(deploy_msg(&listen), &ctx).await,
+                KamajiToYubaba::Ack { .. }
+            ));
+
+            let entry = list_one(&ctx, "passway.shop.tenant.io").await;
+            assert_eq!(
+                entry.spec_digest,
+                kamaji_proto::spec_digest(&declared),
+                "the entry must carry the digest of the caller's own declaration"
+            );
+
+            // And a redeploy with a CHANGED declaration moves it — otherwise a
+            // caller would compare against the spec before last and skip a
+            // deploy that has to happen.
+            let moved = format!("127.0.0.1:{}", free_port());
+            assert!(matches!(
+                handle_message(deploy_msg(&moved), &ctx).await,
+                KamajiToYubaba::Ack { .. }
+            ));
+            let after = list_one(&ctx, "passway.shop.tenant.io").await;
+            assert_ne!(after.spec_digest, entry.spec_digest);
+            assert_eq!(
+                after.spec_digest,
+                kamaji_proto::spec_digest(&Workload::TenantPassway(
+                    TenantPasswayWorkload::cold("shop.tenant.io", &moved)
+                ))
+            );
+
+            // Release the port the second deploy is holding.
+            let _ = handle_message(
+                YubabaToKamaji::Stop {
+                    request_id: RequestId(9),
+                    id: WorkloadId::new("passway.shop.tenant.io"),
+                },
+                &ctx,
+            )
+            .await;
+        }
+
+        /// A `Stop` drops the digest with the workload. A record that outlived
+        /// what it described is the ONE way this field could cause a *missing*
+        /// deploy rather than a redundant one: a caller re-declaring the same
+        /// spec would see agreement and skip, while nothing is bound.
+        #[cfg(feature = "tenant-passway")]
+        #[tokio::test]
+        async fn stop_drops_the_digest_so_the_same_spec_is_deployed_again() {
+            let dir = tempfile::tempdir().expect("temp state dir");
+            let ctx = Arc::new(
+                ServerCtx::new()
+                    .with_tenant_passway(Arc::new(kamaji::jit::JitRuntime::new(dir.path()))),
+            );
+            let listen = format!("127.0.0.1:{}", free_port());
+            assert!(matches!(
+                handle_message(deploy_msg(&listen), &ctx).await,
+                KamajiToYubaba::Ack { .. }
+            ));
+            assert!(list_one(&ctx, "passway.shop.tenant.io").await.spec_digest.is_some());
+
+            assert!(matches!(
+                handle_message(
+                    YubabaToKamaji::Stop {
+                        request_id: RequestId(3),
+                        id: WorkloadId::new("passway.shop.tenant.io"),
+                    },
+                    &ctx,
+                )
+                .await,
+                KamajiToYubaba::Ack { .. }
+            ));
+
+            // Nothing is listed any more, so ask the registry directly: would a
+            // row for this id still be stamped?
+            let mut ghost = vec![WorkloadEntry {
+                id: WorkloadId::new("passway.shop.tenant.io"),
+                state: kamaji_proto::WorkloadState::Pending,
+                pid: None,
+                mesh_ident: None,
+                ports: Vec::new(),
+                named_ports: Default::default(),
+                spec_digest: None,
+            }];
+            ctx.registry.lock().await.stamp_spec_digests(&mut ghost);
+            assert_eq!(
+                ghost[0].spec_digest, None,
+                "a stopped workload's digest must not survive it"
+            );
+        }
+
+        /// A refused deploy records nothing. Recording on admission rather than
+        /// on acceptance would tell the next `List` that a workload kamaji
+        /// never took is deployed with the spec that was refused.
+        #[cfg(feature = "tenant-passway")]
+        #[tokio::test]
+        async fn a_refused_deploy_leaves_no_digest_behind() {
+            let dir = tempfile::tempdir().expect("temp state dir");
+            let ctx = Arc::new(
+                ServerCtx::new()
+                    .with_tenant_passway(Arc::new(kamaji::jit::JitRuntime::new(dir.path()))),
+            );
+            // A hostname listen — refused as InvalidSpec by the arm above.
+            assert!(matches!(
+                handle_message(deploy_msg("shop.tenant.io:8443"), &ctx).await,
+                KamajiToYubaba::Error { .. }
+            ));
+            let mut ghost = vec![WorkloadEntry {
+                id: WorkloadId::new("passway.shop.tenant.io"),
+                state: kamaji_proto::WorkloadState::Pending,
+                pid: None,
+                mesh_ident: None,
+                ports: Vec::new(),
+                named_ports: Default::default(),
+                spec_digest: None,
+            }];
+            ctx.registry.lock().await.stamp_spec_digests(&mut ghost);
+            assert_eq!(ghost[0].spec_digest, None);
+        }
+
+        /// `List` the workloads and return the one with this id.
+        #[cfg(feature = "tenant-passway")]
+        async fn list_one(ctx: &Arc<ServerCtx>, id: &str) -> WorkloadEntry {
+            match handle_message(
+                YubabaToKamaji::List {
+                    request_id: RequestId(2),
+                },
+                ctx,
+            )
+            .await
+            {
+                KamajiToYubaba::WorkloadList { entries, .. } => entries
+                    .into_iter()
+                    .find(|e| e.id.0 == id)
+                    .unwrap_or_else(|| panic!("{id} must appear in List")),
+                other => panic!("expected WorkloadList, got {other:?}"),
+            }
+        }
+
+        /// Built WITHOUT the tier: the workload is recognised (not
+        /// `InvalidSpec`) and the refusal names the feature — the same
+        /// build-aware shape the containerd and bundle arms have, so an
+        /// operator can tell "wrong build" from "wrong manifest".
+        #[cfg(not(feature = "tenant-passway"))]
+        #[tokio::test]
+        async fn without_the_feature_the_refusal_names_the_build() {
+            let ctx = Arc::new(ServerCtx::new());
+            match handle_message(deploy_msg("127.0.0.1:8443"), &ctx).await {
+                KamajiToYubaba::Error { code, message, .. } => {
+                    assert!(matches!(code, ErrorCode::BackendRefused), "{message}");
+                    assert!(message.contains("--features tenant-passway"), "{message}");
+                }
+                other => panic!("expected BackendRefused, got {other:?}"),
+            }
         }
     }
 }

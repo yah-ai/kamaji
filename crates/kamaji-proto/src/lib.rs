@@ -17,10 +17,12 @@
 //! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 
 pub mod codec;
+pub mod digest;
 pub mod messages;
 pub mod version;
 
 pub use codec::{decode_frame, encode_frame, Error, MAX_FRAME_BYTES};
+pub use digest::{spec_digest, SpecDigest};
 pub use messages::{
     AckKind, DrainBudget, DrainOutcome, DrainPhase, ErrorCode, ExitStatus, KamajiToYubaba,
     MeshAssignment, ProbeStatus, RequestId, WireguardPeer, WorkloadEntry, WorkloadId, WorkloadState,

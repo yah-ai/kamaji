@@ -802,7 +802,7 @@ impl Kamaji for MicroVmRuntime {
             task_pid: vm_pid,
             // R844-F2: the guest owns its own network stack, so the declared
             // port is the bound port — nothing for this backend to resolve.
-            ports: Vec::new(),
+            ports: Default::default(),
         })
     }
 
@@ -815,7 +815,7 @@ impl Kamaji for MicroVmRuntime {
                 container_id: format!("microvm-{}", h.pid.load(Ordering::SeqCst)),
                 status: h.status.borrow().clone(),
                 mesh_ip: Some(h.mesh_ip),
-                ports: Vec::new(),
+                ports: Default::default(),
             })
             .collect())
     }
@@ -827,7 +827,7 @@ impl Kamaji for MicroVmRuntime {
             container_id: format!("microvm-{}", h.pid.load(Ordering::SeqCst)),
             status: h.status.borrow().clone(),
             mesh_ip: Some(h.mesh_ip),
-            ports: Vec::new(),
+            ports: Default::default(),
         }))
     }
 

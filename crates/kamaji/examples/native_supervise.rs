@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(name.clone()),
-                ports: vec![],
+                ports: MeshExpose::anonymous_ports([]),
                 allow_from: vec![],
             },
             public: None,

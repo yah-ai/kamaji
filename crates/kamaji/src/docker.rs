@@ -294,7 +294,7 @@ impl DockerRuntime {
                 mesh_ip,
                 // R844-F2: namespaced container — the declared port is the
                 // bound port, so this backend resolves nothing.
-                ports: Vec::new(),
+                ports: Default::default(),
             },
             pid,
             workload_id,
@@ -495,7 +495,18 @@ impl DockerRuntime {
         args.push("--env".into());
         args.push(format!("YAH_MESH_IP={}", mesh.mesh_ip));
 
-        // Literal env vars from the spec.
+        // "What port did I get?" — one contract (R844-T13). Container-side ports
+        // are the declared ones (the namespace is the workload's own), but a
+        // workload must not have to know which backend started it to know which
+        // variable to read.
+        for (k, v) in crate::ports::port_env(&crate::declared_port_names(&spec.expose.mesh)) {
+            args.push("--env".into());
+            args.push(format!("{k}={v}"));
+        }
+
+        // Literal env vars from the spec. Last, so a spec-level value overrides
+        // both the mesh IP and the port contract — `docker run` takes the final
+        // `--env` for a repeated name.
         for e in &spec.env {
             if let workload_spec::EnvValue::Literal { value } = &e.value {
                 args.push("--env".into());
@@ -591,6 +602,12 @@ impl Kamaji for DockerRuntime {
         workload_spec::admission::check(spec)
             .map_err(|e| anyhow!("workload {} not admitted: {e}", spec.name))?;
 
+        // R844-F21: a name-only port asks this backend to allocate, and it
+        // cannot — see `crate::reject_unresolved_ports`. `yah.docker.publish`
+        // is the only host port this backend ever opens, and it is an explicit
+        // `host:container` map an operator wrote, not a number to invent.
+        crate::reject_unresolved_ports(&spec.name, &spec.expose.mesh, crate::Backend::Docker)?;
+
         let ident = &spec.expose.mesh.identity;
         let name = Self::container_name(ident).to_string();
         let image = Self::image_ref(spec);
@@ -657,7 +674,7 @@ impl Kamaji for DockerRuntime {
             container_id,
             mesh_ip: mesh.mesh_ip,
             task_pid,
-            ports: Vec::new(),
+            ports: Default::default(),
         })
     }
 
@@ -1327,7 +1344,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.to_string()),
-                    ports: vec![],
+                    ports: MeshExpose::anonymous_ports([]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -1419,6 +1436,30 @@ mod tests {
         let args = render(&spec);
         assert!(flag_value(&args, "--memory").is_none(), "{args:?}");
         assert!(flag_value(&args, "--cpu-shares").is_none(), "{args:?}");
+    }
+
+    /// R844-T13: the container reads the same `PORT` / `PORT_HTTP` a native
+    /// child does, and a spec literal still wins — `docker run` takes the final
+    /// `--env` for a repeated name, which is why the contract is emitted first.
+    #[test]
+    fn the_port_env_contract_renders_and_yields_to_a_spec_literal() {
+        let mut spec = test_spec("web");
+        spec.expose.mesh.ports = workload_spec::MeshExpose::anonymous_ports([8080]);
+        let args = render(&spec);
+        let env = flag_values(&args, "--env");
+        assert!(env.contains(&"PORT=8080"), "{env:?}");
+        assert!(env.contains(&"PORT_HTTP=8080"), "{env:?}");
+
+        spec.env = vec![workload_spec::EnvVar {
+            name: "PORT".into(),
+            value: workload_spec::EnvValue::Literal {
+                value: "9999".into(),
+            },
+        }];
+        let args = render(&spec);
+        let env = flag_values(&args, "--env");
+        let last_port = env.iter().filter(|e| e.starts_with("PORT=")).next_back();
+        assert_eq!(last_port, Some(&"PORT=9999"), "{env:?}");
     }
 
     #[test]

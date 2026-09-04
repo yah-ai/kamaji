@@ -670,7 +670,17 @@ fn entry_to_workload_state(entry: WorkloadEntry) -> crate::WorkloadState {
         // service-record sweep can publish and correct them. This is the whole
         // return path — without it a port kamaji allocated is invisible to the
         // thing that renders the ingress upstream.
-        ports: entry.ports,
+        //
+        // R844-F15: prefer the *named* map when the peer sent one. An empty
+        // `named_ports` does not distinguish "no ports" from "peer predates the
+        // field", so both fall through to naming the anonymous list — which
+        // yields exactly the old behaviour against an un-rolled node instead of
+        // a portless entry.
+        ports: if entry.named_ports.is_empty() {
+            crate::name_anonymous_ports(&entry.ports)
+        } else {
+            entry.named_ports
+        },
     }
 }
 
@@ -711,7 +721,7 @@ impl crate::Kamaji for KamajiClient {
             // before the bundle tree is materialized and long before anything
             // binds — so there is no resolved port in existence yet to report.
             // The first `list_workloads` sweep after the fork carries it.
-            ports: Vec::new(),
+            ports: Default::default(),
         })
     }
 
@@ -790,7 +800,7 @@ impl crate::Kamaji for KamajiClient {
                     task_pid: 0,
                     // Same as `deploy_workload`: the ack carries no resolved
                     // port, and a graceful upgrade keeps the listener anyway.
-                    ports: Vec::new(),
+                    ports: Default::default(),
                 })
             }
             other => Err(anyhow::anyhow!(
@@ -1069,6 +1079,8 @@ mod tests {
             state: WorkloadState::Running,
             pid: Some(1),
             ports: Vec::new(),
+            named_ports: Default::default(),
+            spec_digest: None,
         }
     }
 
@@ -1100,6 +1112,8 @@ mod tests {
                     state: WorkloadState::Running,
                     pid: Some(42),
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 }],
             }
         })
@@ -1530,6 +1544,8 @@ mod tests {
                         state: WorkloadState::Running,
                         pid: Some(1000),
                         ports: Vec::new(),
+                        named_ports: Default::default(),
+                        spec_digest: None,
                     },
                     WorkloadEntry {
                         mesh_ident: None,
@@ -1537,6 +1553,8 @@ mod tests {
                         state: WorkloadState::Exited,
                         pid: None,
                         ports: Vec::new(),
+                        named_ports: Default::default(),
+                        spec_digest: None,
                     },
                 ],
             }
@@ -1566,6 +1584,8 @@ mod tests {
                     state: WorkloadState::Running,
                     pid: Some(42),
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 }],
             }
         })

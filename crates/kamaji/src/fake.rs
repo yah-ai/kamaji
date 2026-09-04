@@ -157,7 +157,7 @@ impl FakeRuntime {
                     container_id: String::new(),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
-                    ports: Vec::new(),
+                    ports: Default::default(),
                 },
                 logs: vec![],
             })
@@ -203,7 +203,7 @@ impl FakeRuntime {
                     container_id: format!("fake-{key}"),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
-                    ports: Vec::new(),
+                    ports: Default::default(),
                 },
                 logs: vec![],
             });
@@ -303,7 +303,7 @@ impl Kamaji for FakeRuntime {
                     container_id: container_id.clone(),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
-                    ports: Vec::new(),
+                    ports: Default::default(),
                 },
                 logs: vec![],
             });
@@ -314,13 +314,13 @@ impl Kamaji for FakeRuntime {
         // R844-F2: the fake stands in for a native supervisor, so it reports
         // the spec's ports as resolved. A fake that always answered "no
         // resolved port" would make every test of the return path vacuous.
-        entry.state.ports = spec.expose.mesh.ports.clone();
+        entry.state.ports = crate::declared_port_names(&spec.expose.mesh);
 
         Ok(DeployResult {
             container_id,
             mesh_ip,
             task_pid: 1, // fake PID
-            ports: spec.expose.mesh.ports.clone(),
+            ports: crate::declared_port_names(&spec.expose.mesh),
         })
     }
 
@@ -394,20 +394,20 @@ impl Kamaji for FakeRuntime {
                     container_id: container_id.clone(),
                     status: WorkloadStatus::Pending,
                     mesh_ip: None,
-                    ports: Vec::new(),
+                    ports: Default::default(),
                 },
                 logs: vec![],
             });
         entry.state.status = WorkloadStatus::Running;
         entry.state.container_id = container_id.clone();
         entry.state.mesh_ip = Some(mesh_ip);
-        entry.state.ports = spec.expose.mesh.ports.clone();
+        entry.state.ports = crate::declared_port_names(&spec.expose.mesh);
 
         Ok(DeployResult {
             container_id,
             mesh_ip,
             task_pid: 1,
-            ports: spec.expose.mesh.ports.clone(),
+            ports: crate::declared_port_names(&spec.expose.mesh),
         })
     }
 
@@ -503,7 +503,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.to_string()),
-                    ports: vec![],
+                    ports: MeshExpose::anonymous_ports([]),
                     allow_from: vec![],
                 },
                 public: None,

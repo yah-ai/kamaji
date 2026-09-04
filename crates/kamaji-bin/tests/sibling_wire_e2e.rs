@@ -171,7 +171,7 @@ fn full_container_spec() -> WorkloadSpec {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent("noisetable-api.pdx".into()),
-                ports: vec![8080, 9090],
+                ports: MeshExpose::anonymous_ports([8080, 9090]),
                 allow_from: vec![
                     workload_spec::MeshPeer::Tier(TierTag("private".into())),
                     workload_spec::MeshPeer::Tier(TierTag("tenant".into())),
@@ -447,6 +447,8 @@ async fn scripted_backend(listener: UnixListener) {
                         state: WorkloadState::Running,
                         pid: Some(4242),
                         ports: Vec::new(),
+                        named_ports: Default::default(),
+                        spec_digest: None,
                     });
                     KamajiToYubaba::Ack {
                         request_id,

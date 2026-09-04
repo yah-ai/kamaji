@@ -43,6 +43,28 @@
 //! spawn is a socket becoming readable, not a policy timer. Sharing the loop
 //! would tangle two contradictory lifecycles, so JIT gets its own supervisor and
 //! reuses only the leaf helpers (`argv`, log capture).
+//!
+//! @yah:relay(R852, "Custom-domain onboarding, the halves outside passway/yubaba: declare a per-tenant passway workload, and render the tenant-facing enrollment page")
+//! @yah:at(2026-09-03T06:26:19Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:next("Split out of R779 (free-tier ingress at 10k domains) at its P8 close-out, because both halves are outside R779's blast radius rather than unfinished inside it. R779 shipped and proved the whole passway/yubaba side: SNI demux on one shared :443 that terminates no TLS, per-tenant passway fd-3 adoption + idle self-reap behind kamaji JIT (oss/passway/crates/passway/tests/jit_cold_start.rs proves fork/serve/reap/re-fork end to end), the R2-backed cert store off raft, the enrollment set as the structural allowlist, the per-domain ACME issuer, and DNS-01 _acme-challenge CNAME delegation now proven against a real CA (oss/passway/crates/acme-engine/tests/pebble_dns01_delegation.rs). What is left is a way to DECLARE a per-tenant passway, and a place for a tenant to READ their two DNS records. Design canon: .yah/docs/working/W267-sovereign-public-ingress.md.")
+//!
+//! @yah:ticket(R852-F1, "A workload kind for a per-tenant passway, so kamaji JIT can actually fork one")
+//! @yah:status(review)
+//! @yah:at(2026-09-03T08:19:03Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R852)
+//! @yah:next("THE PASSWAY HALF IS DONE AND PROVEN — do not rebuild it. JitRuntime::deploy_on_demand is already generic over WorkloadSpec, but kamaji-bin only ROUTES to it for a MesofactStatic workload carrying a serve_bundle (server.rs deploy_mesofact_bundle / deploy_bundle_on_demand). So a per-tenant passway has no way to be declared. Needs: a workload kind in workload-spec, a kamaji-bin routing arm, and a yah-cloud reconciler arm.")
+//! @yah:next("THE BIND STRING IS THE FD-TABLE KEY AND MUST MATCH BYTE FOR BYTE. The workload's env must carry PASSWAY_LISTEN equal to kamaji's listen_addr as a string, plus PASSWAY_IDLE_TTL_SECS (self-reap; unset = never reap), plus LISTEN_FDS=1 which kamaji's jit.rs already sets. passway's socket-activation feature is on by default and PANICS rather than binding fresh if LISTEN_FDS is set and the seed does not take — deliberate, so a supervisor never silently gets a second listener. The demux route for the tenant points at that held socket.")
+//! @yah:gotcha("Touching workload-spec trips the GENERATED-ARTIFACT drift gates: .yah/schema/*.toml.schema.json and packages/yah/workload-spec/index.ts no longer regenerate on commit (disabled 2026-08-15 because cargo run blocks on the shared target-dir lock). Regenerate by hand once your build is not contending with the camp: cargo run -p xtask -- emit-schemas, and cargo run --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --bin export-ts. schema-drift-guard / workload-spec-drift-guard in .yah/qed/check.toml will fail otherwise. Generated artifacts are NOT ownable under the shared-tree rule — regenerate them even if the type that moved was a peer's.")
+//! @yah:next("SECOND-ORDER, and it only starts to matter once this lands: yubaba's secret_reload rotation watcher resolves from raft ALONE. It is driven by a raft state-change watch, so a cert rotated only into R2 by the per-domain issuer produces no bump and the reload never fires. Harmless for a short-lived JIT passway (it re-reads at every cold start) and harmless today (nothing declares one), but a long-running per-tenant passway would serve an expiring cert. Fix it in this relay if you make per-tenant passways long-lived: oss/yubaba/crates/yubaba/src/secret_reload.rs, and see the LayeredSecretStore seam R779 added at oss/yubaba/crates/yubaba/src/lib.rs.")
+//! @yah:handoff("LANDED — kind = \"tenant-passway\", the fifth Workload variant, plus its kamaji routing arm and its yubaba reconciler. (1) workload_spec::TenantPasswayWorkload + TenantPasswayTls (oss/yah-base/crates/workload-spec/src/lib.rs), appended LAST to Workload and to all four tagging mirrors — postcard encodes an external tag as the variant index, so anywhere but the end renumbers the four a deployed node already decodes. jit_spec() renders the WorkloadSpec kamaji forks and DERIVES every load-bearing env key (PASSWAY_LISTEN, LISTEN_FDS=1, PASSWAY_IDLE_TTL_SECS, PASSWAY_UPSTREAMS, PASSWAY_TLS_*) from the declaration, applying the caller's env map FIRST so an escape hatch cannot break the fd handoff. (2) kamaji-bin gains a `tenant-passway` feature + --tenant-passway-dir + ServerCtx.tenant_passway, a deliberately SEPARATE JitRuntime from BundleBackend::jit (same rationale as ServerCtx::native vs BundleBackend::native), with arms in deploy_workload, Stop teardown, List merge, and the graceful-upgrade refusal. (3) yubaba::tenant_passway sweeps the same cert_store::enrolled() set demux_routes publishes from and arms one passway per domain via KamajiClient::deploy_envelope; wired into `yubaba serve` after attach_constable_client.")
+//! @yah:verify("Generated artifacts regenerated per the ticket's own gotcha: cargo run -p xtask -- emit-schemas and the workload-spec export-ts bin. git diff on .yah/schema + packages/yah/workload-spec is ADDITIONS ONLY and all tenant-passway — no peer's type drift got swept in. Both drift gates read red only because the regenerated files are uncommitted; re-running the generators produces no further change.")
+//! @yah:gotcha("A PEER EDITED UNDER ME, and the edit was correct so I kept it: oss/yubaba/crates/cloud/src/reconciler/static_asset_prune.rs's workload_kind_str helper (a hand-written four-arm match, the exact 'sixth place enumerating the variants' Workload::kind_str's doc warns about) went non-exhaustive when I added the variant, and someone replaced it with a kind_str() call while I was working. Verified against git show HEAD: the old form is in the last commit. Naming it here because it is in my diff and is not my authorship — likely @Ashguard:libra (session:d5b179fd) or the session running clippy on yah-cloud, but git cannot attribute an uncommitted hunk so I will not assert which.")
+//! @yah:assumes("The ticket's third `next` — yubaba's secret_reload rotation watcher resolving from raft alone — is deliberately NOT fixed, because the condition it named ('fix it if you make per-tenant passways long-lived') does not hold: the default is cold (DEFAULT_IDLE_TTL_SECS = 60) and a cold passway re-reads its chain at every start. The never-reap escape hatch exists (YUBABA_TENANT_PASSWAY_IDLE_TTL_SECS=0), and the rotation gap it re-opens is documented on TenantPasswayWorkload::idle_ttl where someone setting it will read it, rather than left silent.")
+//! @yah:verify("Tests, all green and all run: yah-workload-spec --test main 73 pass (5 new — postcard frame is [4]++payload, flat kind-tagged JSON round-trip, the derive-not-restate env invariant incl. an env map that tries to override PASSWAY_LISTEN/LISTEN_FDS, idle_ttl rounding up + None omitting the var, empty-upstreams). kamaji-bin --features tenant-passway --lib 220 pass (4 new: deploy arms the DECLARED socket and Stop releases it — asserted by trying to bind it ourselves, so nothing forks; a hostname listen is InvalidSpec; tier-not-attached names --tenant-passway-dir; and the no-feature build names --features tenant-passway, run separately without the feature). yubaba --lib 610 pass (7 new). yah-cloud --lib 958 pass. cargo check clean on all three workspaces: root --workspace --all-targets, oss/kamaji --workspace --all-targets --all-features, oss/yubaba --workspace --all-targets.")
+//! @yah:gotcha("PRE-EXISTING RED, not mine: xtask --test main fleet_build_placement::build_offloads_land_where_this_table_says_they_do fails (x86_64/linux builds land on us-west-002, EXPECTED_BUILD_PLACEMENT says us-west-003). It is placement over .yah/infra/machines/*.toml — no machine file is modified in the working tree and I touched no placement code, so this is red on committed state. The other 56 xtask tests pass, including workload_envelope (I added \"tenant-passway\" to MODELLED_KINDS: no hand-written file carries the kind today, but listing it means the first one anyone writes is checked rather than skipped).")
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -90,7 +112,7 @@ struct JitHandle {
     /// tier the custodian's socket *is* the workload's listener: it outlives
     /// every forked child, so the held socket's port is the resolved port by
     /// definition and cannot drift from what a child was told to expect.
-    ports: Vec<u16>,
+    ports: std::collections::BTreeMap<String, u16>,
     /// pid of the currently-live serve child, or `0` when idle (no resident
     /// process — the whole point of the on-demand tier).
     pid: Arc<AtomicU32>,
@@ -168,6 +190,18 @@ impl JitRuntime {
             .and_then(|fds| fds.into_iter().next())
             .ok_or_else(|| anyhow!("custodian holds no fd for {} after bind_and_hold", ident.0))?;
 
+        // The one resolved set for this workload: what `list_workloads` reports
+        // and what the forked child reads as `PORT` (R844-T13) are the same map,
+        // built once here, so a JIT workload's own idea of its port cannot differ
+        // from the one kamaji publishes.
+        let ports = crate::name_anonymous_ports(
+            &listen_addr
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+
         let pid = Arc::new(AtomicU32::new(0));
         let (status_tx, status_rx) = watch::channel(WorkloadStatus::Pending);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -176,6 +210,7 @@ impl JitRuntime {
             spec.clone(),
             mesh.mesh_ip,
             listen_fd,
+            ports.clone(),
             Arc::clone(&pid),
             status_tx,
             shutdown_rx,
@@ -185,11 +220,7 @@ impl JitRuntime {
             ident.0.clone(),
             JitHandle {
                 mesh_ip: mesh.mesh_ip,
-                ports: listen_addr
-                    .rsplit_once(':')
-                    .and_then(|(_, p)| p.parse::<u16>().ok())
-                    .into_iter()
-                    .collect(),
+                ports,
                 pid,
                 status: status_rx,
                 shutdown: shutdown_tx,
@@ -283,6 +314,7 @@ async fn supervise_on_demand(
     spec: WorkloadSpec,
     mesh_ip: Ipv4Addr,
     listen_fd: RawFd,
+    ports: std::collections::BTreeMap<String, u16>,
     pid: Arc<AtomicU32>,
     status_tx: watch::Sender<WorkloadStatus>,
     mut shutdown: watch::Receiver<bool>,
@@ -318,7 +350,7 @@ async fn supervise_on_demand(
 
         // ── FORK: a connection is pending; spawn the serve runtime and hand it
         //    the held socket (LISTEN_FDS socket activation). The child accepts.
-        let mut child = match spawn_jit_child(&state_dir, &spec, mesh_ip, listen_fd) {
+        let mut child = match spawn_jit_child(&state_dir, &spec, mesh_ip, listen_fd, &ports) {
             Ok(c) => c,
             Err(e) => {
                 let _ = status_tx.send(WorkloadStatus::Failed {
@@ -373,8 +405,14 @@ struct JitChild {
 
 /// Fork the serve runtime for an on-demand connection, passing the custodian's
 /// held listener as the child's fd 3 (socket activation). The argv/env come from
-/// `spec` (same shape the native backend forks), plus `LISTEN_FDS=1` and the
-/// `YAH_MESH_IP` injection.
+/// `spec` (same shape the native backend forks), plus `LISTEN_FDS=1`, the
+/// `YAH_MESH_IP` injection and the `PORT` / `PORT_<NAME>` set (R844-T13).
+///
+/// `ports` is the custodian's *held* address, not a declared number — the child
+/// adopts fd 3 rather than binding, so this is telling it which port it is
+/// already serving on. It still needs to know: a serve runtime renders absolute
+/// URLs and reports its own address, and a JIT workload that had to infer that
+/// from the spec would be the one tier reading a different fact.
 ///
 /// The child's argv is expected to carry `--idle-ttl <secs>` so the runtime
 /// self-reaps; kamaji does not own idle detection.
@@ -383,6 +421,7 @@ fn spawn_jit_child(
     spec: &WorkloadSpec,
     mesh_ip: Ipv4Addr,
     listen_fd: RawFd,
+    ports: &std::collections::BTreeMap<String, u16>,
 ) -> Result<JitChild> {
     let ident = &spec.expose.mesh.identity;
     let argv = argv(spec)?;
@@ -419,6 +458,9 @@ fn spawn_jit_child(
         .kill_on_drop(false);
     if let Some(workdir) = &spec.workdir {
         cmd.current_dir(workdir);
+    }
+    for (k, v) in crate::ports::port_env(ports) {
+        cmd.env(k, v);
     }
     for e in &spec.env {
         if let EnvValue::Literal { value } = &e.value {

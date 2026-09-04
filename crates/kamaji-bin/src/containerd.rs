@@ -48,7 +48,7 @@ use containerd_client::{
         tasks_client::TasksClient,
         version_client::VersionClient,
         Container, CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest,
-        DeleteTaskRequest, GetContainerRequest, KillRequest, ListContainersRequest, StartRequest,
+        GetContainerRequest, KillRequest, ListContainersRequest, StartRequest,
     },
     tonic::{transport::Channel, Request},
     with_namespace,
@@ -372,6 +372,12 @@ impl ContainerdBackend {
             .with_context(|| format!("preparing rootfs for {container_id}"))?;
 
         // Create + start the task (the live execution instance).
+        //
+        // R854: via `create_task_reaping_stale`, so a task record that outlived
+        // the reap above (a shim slow to publish its exit) is torn down and the
+        // create retried once, rather than 500ing the deploy on "already
+        // exists" and leaving the workload down until an operator happens to
+        // redeploy a third time.
         let pid = {
             let mut tasks = self.tasks_client();
             let req = CreateTaskRequest {
@@ -385,13 +391,10 @@ impl ContainerdBackend {
                 options: None,
                 ..Default::default()
             };
-            let req = with_namespace!(req, self.namespace);
-            let resp = tasks
-                .create(req)
+            kcc::create_task_reaping_stale(&mut tasks, &self.namespace, req)
                 .await
                 .with_context(|| format!("creating task for {container_id}"))
-                .map_err(BackendError::Containerd)?;
-            resp.into_inner().pid
+                .map_err(BackendError::Containerd)?
         };
         {
             let mut tasks = self.tasks_client();
@@ -657,9 +660,32 @@ impl ContainerdBackend {
     /// socket should close too. This is why deploy / graceful use the private
     /// [`reap_container`](Self::reap_container) (which keeps custody) for their
     /// internal same-id recycle, and only the public Stop path lands here.
+    /// R823-B4: `id` may be either the container id this backend deployed
+    /// under (`spec.name`) OR the workload's mesh identity, so resolve it
+    /// before reaping. See [`resolve_container_key_with`] for why, and
+    /// [`ContainerLookup`] for the seam that makes the choice testable.
+    ///
+    /// Custody is released under BOTH keys: the fast path releases whatever
+    /// the caller named, and the resolved id covers the case where custody was
+    /// recorded under the deploy-time container id. `release` is an idempotent
+    /// map removal, so the extra call costs nothing when the keys agree.
     pub async fn teardown(&self, id: &WorkloadId) -> Result<(), BackendError> {
+        let resolved = self.resolve_container_key(id).await?;
         self.custodian.release(id.as_str());
-        self.reap_container(id).await
+        if resolved.as_str() != id.as_str() {
+            self.custodian.release(resolved.as_str());
+        }
+        self.reap_container(&resolved).await
+    }
+
+    /// Resolve a `Stop` key to the container id it actually names, over live
+    /// containerd. See [`resolve_container_key_with`] for the logic.
+    async fn resolve_container_key(&self, key: &WorkloadId) -> Result<WorkloadId, BackendError> {
+        let mut lookup = ContainerdLookup {
+            ctrs: self.containers_client(),
+            namespace: self.namespace.clone(),
+        };
+        resolve_container_key_with(&mut lookup, key).await
     }
 
     /// Reap the container/task/snapshot + journald forwarders for `id`, WITHOUT
@@ -712,39 +738,57 @@ impl ContainerdBackend {
             return Ok(());
         }
 
-        // Kill the task with SIGKILL — Stop's gentle path goes through Drain
-        // (T7); this is the hard-tear-down used by `Stop` and idempotent
-        // redeploy.
+        // Kill the task with SIGKILL and WAIT for containerd to actually reap
+        // it — Stop's gentle path goes through Drain (T7); this is the
+        // hard-tear-down used by `Stop` and idempotent redeploy.
+        //
+        // R854: this used to fire the kill and delete the task record in the
+        // very next breath, discarding the delete's result. Containerd refuses
+        // to delete a task that has not reached STOPPED, so on a back-to-back
+        // redeploy the delete lost the race, the task survived, the *container*
+        // delete below succeeded anyway (containerd's metadata store does not
+        // hold the two together), and the redeploy's CreateTask collided with
+        // the orphan — "task <ident>: already exists", a 500 out of yubaba, and
+        // a previously-healthy workload left Failed. `reap_task` returns only
+        // once containerd reports no task, so the failure is now visible here
+        // instead of surfacing three steps later as a phantom collision.
         {
             let mut tasks = self.tasks_client();
-            let req = KillRequest {
-                container_id: container_id.clone(),
-                exec_id: String::new(),
-                signal: 9, // SIGKILL
-                all: false,
-            };
-            let req = with_namespace!(req, self.namespace);
-            let _ = tasks.kill(req).await; // missing/already-dead → ignore
+            if let Err(e) = kcc::reap_task(
+                &mut tasks,
+                &self.namespace,
+                &container_id,
+                kcc::TASK_REAP_TIMEOUT,
+            )
+            .await
+            {
+                warn!(
+                    container_id = %container_id,
+                    error = %format!("{e:#}"),
+                    "kamaji: task reap did not complete; a redeploy may collide with the survivor"
+                );
+            }
         }
 
-        // Delete the task record.
-        {
-            let mut tasks = self.tasks_client();
-            let req = DeleteTaskRequest {
-                container_id: container_id.clone(),
-            };
-            let req = with_namespace!(req, self.namespace);
-            let _ = tasks.delete(req).await;
-        }
-
-        // Delete the container record.
+        // Delete the container record. R854: a swallowed failure here is the
+        // other half of the same trap — the next deploy's CreateContainer
+        // would then collide, and with nothing logged the 500 names a
+        // condition no one can trace back to this reap.
         {
             let mut ctrs = self.containers_client();
             let req = DeleteContainerRequest {
                 id: container_id.clone(),
             };
             let req = with_namespace!(req, self.namespace);
-            let _ = ctrs.delete(req).await;
+            match ctrs.delete(req).await {
+                Ok(_) => {}
+                Err(status) if status.code() == containerd_client::tonic::Code::NotFound => {}
+                Err(status) => warn!(
+                    container_id = %container_id,
+                    error = %status,
+                    "kamaji: container record delete failed; a redeploy may collide with it"
+                ),
+            }
         }
 
         // Remove the active rootfs snapshot so a redeploy can re-prepare it
@@ -802,6 +846,12 @@ impl ContainerdBackend {
                 // backend resolves nothing. Empty means "no resolved port
                 // known", not "portless" — the caller falls back to the spec.
                 ports: Vec::new(),
+                named_ports: Default::default(),
+                // R852-B4: a backend does not know what spec it was deployed
+                // from — containerd knows a container, not a `Workload`. The
+                // server stamps the digest onto every entry from its own deploy
+                // record after the merges, so every backend leaves it `None`.
+                spec_digest: None,
             });
         }
         Ok(entries)
@@ -911,6 +961,119 @@ fn spawn_forwarder(
     Err(BackendError::Containerd(anyhow::anyhow!(
         "containerd FIFO log fan-in requires Linux"
     )))
+}
+
+/// The containerd container lookups [`resolve_container_key_with`] needs,
+/// behind a trait so the resolution logic — the part that was wrong — is
+/// exercised on a machine with no containerd. Same shape as
+/// `kcc::TaskOps`/`reap_task_with` (R854).
+#[allow(async_fn_in_trait)]
+pub trait ContainerLookup {
+    /// Does a container with exactly this id exist?
+    async fn exists(&mut self, container_id: &str) -> Result<bool, BackendError>;
+    /// The id of the container carrying `yah.mesh-ident == mesh_ident`, if any.
+    async fn find_by_mesh_ident(&mut self, mesh_ident: &str)
+        -> Result<Option<String>, BackendError>;
+}
+
+/// Resolve a `Stop` key to the container id it names.
+///
+/// R823-B4 — the leak this exists to close. This backend NAMES containers by
+/// the `WorkloadId` `Deploy` carried, which `KamajiSibling::deploy_workload`
+/// fills from `spec.name`; but `KamajiSibling::teardown_workload` has only a
+/// `MeshIdent` and sends *that* as the `Stop` id. For every workload whose
+/// name and mesh identity agree the two are the same string and nothing was
+/// ever wrong. A forge run is the one shape where they differ —
+/// `WorkloadSpec::for_forge` is `name = forge-<uuid>` (DNS-label safe, no dots)
+/// against `expose.mesh.identity = forge.<uuid>` (R590-B9) — so `Stop` probed a
+/// container id that had never existed, [`ContainerdBackend::reap_container`]
+/// took its `probe.is_err() → Ok(())` early return, and yubaba answered
+/// `{"status":"destroyed"}` over a container that was still RUNNING and still
+/// holding its ports. MEASURED on us-west-003 2026-09-03: five participant-set
+/// runs, five surviving responders.
+///
+/// This is the same class of bug the docker backend fixed in the opposite
+/// direction (it names by identity and was handed an id) with
+/// `resolve()`/`teardown_by_key()`; see the R626-F1 gotcha on
+/// [`crate::server`]. The resolution here is the containerd half, and it is
+/// deliberately the same "accept EITHER key" contract rather than a new one.
+///
+/// Order matters: the direct hit is tried FIRST, so an ordinary workload costs
+/// one `Containers.Get` and never a label scan, and a container id that
+/// happens to collide with some other workload's mesh-ident label can't be
+/// hijacked. Falling back to `key` when neither matches keeps `Stop`
+/// idempotent — `reap_container` still runs its FIFO/tracking cleanup and
+/// returns `Ok(())` for a workload containerd never had.
+pub async fn resolve_container_key_with<L: ContainerLookup>(
+    lookup: &mut L,
+    key: &WorkloadId,
+) -> Result<WorkloadId, BackendError> {
+    if lookup.exists(key.as_str()).await? {
+        return Ok(key.clone());
+    }
+    if let Some(container_id) = lookup.find_by_mesh_ident(key.as_str()).await? {
+        info!(
+            stop_key = %key.as_str(),
+            container_id = %container_id,
+            "kamaji: resolved Stop key to a container by its yah.mesh-ident label (R823-B4)"
+        );
+        return Ok(WorkloadId::new(container_id));
+    }
+    Ok(key.clone())
+}
+
+/// The containerd filter that selects containers carrying
+/// `yah.mesh-ident == mesh_ident`.
+///
+/// Returns `None` for a value that cannot be embedded in containerd's filter
+/// grammar — a `"` or `\` would end the quoted string early and turn a lookup
+/// into a syntax error (or, worse, a different filter). No mesh identity in
+/// this fleet contains either, so refusing is strictly a guard: the caller
+/// treats `None` as "no match", and `Stop` falls back to the literal key,
+/// which is the pre-R823-B4 behaviour.
+fn mesh_ident_filter(mesh_ident: &str) -> Option<String> {
+    if mesh_ident.contains('"') || mesh_ident.contains('\\') {
+        return None;
+    }
+    Some(format!("labels.\"yah.mesh-ident\"==\"{mesh_ident}\""))
+}
+
+/// [`ContainerLookup`] over a live containerd.
+struct ContainerdLookup {
+    ctrs: ContainersClient<Channel>,
+    namespace: String,
+}
+
+impl ContainerLookup for ContainerdLookup {
+    async fn exists(&mut self, container_id: &str) -> Result<bool, BackendError> {
+        let req = GetContainerRequest {
+            id: container_id.to_string(),
+        };
+        let req = with_namespace!(req, self.namespace);
+        Ok(self.ctrs.get(req).await.is_ok())
+    }
+
+    async fn find_by_mesh_ident(
+        &mut self,
+        mesh_ident: &str,
+    ) -> Result<Option<String>, BackendError> {
+        let Some(filter) = mesh_ident_filter(mesh_ident) else {
+            return Ok(None);
+        };
+        let req = ListContainersRequest {
+            filters: vec![filter],
+        };
+        let req = with_namespace!(req, self.namespace);
+        let containers = self
+            .ctrs
+            .list(req)
+            .await
+            .context("listing containerd containers by mesh ident")
+            .map_err(BackendError::Containerd)?
+            .into_inner()
+            .containers;
+        Ok(containers.into_iter().next().map(|c| c.id))
+    }
 }
 
 /// Build labels Kamaji stamps on every container — these are how
@@ -1087,7 +1250,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.into()),
-                    ports: vec![8080],
+                    ports: MeshExpose::anonymous_ports([8080]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -1389,5 +1552,130 @@ mod tests {
             "expected no entries after abort, got {:?}",
             sink.entries()
         );
+    }
+
+    // ── R823-B4: Stop must accept either the container id or the mesh ident ──
+
+    /// Records what was asked, so a test can assert the direct hit short-
+    /// circuits instead of merely returning the right string by luck.
+    #[derive(Default)]
+    struct FakeLookup {
+        /// container ids that exist
+        containers: Vec<String>,
+        /// mesh-ident label → container id
+        by_mesh_ident: HashMap<String, String>,
+        exists_calls: Vec<String>,
+        find_calls: Vec<String>,
+    }
+
+    impl ContainerLookup for FakeLookup {
+        async fn exists(&mut self, container_id: &str) -> Result<bool, BackendError> {
+            self.exists_calls.push(container_id.to_string());
+            Ok(self.containers.iter().any(|c| c == container_id))
+        }
+
+        async fn find_by_mesh_ident(
+            &mut self,
+            mesh_ident: &str,
+        ) -> Result<Option<String>, BackendError> {
+            self.find_calls.push(mesh_ident.to_string());
+            Ok(self.by_mesh_ident.get(mesh_ident).cloned())
+        }
+    }
+
+    /// The R823-B4 leak itself: a forge Stop carries `forge.<uuid>` (the mesh
+    /// identity) but the container is named `forge-<uuid>` (`spec.name`).
+    /// Before the fix this resolved to nothing, `reap_container` early-returned
+    /// Ok, and yubaba answered "destroyed" over a running container.
+    #[tokio::test]
+    async fn a_mesh_ident_stop_key_resolves_to_the_forge_container_id() {
+        let mut lookup = FakeLookup {
+            containers: vec!["forge-87802530".into()],
+            by_mesh_ident: HashMap::from([(
+                "forge.87802530".to_string(),
+                "forge-87802530".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let resolved =
+            resolve_container_key_with(&mut lookup, &WorkloadId::new("forge.87802530"))
+                .await
+                .unwrap();
+
+        assert_eq!(resolved, WorkloadId::new("forge-87802530"));
+    }
+
+    /// The ordinary workload — name and mesh identity agree — must cost one
+    /// `Containers.Get` and never reach the label scan.
+    #[tokio::test]
+    async fn a_container_id_that_exists_is_taken_directly_without_a_label_scan() {
+        let mut lookup = FakeLookup {
+            containers: vec!["yah-cloud-admin".into()],
+            ..Default::default()
+        };
+
+        let resolved =
+            resolve_container_key_with(&mut lookup, &WorkloadId::new("yah-cloud-admin"))
+                .await
+                .unwrap();
+
+        assert_eq!(resolved, WorkloadId::new("yah-cloud-admin"));
+        assert_eq!(lookup.exists_calls, vec!["yah-cloud-admin".to_string()]);
+        assert!(
+            lookup.find_calls.is_empty(),
+            "a direct hit must not fall through to the label scan: {:?}",
+            lookup.find_calls
+        );
+    }
+
+    /// A direct hit wins over a label match, so one workload's container id
+    /// cannot be hijacked by another workload's `yah.mesh-ident`.
+    #[tokio::test]
+    async fn a_direct_hit_outranks_a_mesh_ident_label_on_a_different_container() {
+        let mut lookup = FakeLookup {
+            containers: vec!["shared-key".into(), "someone-else".into()],
+            by_mesh_ident: HashMap::from([(
+                "shared-key".to_string(),
+                "someone-else".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let resolved = resolve_container_key_with(&mut lookup, &WorkloadId::new("shared-key"))
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, WorkloadId::new("shared-key"));
+    }
+
+    /// Stop stays idempotent: an unknown key resolves to itself so
+    /// `reap_container` still runs its FIFO/tracking cleanup and returns Ok.
+    #[tokio::test]
+    async fn an_unknown_key_falls_back_to_itself_so_stop_stays_idempotent() {
+        let mut lookup = FakeLookup::default();
+
+        let resolved = resolve_container_key_with(&mut lookup, &WorkloadId::new("never-existed"))
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, WorkloadId::new("never-existed"));
+        assert_eq!(lookup.find_calls, vec!["never-existed".to_string()]);
+    }
+
+    #[test]
+    fn the_mesh_ident_filter_is_containerd_label_syntax() {
+        assert_eq!(
+            mesh_ident_filter("forge.87802530").unwrap(),
+            "labels.\"yah.mesh-ident\"==\"forge.87802530\""
+        );
+    }
+
+    /// A value that would break out of the quoted filter string is refused
+    /// rather than embedded — the caller reads None as "no match".
+    #[test]
+    fn the_mesh_ident_filter_refuses_a_value_it_cannot_quote() {
+        assert!(mesh_ident_filter("forge.\"; drop").is_none());
+        assert!(mesh_ident_filter("forge\\x").is_none());
     }
 }

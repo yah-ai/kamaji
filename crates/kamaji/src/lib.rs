@@ -134,6 +134,7 @@ pub mod fake;
 /// not a shape any build should be able to select.
 pub mod ports;
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -259,14 +260,22 @@ pub struct DeployResult {
     pub container_id: String,
     pub mesh_ip: Ipv4Addr,
     pub task_pid: u32,
-    /// Port(s) the supervisor **actually bound** for this workload (R844-F2).
+    /// Port(s) the supervisor **actually bound** for this workload, keyed by
+    /// **port name** (R844-F2 introduced the field; R844-F15 named it).
     ///
     /// Distinct from the workload's *declared* ports (`spec.expose.mesh.ports`
-    /// for a container, `serve_bundle.port` for a W272 bundle): a declared port
-    /// is a request, this is the answer. They coincide whenever the workload
-    /// declared one — [`ports::PortAllocator::resolve`] returns a declared port
-    /// unchanged — and diverge exactly when it did not and the supervisor
-    /// allocated instead.
+    /// for a container, `serve_bundle.port` for a W272 bundle): a declared
+    /// *name* is a request, this is the answer. A declared *number* is refused
+    /// outright unless the port is fixed by the outside world
+    /// ([`ports::WORLD_FIXED_PORTS`]), so since R844-F14 these no longer
+    /// coincide by way of a pin — the allocator picks, and this reports.
+    ///
+    /// The **name** is what makes a multi-port workload resolvable: three bare
+    /// numbers tell a consumer nothing about which one is the websocket
+    /// listener, so it has to guess by index or by convention and is wrong the
+    /// first time a port moves. A workload that declares no names at all still
+    /// gets one — see [`name_anonymous_ports`], which is the single place that
+    /// synthesis lives so every tier spells it the same way.
     ///
     /// Empty means "this backend does not resolve ports", not "no ports": a
     /// container backend puts the workload in its own namespace, where the
@@ -274,7 +283,7 @@ pub struct DeployResult {
     /// Consumers must fall back to the declared ports on empty rather than
     /// treating the workload as undialable.
     #[serde(default)]
-    pub ports: Vec<u16>,
+    pub ports: BTreeMap<String, u16>,
 }
 
 /// Point-in-time state snapshot for one deployed workload.
@@ -284,8 +293,9 @@ pub struct WorkloadState {
     pub container_id: String,
     pub status: WorkloadStatus,
     pub mesh_ip: Option<Ipv4Addr>,
-    /// Port(s) the supervisor currently has bound for this workload — same
-    /// meaning as [`DeployResult::ports`], observed rather than returned.
+    /// Port(s) the supervisor currently has bound for this workload, keyed by
+    /// port name — same meaning as [`DeployResult::ports`], observed rather
+    /// than returned.
     ///
     /// This field is what makes a moved port *correctable*. `DeployResult` gets
     /// the resolved port into a service record once, at admission; this one
@@ -293,9 +303,225 @@ pub struct WorkloadState {
     /// a different port updates the record instead of leaving it advertising a
     /// port nothing is listening on. A stale-but-healthy-looking record is a
     /// strictly worse failure than an absent one, because nothing detects it.
+    ///
+    /// Names ride the same sweep at no extra cost, which is why R844-F15 put
+    /// them here rather than inventing a second channel: the correction path
+    /// already re-asserts every resolved port on every pass.
     #[serde(default)]
-    pub ports: Vec<u16>,
+    pub ports: BTreeMap<String, u16>,
 }
+
+/// Attach names to a port list that carries none.
+///
+/// A `Vec<u16>` — `expose.mesh.ports` on a [`WorkloadSpec`], a legacy
+/// `serve_bundle.port`, an older peer's `WorkloadEntry.ports` off the sibling
+/// wire — is the shape that predates named ports, and it genuinely has no
+/// names to recover. This is the one function that decides what to call those
+/// ports, so kamaji, yubaba's service records and the `PORT_<NAME>` env
+/// contract (R844-T13) all spell the same workload's ports identically.
+///
+/// The rule, and why:
+///
+/// - **Exactly one** port becomes [`DEFAULT_PORT_NAME`] (`http`). A
+///   single-listener workload is the overwhelmingly common case, `http` is the
+///   name R844-F14's allocator gives it too, and there is nothing to be
+///   ambiguous about: the one port a workload has *is* the one it serves on. So
+///   the trivial case stays trivial and `PORT` can alias it (R844-T13).
+/// - **Several** ports each become their own number, as a decimal string
+///   (`{"8080": 8080, "9090": 9090}`) — and, importantly, **none of them
+///   becomes `http`**.
+///
+/// That second clause is the whole care in this function, and it was nearly got
+/// wrong: the obvious rule is "first port is `http`, rest are numbers", which
+/// reads as reasonable and is exactly the index-guess named ports exist to
+/// abolish. `expose.mesh.ports = [8080, 9090]` says a workload listens on two
+/// ports; it does not say which one a front door should publish. Calling the
+/// first one `http` would let
+/// `ServiceRecordFanout::port_for` resolve an ingress rule against a positional
+/// accident and publish a hostname at, say, a metrics listener — the failure
+/// that only surfaces as a 502 at request time. A caller asking for `http` and
+/// getting `None` is the honest answer; the operator then either pins `port` on
+/// the slot or names the ports in the manifest, and both of those are somebody
+/// stating the fact rather than the code inventing it.
+///
+/// Not `extra1`, not `port-9090`, for the smaller reason: an anonymous
+/// declaration has no names and the number is the only identity those ports
+/// actually carry, so an ordinal would name a thing nobody said. It also keeps
+/// the env spelling readable (`PORT_9090`, not `PORT_PORT_9090`).
+///
+/// Deterministic and idempotent: the same list always yields the same map, and
+/// re-naming an already-named port list never happens because named ports never
+/// take this path. Duplicate numbers collapse, which is correct — a workload
+/// cannot bind the same port twice. Note that collapsing can turn a two-element
+/// list into a one-element map, and `[8080, 8080]` then *does* name `http`,
+/// which is right: there is only one port.
+///
+/// Once a manifest spells `ports = ["http", "wss"]` the real names flow through
+/// from the allocator and none of this synthesis runs.
+pub fn name_anonymous_ports(ports: &[u16]) -> BTreeMap<String, u16> {
+    let mut distinct: Vec<u16> = ports.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    match distinct.as_slice() {
+        [one] => [(DEFAULT_PORT_NAME.to_string(), *one)].into_iter().collect(),
+        many => many.iter().map(|&p| (p.to_string(), p)).collect(),
+    }
+}
+
+/// The `name -> port` map for a workload's declared mesh exposure (R844-F17).
+///
+/// This is the one lowering from a *manifest* to the named ports every tier
+/// below speaks, and it exists because [`name_anonymous_ports`] can only ever
+/// synthesise: before R844-F17 `expose.mesh.ports` was an array of bare
+/// numbers, so a two-listener workload had no way to say which one a front door
+/// should publish and the honest answer was to refuse. Now it can say, and this
+/// is what reads the answer.
+///
+/// The rule, and the care in it:
+///
+/// - **Nothing is named** — the whole list falls through to
+///   [`name_anonymous_ports`], byte-for-byte the pre-F17 behaviour. A sole port
+///   becomes `http`; several become their own numbers and none becomes `http`.
+/// - **Something is named** — every declared name is used verbatim, and an
+///   *unnamed sibling* becomes its own number rather than `http`. That second
+///   clause is deliberate and is the whole difference from "the leftover one
+///   must be the default": an author who names one of three ports has shown
+///   they name ports on purpose, so promoting whichever one they left bare to
+///   `http` would invent exactly the fact — *this* is the listener the world
+///   dials — that naming exists to state. A caller asking for `http` and
+///   getting `None` sends the author back to the manifest, which is the right
+///   place to settle it.
+///
+/// Name-only entries (`ports = ["http"]`) have no number to map yet, so they
+/// are absent here; a supervisor that allocates from the manifest is what fills
+/// them in, and `validate::shape` warns that none does today.
+///
+/// Deterministic against a hostile spec as well as a validated one: declared
+/// names are inserted first, so a manifest whose name collides with a sibling's
+/// number-as-string (`[{ name = "8080", port = 9090 }, 8080]` — rejected by
+/// `validate::shape`, but the binary wire is not validated) resolves the same
+/// way on every node instead of by iteration order.
+pub fn declared_port_names(mesh: &workload_spec::MeshExpose) -> BTreeMap<String, u16> {
+    if mesh.ports.iter().all(|p| p.name.is_none()) {
+        return name_anonymous_ports(&mesh.numbers());
+    }
+
+    let mut out: BTreeMap<String, u16> = BTreeMap::new();
+    for port in &mesh.ports {
+        if let (Some(name), Some(number)) = (port.name.as_deref(), port.number) {
+            out.insert(name.to_string(), number);
+        }
+    }
+    for port in &mesh.ports {
+        if port.name.is_none() {
+            if let Some(number) = port.number {
+                out.entry(number.to_string()).or_insert(number);
+            }
+        }
+    }
+    out
+}
+
+/// The [`ports::PortSpec`] set a workload's declared mesh exposure asks for
+/// (R844-F21) — the lowering from a *manifest* to an allocator's input.
+///
+/// [`declared_port_names`] answers "what number is each port already at".
+/// This answers "what does this workload want", which is the question a
+/// supervisor has to settle *before* anything is bound, and until R844-F21
+/// nothing asked it: `ports = ["http", "wss"]` parsed, validated and crossed
+/// both wires without a single consumer, so the names arrived at the
+/// supervisor attached to no numbers and nothing bound them.
+///
+/// The two functions agree on naming by construction — every number-bearing
+/// entry appears here under exactly the name `declared_port_names` gives it,
+/// including the anonymous-port rules (a sole bare number is `http`; several
+/// are their own numbers and none is `http`). A port allocated under one name
+/// and published under another is the whole class of bug this relay exists to
+/// remove, so the two readings are one reading.
+///
+/// A stated number rides through as [`ports::PortSpec::pin`] rather than being
+/// honoured here, because what a written number *means* is a per-tier decision
+/// R844-F14 already made — [`ports::LedgerPorts`] refuses one that is not
+/// world-fixed, [`ports::EphemeralPorts`] treats it as a preference — and this
+/// lowering has no business knowing which tier it feeds.
+///
+/// Name-only entries are the reason this exists: they carry no pin, so
+/// `pin.is_none()` is exactly "the supervisor still owes this port a number".
+pub fn declared_port_specs(mesh: &workload_spec::MeshExpose) -> Vec<ports::PortSpec> {
+    let numbered = declared_port_names(mesh);
+    let mut out: Vec<ports::PortSpec> = numbered
+        .iter()
+        .map(|(name, &number)| ports::PortSpec {
+            name: name.clone(),
+            pin: Some(number),
+        })
+        .collect();
+
+    // Name-only entries, in declaration order. The `contains_key` guard keeps a
+    // hostile spec deterministic rather than double-listing one name: the
+    // binary wire is not validated, so `[{ name = "http", port = 8080 },
+    // "http"]` can arrive here even though `validate::shape` rejects it.
+    out.extend(
+        mesh.ports
+            .iter()
+            .filter(|port| port.number.is_none())
+            .filter_map(|port| port.name.as_deref())
+            .filter(|name| !numbered.contains_key(*name))
+            .map(ports::PortSpec::auto),
+    );
+    out
+}
+
+/// Refuse a port this backend cannot give a number to (R844-F21).
+///
+/// A name-only port is a request to *allocate*, and only a backend that owns
+/// the workload's network namespace can honour it. A container does not: its
+/// ports are its image's, fixed before the manifest was written, which is why
+/// both container backends report [`DeployResult::ports`] empty rather than
+/// echoing the declaration back (see `containerd::create_and_start`).
+///
+/// The alternative — allocating a *host* port and publishing that — was
+/// considered and rejected: containerd publishes no host ports at all, and the
+/// docker backend publishes only what `yah.docker.publish` explicitly maps, so
+/// an allocated number would be published into a service record while nothing
+/// answered on it. A front door dialling a number no listener holds is exactly
+/// the confidently-wrong reading this relay exists to eliminate, and it is
+/// strictly worse than the loud refusal here.
+pub fn reject_unresolved_ports(
+    workload: &str,
+    mesh: &workload_spec::MeshExpose,
+    backend: Backend,
+) -> anyhow::Result<()> {
+    let unresolved: Vec<&str> = mesh
+        .ports
+        .iter()
+        .filter(|port| port.number.is_none())
+        .filter_map(|port| port.name.as_deref())
+        .collect();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "workload {workload}: port(s) {:?} name no number, but {:?} cannot \
+         allocate one — a container's ports are its image's, fixed before this \
+         manifest was written, and this backend publishes no host port to stand \
+         in for them. State the number ({{ name = {:?}, port = <n> }}), or run \
+         the workload on the native backend, where the supervisor allocates and \
+         tells the process via PORT_<NAME>.",
+        unresolved,
+        backend,
+        unresolved[0],
+    )
+}
+
+/// The name a workload's sole port gets when nothing named it, and the name a
+/// front door publishes when a workload has several.
+///
+/// Shared by [`name_anonymous_ports`], R844-F14's allocator and yubaba's
+/// ingress port resolution so a single-listener workload is called the same
+/// thing at every tier — and so "which port does this hostname front" has one
+/// answer rather than one per reader.
+pub const DEFAULT_PORT_NAME: &str = "http";
 
 /// Lifecycle status of a deployed workload.
 ///
@@ -589,5 +815,256 @@ mod tests {
         assert_eq!(json, "\"containerd\"");
         let parsed: Backend = serde_json::from_str("\"docker\"").unwrap();
         assert_eq!(parsed, Backend::Docker);
+    }
+
+    // ── R844-F15: naming an anonymous port list ─────────────────────────────
+
+    #[test]
+    fn a_sole_anonymous_port_is_named_http() {
+        assert_eq!(
+            name_anonymous_ports(&[8080]),
+            [(DEFAULT_PORT_NAME.to_string(), 8080)]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        );
+    }
+
+    /// The load-bearing half. An anonymous list of several ports says a
+    /// workload listens on several ports; it does not say which one a front
+    /// door should publish. Naming the first one `http` would make
+    /// `ServiceRecordFanout::port_for` resolve an ingress rule off declaration
+    /// order and point a hostname at, say, a metrics listener — visible only as
+    /// a 502 at request time.
+    #[test]
+    fn several_anonymous_ports_name_none_of_themselves_http() {
+        let named = name_anonymous_ports(&[8080, 9090]);
+        assert_eq!(named.get("8080"), Some(&8080));
+        assert_eq!(named.get("9090"), Some(&9090));
+        assert_eq!(named.get(DEFAULT_PORT_NAME), None);
+    }
+
+    /// Declaration order does not change the answer — if it did, the map would
+    /// carry the positional accident it exists to remove.
+    #[test]
+    fn naming_is_independent_of_declaration_order() {
+        assert_eq!(
+            name_anonymous_ports(&[9090, 8080]),
+            name_anonymous_ports(&[8080, 9090])
+        );
+    }
+
+    /// A repeated port is one port, so it *is* unambiguous and does get `http`.
+    #[test]
+    fn a_repeated_port_collapses_to_the_single_port_case() {
+        assert_eq!(
+            name_anonymous_ports(&[8080, 8080]),
+            name_anonymous_ports(&[8080])
+        );
+    }
+
+    #[test]
+    fn no_ports_names_nothing() {
+        assert!(name_anonymous_ports(&[]).is_empty());
+    }
+
+    // ── declared_port_names (R844-F17) ───────────────────────────────────────
+
+    fn mesh(ports: Vec<workload_spec::MeshPort>) -> workload_spec::MeshExpose {
+        workload_spec::MeshExpose {
+            identity: workload_spec::MeshIdent("api".into()),
+            ports,
+            allow_from: vec![],
+        }
+    }
+
+    /// The compatibility property the whole change rests on: every manifest
+    /// written before names existed resolves to exactly what it always did.
+    #[test]
+    fn an_unnamed_declaration_resolves_identically_to_the_old_synthesis() {
+        for numbers in [vec![], vec![8080], vec![8080, 9090], vec![8080, 8080]] {
+            assert_eq!(
+                declared_port_names(&mesh(
+                    workload_spec::MeshExpose::anonymous_ports(numbers.clone())
+                )),
+                name_anonymous_ports(&numbers),
+                "{numbers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_name_is_used_verbatim() {
+        let named = declared_port_names(&mesh(vec![
+            workload_spec::MeshPort::pinned("http", 8080),
+            workload_spec::MeshPort::pinned("wss", 8443),
+        ]));
+        assert_eq!(named.get("http"), Some(&8080));
+        assert_eq!(named.get("wss"), Some(&8443));
+        assert_eq!(named.len(), 2);
+    }
+
+    /// Naming one port does not promote the leftover to `http`. Doing so would
+    /// invent the fact — *this* is the listener the world dials — that naming
+    /// exists to state, and would do it precisely for the author who has shown
+    /// they name ports deliberately.
+    #[test]
+    fn an_unnamed_sibling_of_a_named_port_becomes_its_number_not_http() {
+        let named = declared_port_names(&mesh(vec![
+            workload_spec::MeshPort::pinned("metrics", 9090),
+            workload_spec::MeshPort::anonymous(8080),
+        ]));
+        assert_eq!(named.get("metrics"), Some(&9090));
+        assert_eq!(named.get("8080"), Some(&8080));
+        assert_eq!(named.get(DEFAULT_PORT_NAME), None);
+    }
+
+    /// A name-only entry has no number yet, so it cannot appear in a
+    /// `name -> port` map. It must not fabricate one and must not drag the rest
+    /// of the list down with it.
+    #[test]
+    fn a_name_only_port_is_absent_until_something_allocates_it() {
+        let named = declared_port_names(&mesh(vec![
+            workload_spec::MeshPort::named("wss"),
+            workload_spec::MeshPort::pinned("http", 8080),
+        ]));
+        assert_eq!(named.get("http"), Some(&8080));
+        assert_eq!(named.get("wss"), None);
+        assert_eq!(named.len(), 1);
+    }
+
+    // ── declared_port_specs / reject_unresolved_ports (R844-F21) ─────────────
+
+    fn spec_by_name(specs: &[ports::PortSpec], name: &str) -> Option<Option<u16>> {
+        specs.iter().find(|s| s.name == name).map(|s| s.pin)
+    }
+
+    /// The property that keeps allocation and publication one reading: every
+    /// port `declared_port_names` can name appears in the spec set under
+    /// exactly that name, carrying exactly that number as its pin.
+    #[test]
+    fn every_numbered_port_lowers_under_the_name_it_is_published_by() {
+        for declaration in [
+            vec![],
+            workload_spec::MeshExpose::anonymous_ports([8080]),
+            workload_spec::MeshExpose::anonymous_ports([8080, 9090]),
+            vec![
+                workload_spec::MeshPort::pinned("http", 8080),
+                workload_spec::MeshPort::anonymous(9090),
+            ],
+        ] {
+            let m = mesh(declaration.clone());
+            let names = declared_port_names(&m);
+            let specs = declared_port_specs(&m);
+            for (name, &number) in &names {
+                assert_eq!(
+                    spec_by_name(&specs, name),
+                    Some(Some(number)),
+                    "{declaration:?} -> {name}"
+                );
+            }
+            assert_eq!(specs.len(), names.len(), "{declaration:?}");
+        }
+    }
+
+    /// The whole point of the lowering: a name-only port becomes an unpinned
+    /// spec, which is what "the supervisor still owes this port a number"
+    /// looks like to an allocator.
+    #[test]
+    fn a_name_only_port_lowers_to_an_unpinned_spec() {
+        let specs = declared_port_specs(&mesh(vec![
+            workload_spec::MeshPort::named("wss"),
+            workload_spec::MeshPort::pinned("http", 8080),
+        ]));
+        assert_eq!(spec_by_name(&specs, "wss"), Some(None));
+        assert_eq!(spec_by_name(&specs, "http"), Some(Some(8080)));
+        assert_eq!(specs.len(), 2);
+    }
+
+    /// A number is lowered as a `pin`, never honoured here. What a written
+    /// number means is a per-tier decision (R844-F14) and this function does
+    /// not know which tier it is feeding.
+    #[test]
+    fn a_stated_number_is_lowered_as_a_pin_not_resolved() {
+        let specs = declared_port_specs(&mesh(vec![workload_spec::MeshPort::pinned("https", 443)]));
+        assert_eq!(spec_by_name(&specs, "https"), Some(Some(443)));
+    }
+
+    /// The hostile-spec case `declared_port_names` already guards: the postcard
+    /// wire is not validated, so a name-only entry duplicating a numbered
+    /// sibling's name must not produce two specs under one name — the allocator
+    /// would reject the set and a legal manifest would be blamed for it.
+    #[test]
+    fn a_name_only_duplicate_of_a_numbered_port_lowers_once() {
+        let specs = declared_port_specs(&mesh(vec![
+            workload_spec::MeshPort::pinned("http", 8080),
+            workload_spec::MeshPort::named("http"),
+        ]));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(spec_by_name(&specs, "http"), Some(Some(8080)));
+    }
+
+    /// R844-B22: `workload_spec::validate::select_mesh_port` has to name the
+    /// default port too, and it cannot import this constant — kamaji sits above
+    /// workload-spec in the publish DAG (`yah-base <- {qed,kamaji} <- yubaba`),
+    /// so the dependency would invert the graph. The two are therefore agreed
+    /// by convention, and this is the thing that makes the convention hold: if
+    /// either side ever renames `http`, a dependent workload's `FromMesh` URL
+    /// and its `PORT` env would silently disagree about which listener is the
+    /// default. Asserted here because kamaji is the lower of the two crates
+    /// that can see both.
+    #[test]
+    fn default_port_name_agrees_with_the_mesh_resolver() {
+        assert_eq!(
+            DEFAULT_PORT_NAME,
+            workload_spec::validate::DEFAULT_PORT_NAME
+        );
+        assert_eq!(DEFAULT_PORT_NAME, ports::HTTP);
+    }
+
+    #[test]
+    fn a_container_backend_refuses_a_port_it_cannot_allocate() {
+        let declared = mesh(vec![
+            workload_spec::MeshPort::pinned("http", 8080),
+            workload_spec::MeshPort::named("wss"),
+        ]);
+        for backend in [Backend::Containerd, Backend::Docker] {
+            let err = reject_unresolved_ports("api", &declared, backend)
+                .expect_err("a name-only port has no number a container can bind");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("wss"), "must name the port; got: {msg}");
+            assert!(
+                !msg.contains("8080"),
+                "must not blame the port that is fine; got: {msg}"
+            );
+            assert!(
+                msg.contains("api"),
+                "must name the workload; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_numbered_declaration_passes_every_container_backend() {
+        let declared = mesh(workload_spec::MeshExpose::anonymous_ports([8080, 9090]));
+        assert!(reject_unresolved_ports("api", &declared, Backend::Containerd).is_ok());
+        assert!(reject_unresolved_ports("api", &declared, Backend::Docker).is_ok());
+    }
+
+    /// `validate::shape` rejects this, but the postcard wire is not validated,
+    /// so the answer still has to be the same on every node.
+    #[test]
+    fn a_name_colliding_with_a_siblings_number_resolves_deterministically() {
+        let collide = mesh(vec![
+            workload_spec::MeshPort::pinned("8080", 9090),
+            workload_spec::MeshPort::anonymous(8080),
+        ]);
+        let reversed = mesh(vec![
+            workload_spec::MeshPort::anonymous(8080),
+            workload_spec::MeshPort::pinned("8080", 9090),
+        ]);
+        // The declared name wins in both orders — it is the only half an author
+        // actually wrote.
+        assert_eq!(declared_port_names(&collide).get("8080"), Some(&9090));
+        assert_eq!(declared_port_names(&collide), declared_port_names(&reversed));
     }
 }

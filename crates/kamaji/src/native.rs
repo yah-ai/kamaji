@@ -161,7 +161,7 @@ struct WorkloadHandle {
     /// the `--listen` argument so it cannot drift from what the child binds.
     /// Recording it here is what lets `list_workloads` report a resolved port
     /// on every sweep.
-    ports: Vec<u16>,
+    ports: std::collections::BTreeMap<String, u16>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     /// The pid of the currently-running child, or `0` when no child is running
@@ -181,15 +181,77 @@ struct WorkloadHandle {
 pub struct NativeRuntime {
     state_dir: PathBuf,
     workloads: Mutex<HashMap<String, WorkloadHandle>>,
+    /// Numbers for the ports a manifest names but does not number (R844-F21).
+    ///
+    /// [`crate::ports::LedgerPorts`] rather than `EphemeralPorts`, and it opens
+    /// on the *same* `state_dir` the bundle path's ledger uses
+    /// (`kamaji-bin`'s `BundleBackend`), which is deliberate on both counts: a
+    /// native workload's port is published into a service record and rendered
+    /// into an ingress upstream, so it must survive a supervisor restart, and
+    /// one ledger per state dir is what stops this backend and the bundle
+    /// backend handing the same number to two workloads on one node.
+    ports: crate::ports::LedgerPorts,
 }
 
 impl NativeRuntime {
-    /// `state_dir` holds per-workload log captures; created on demand.
+    /// `state_dir` holds per-workload log captures and the port ledger; created
+    /// on demand.
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        let state_dir = state_dir.into();
         Self {
-            state_dir: state_dir.into(),
+            ports: crate::ports::LedgerPorts::open(&state_dir),
+            state_dir,
             workloads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Give a number to every port the spec names but does not number
+    /// (R844-F21), returning the spec that results.
+    ///
+    /// `None` means the spec already states every number — the common case,
+    /// and the one where cloning it would buy nothing.
+    ///
+    /// **Ports that already carry a number are left alone**, and that is the
+    /// load-bearing half rather than an optimisation. On this backend a number
+    /// in `expose.mesh.ports` is not an operator's pin: it is the bind address
+    /// a caller *already resolved* (see [`WorkloadHandle::ports`]), and the
+    /// W272 bundle path parses it straight back off `--listen`. Handing it to
+    /// the allocator as a [`crate::ports::PortSpec::pin`] would make
+    /// `LedgerPorts` reject the very port it just handed out, turning every
+    /// existing bundle deploy into a bring-up failure.
+    fn resolve_declared_ports(
+        &self,
+        spec: &WorkloadSpec,
+        bind_ip: Ipv4Addr,
+    ) -> Result<Option<WorkloadSpec>> {
+        use crate::ports::PortAllocator;
+
+        let wanted: Vec<crate::ports::PortSpec> = crate::declared_port_specs(&spec.expose.mesh)
+            .into_iter()
+            .filter(|port| port.pin.is_none())
+            .collect();
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+
+        let ident = spec.expose.mesh.identity.0.clone();
+        let resolved = self
+            .ports
+            .resolve_set(&ident, std::net::IpAddr::V4(bind_ip), &wanted)
+            .with_context(|| {
+                format!("workload {ident}: allocating the ports its manifest names")
+            })?;
+
+        let mut spec = spec.clone();
+        for port in &mut spec.expose.mesh.ports {
+            if port.number.is_some() {
+                continue;
+            }
+            if let Some(&number) = port.name.as_deref().and_then(|name| resolved.get(name)) {
+                port.number = Some(number);
+            }
+        }
+        Ok(Some(spec))
     }
 }
 
@@ -275,6 +337,12 @@ async fn spawn_child(
         .kill_on_drop(false);
     if let Some(workdir) = &spec.workdir {
         cmd.current_dir(workdir);
+    }
+    // "What port did I get?" — one contract (R844-T13). The map is built by the
+    // same call that fills `WorkloadState::ports`, so what the workload reads and
+    // what kamaji publishes cannot drift apart.
+    for (k, v) in crate::ports::port_env(&crate::declared_port_names(&spec.expose.mesh)) {
+        cmd.env(k, v);
     }
     // Spec env layers OVER the inherited environment, so a workload can override
     // a node default without the node having to know about the workload.
@@ -668,6 +736,15 @@ impl Kamaji for NativeRuntime {
         workload_spec::admission::check(spec)
             .map_err(|e| anyhow!("workload {} not admitted: {e}", spec.name))?;
 
+        // R844-F21: `ports = ["http", "wss"]` is a request, not a fact. Settle
+        // it here, before the fork, and write the numbers back onto the spec —
+        // then the `PORT_<NAME>` env the child reads, `declared_port_names`,
+        // `DeployResult::ports` and the service record downstream of them all
+        // derive from ONE set of numbers instead of from a declaration and a
+        // measurement that are free to disagree.
+        let allocated = self.resolve_declared_ports(spec, mesh.mesh_ip)?;
+        let spec = allocated.as_ref().unwrap_or(spec);
+
         let ident = spec.expose.mesh.identity.clone();
 
         // Idempotent: clear any prior workload with the same identity.
@@ -698,7 +775,7 @@ impl Kamaji for NativeRuntime {
             ident.0,
             WorkloadHandle {
                 mesh_ip: mesh.mesh_ip,
-                ports: spec.expose.mesh.ports.clone(),
+                ports: crate::declared_port_names(&spec.expose.mesh),
                 stdout_path,
                 stderr_path,
                 pid,
@@ -712,7 +789,7 @@ impl Kamaji for NativeRuntime {
             container_id: format!("native-{start_pid}"),
             mesh_ip: mesh.mesh_ip,
             task_pid: start_pid,
-            ports: spec.expose.mesh.ports.clone(),
+            ports: crate::declared_port_names(&spec.expose.mesh),
         })
     }
 
@@ -870,7 +947,7 @@ impl Kamaji for NativeRuntime {
             task_pid: new_pid,
             // A graceful upgrade is explicitly the *same* listener handed to a
             // new generation, so the resolved port is unchanged by construction.
-            ports: spec.expose.mesh.ports.clone(),
+            ports: crate::declared_port_names(&spec.expose.mesh),
         })
     }
 
@@ -943,7 +1020,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.to_string()),
-                    ports: vec![],
+                    ports: MeshExpose::anonymous_ports([]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -999,6 +1076,231 @@ mod tests {
         runtime.teardown_workload(&ident).await.unwrap();
         assert!(runtime.get_workload(&ident).await.unwrap().is_none());
         // Idempotent.
+        runtime.teardown_workload(&ident).await.unwrap();
+    }
+
+    /// R844-T13: a native child learns its port from `PORT` / `PORT_HTTP`, one
+    /// contract, off the same map `WorkloadState::ports` reports. Driven through
+    /// a real fork rather than asserted on the map, because the bug this
+    /// prevents is the injection being skipped, not the map being wrong.
+    #[tokio::test]
+    async fn a_native_child_reads_its_port_from_the_one_env_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-port-env",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo port=$PORT; echo port_http=$PORT_HTTP; \
+                 echo legacy=$KAMAJI_BUNDLE_PORT/$MF_PORT; sleep 30"
+                    .into(),
+            ],
+        );
+        spec.expose.mesh.ports = MeshExpose::anonymous_ports([48211]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut logs = runtime
+            .stream_logs(
+                &ident,
+                LogOpts {
+                    tail: None,
+                    follow: false,
+                    stream: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut captured = String::new();
+        while let Some(ev) = logs.next().await {
+            captured.push_str(&ev.message);
+            captured.push('\n');
+        }
+        runtime.teardown_workload(&ident).await.unwrap();
+
+        assert!(
+            captured.contains("port=48211"),
+            "bare PORT is the alias a single-listener workload reads; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("port_http=48211"),
+            "PORT_HTTP must be the same number, not a second fact; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("legacy=/"),
+            "neither retired spelling may be produced; got:\n{captured}"
+        );
+    }
+
+    /// R844-F21: `ports = ["http", "wss"]` binds something.
+    ///
+    /// Driven through a REAL fork rather than asserted on the returned map,
+    /// because "the allocator returned two numbers" was already true before
+    /// this ticket and bought nothing — the gap was that no number ever reached
+    /// a process. So the assertion is that the child *read* them, and that the
+    /// numbers it read are the ones `DeployResult` published.
+    #[tokio::test]
+    async fn a_manifest_that_names_its_ports_gets_numbers_the_child_can_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-named-ports",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo http=$PORT_HTTP; echo wss=$PORT_WSS; echo bare=$PORT; sleep 30".into(),
+            ],
+        );
+        spec.expose.mesh.ports = vec![
+            workload_spec::MeshPort::named("http"),
+            workload_spec::MeshPort::named("wss"),
+        ];
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        let deployed = runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        let http = *deployed
+            .ports
+            .get("http")
+            .expect("the port named http was allocated");
+        let wss = *deployed
+            .ports
+            .get("wss")
+            .expect("the port named wss was allocated");
+        assert_ne!(
+            http, wss,
+            "two listeners cannot share one number ({http})"
+        );
+
+        // The same numbers reach the sweep that writes the service record —
+        // this is the leg the front door reads, so a DeployResult that agreed
+        // with nothing downstream would be the same silent gap in a new place.
+        let state = runtime.get_workload(&ident).await.unwrap().unwrap();
+        assert_eq!(state.ports.get("http"), Some(&http));
+        assert_eq!(state.ports.get("wss"), Some(&wss));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut logs = runtime
+            .stream_logs(
+                &ident,
+                LogOpts {
+                    tail: None,
+                    follow: false,
+                    stream: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut captured = String::new();
+        while let Some(ev) = logs.next().await {
+            captured.push_str(&ev.message);
+            captured.push('\n');
+        }
+        runtime.teardown_workload(&ident).await.unwrap();
+
+        assert!(
+            captured.contains(&format!("http={http}")),
+            "the child must read the allocated http port; got:\n{captured}"
+        );
+        assert!(
+            captured.contains(&format!("wss={wss}")),
+            "the child must read the allocated wss port; got:\n{captured}"
+        );
+        assert!(
+            captured.contains(&format!("bare={http}")),
+            "bare PORT stays an alias for the port named http, never a third \
+             number; got:\n{captured}"
+        );
+    }
+
+    /// A named port keeps its number across a supervisor restart — the ledger
+    /// is keyed `(ident, name)`, so this is per PORT, not merely per workload.
+    ///
+    /// It matters because the number is published into a service record and
+    /// rendered into an ingress upstream: a port that moved on every restart
+    /// would make the front door's address correct only until kamaji bounced.
+    #[tokio::test]
+    async fn allocated_ports_survive_a_supervisor_restart_name_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = native_spec(
+            "native-stable-ports",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        spec.expose.mesh.ports = vec![
+            workload_spec::MeshPort::named("http"),
+            workload_spec::MeshPort::named("wss"),
+        ];
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        let first = {
+            let runtime = NativeRuntime::new(tmp.path());
+            let deployed = runtime.deploy_workload(&spec, &mesh).await.unwrap();
+            runtime.teardown_workload(&ident).await.unwrap();
+            deployed.ports
+        };
+
+        // A whole new NativeRuntime over the same state dir is what a restarted
+        // kamaji is.
+        let runtime = NativeRuntime::new(tmp.path());
+        let second = runtime.deploy_workload(&spec, &mesh).await.unwrap().ports;
+        runtime.teardown_workload(&ident).await.unwrap();
+
+        assert_eq!(
+            first, second,
+            "each named port must come back with the number the ledger holds"
+        );
+    }
+
+    /// A number already in the spec is left alone — it is the bind address a
+    /// caller resolved, not an operator's pin, and `LedgerPorts` would reject
+    /// it as one. Without this the W272 bundle path (which writes the resolved
+    /// port onto the spec and forks native) would fail at every bring-up.
+    #[tokio::test]
+    async fn a_number_already_in_the_spec_is_not_re_resolved_as_a_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-resolved-already",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        // 48213 is not world-fixed, so a pin carrying it would be an error.
+        spec.expose.mesh.ports = MeshExpose::anonymous_ports([48213]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        let deployed = runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        assert_eq!(deployed.ports.get("http"), Some(&48213));
+        runtime.teardown_workload(&ident).await.unwrap();
+    }
+
+    /// A manifest that states one port and names another gets exactly one
+    /// allocation. The mixed spelling is the one most likely to be written by
+    /// hand, and the failure it guards against is the allocator either
+    /// re-resolving the stated port (an error) or skipping the named one.
+    #[tokio::test]
+    async fn a_mixed_manifest_allocates_only_the_port_that_has_no_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-mixed-ports",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        spec.expose.mesh.ports = vec![
+            workload_spec::MeshPort::pinned("http", 48215),
+            workload_spec::MeshPort::named("metrics"),
+        ];
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        let deployed = runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        assert_eq!(deployed.ports.get("http"), Some(&48215));
+        let metrics = *deployed.ports.get("metrics").expect("metrics allocated");
+        assert_ne!(metrics, 48215);
         runtime.teardown_workload(&ident).await.unwrap();
     }
 

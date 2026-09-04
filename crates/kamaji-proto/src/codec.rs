@@ -140,6 +140,8 @@ mod tests {
                     state: WorkloadState::Running,
                     pid: Some(1234),
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
                 WorkloadEntry {
                     mesh_ident: None,
@@ -147,6 +149,8 @@ mod tests {
                     state: WorkloadState::Draining,
                     pid: Some(1235),
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
                 WorkloadEntry {
                     mesh_ident: None,
@@ -154,6 +158,8 @@ mod tests {
                     state: WorkloadState::Pending,
                     pid: None,
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
             ],
         };
@@ -587,7 +593,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("noisetable-api.pdx".into()),
-                    ports: vec![8080, 9090],
+                    ports: MeshExpose::anonymous_ports([8080, 9090]),
                     allow_from: vec![
                         workload_spec::MeshPeer::Tier(TierTag("private".into())),
                         workload_spec::MeshPeer::Tier(TierTag("tenant".into())),
@@ -978,6 +984,8 @@ mod tests {
                     state: WorkloadState::Pending,
                     pid: None,
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
                 WorkloadEntry {
                     mesh_ident: None,
@@ -985,6 +993,8 @@ mod tests {
                     state: WorkloadState::Starting,
                     pid: Some(2),
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
                 WorkloadEntry {
                     mesh_ident: None,
@@ -992,6 +1002,8 @@ mod tests {
                     state: WorkloadState::Running,
                     pid: Some(3),
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
                 WorkloadEntry {
                     mesh_ident: None,
@@ -999,6 +1011,8 @@ mod tests {
                     state: WorkloadState::Draining,
                     pid: Some(4),
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
                 WorkloadEntry {
                     mesh_ident: None,
@@ -1006,6 +1020,8 @@ mod tests {
                     state: WorkloadState::Exited,
                     pid: None,
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
                 WorkloadEntry {
                     mesh_ident: None,
@@ -1013,6 +1029,8 @@ mod tests {
                     state: WorkloadState::Failed,
                     pid: None,
                     ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
                 },
             ],
         });

@@ -61,6 +61,7 @@
 #![cfg(feature = "containerd-integration")]
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use containerd_client::{
@@ -71,7 +72,8 @@ use containerd_client::{
         snapshots::{snapshots_client::SnapshotsClient, MountsRequest, PrepareSnapshotRequest},
         tasks_client::TasksClient,
         version_client::VersionClient,
-        GetImageRequest, GetRequest, ReadContentRequest, WaitRequest,
+        CreateTaskRequest, DeleteTaskRequest, GetImageRequest, GetRequest, KillRequest,
+        ReadContentRequest, WaitRequest,
     },
     tonic::{self, transport::Channel, Request},
     with_namespace,
@@ -511,6 +513,228 @@ pub async fn get_task_status(
         Err(status) if status.code() == tonic::Code::NotFound => Ok(TaskProbe::NoTask),
         Err(e) => Err(anyhow!("task get failed: {e}")),
     }
+}
+
+// ── Task reaping (R854) ───────────────────────────────────────────────────────
+
+/// Containerd task status code for a task whose process has exited
+/// (`containerd.v1.types.Status::Stopped`). `Tasks.Delete` only succeeds on a
+/// task in this state — deleting a RUNNING one is a `FailedPrecondition`.
+const TASK_STATUS_STOPPED: i32 = 3;
+
+/// `SIGKILL` — the hard-teardown signal. A graceful stop goes through the
+/// spec's `stop_policy` signal well before anything reaches here.
+const SIGKILL: u32 = 9;
+
+/// How long [`reap_task`] will wait for a SIGKILL'd task to actually exit and
+/// its record to be deletable.
+///
+/// A redeploy has to outlive the kernel delivering SIGKILL, the process
+/// unwinding, and the shim reaping and publishing the exit — none of which is
+/// instantaneous under load. Both backends previously "waited" with a blind
+/// 500 ms sleep (inlined) or not at all (sibling), which is the R854 bug:
+/// the delete raced the exit, failed, was discarded, and the *next* deploy's
+/// `CreateTask` collided with the survivor ("task <ident>: already exists").
+/// 15 s is far above the observed exit latency and still well under any
+/// operator's patience for a deploy.
+pub const TASK_REAP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// SIGKILL a container's task, WAIT for it to actually die, and delete its
+/// record — returning `Ok(())` only once containerd reports no task for
+/// `container_id`.
+///
+/// This is the half of teardown a redeploy depends on: containerd's container
+/// record and its task are separate objects, and deleting the container while
+/// its task survives leaves an orphan the next `CreateTask` collides with. So
+/// the postcondition here is checked, not assumed — the call returns an error
+/// naming the surviving task's status rather than reporting a reap it did not
+/// perform.
+///
+/// Idempotent: a container with no task (never started, already reaped, or
+/// absent entirely) is `Ok(())` on the first probe, without signalling
+/// anything.
+pub async fn reap_task(
+    tasks: &mut TasksClient<Channel>,
+    namespace: &str,
+    container_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let mut ops = ContainerdTaskOps { tasks, namespace };
+    reap_task_with(&mut ops, container_id, timeout).await
+}
+
+/// What a `Tasks.Delete` attempt told the reap loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// Delete succeeded, or the record was already gone (`NotFound`) — either
+    /// way the postcondition holds and no re-probe is needed.
+    Reaped,
+    /// Containerd refused (in practice `FailedPrecondition`: "task must be
+    /// stopped before deletion") — the task is still there, try again.
+    Refused,
+}
+
+/// The containerd task operations [`reap_task`] drives, behind a trait so the
+/// retry/deadline logic — the part R854 got wrong — can be tested without a
+/// containerd socket. The camp's build hosts have no containerd, so a loop
+/// that only exists inside a gRPC call is a loop nothing ever checks.
+#[allow(async_fn_in_trait)]
+pub trait TaskOps {
+    async fn probe(&mut self, container_id: &str) -> Result<TaskProbe>;
+    /// SIGKILL the task. Best-effort by contract: a missing or already-dead
+    /// task is not an error worth surfacing, since the loop re-probes anyway.
+    async fn signal_kill(&mut self, container_id: &str);
+    /// Block until the task's process exits, or `budget` elapses.
+    async fn await_exit(&mut self, container_id: &str, budget: Duration);
+    async fn delete(&mut self, container_id: &str) -> DeleteOutcome;
+}
+
+/// The reap loop itself, over any [`TaskOps`]. See [`reap_task`] for what it
+/// guarantees; this shape exists so the guarantee is testable.
+pub async fn reap_task_with<O: TaskOps>(
+    ops: &mut O,
+    container_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    // Nothing to reap is the common case (first deploy of an ident) — don't
+    // pay a kill round-trip for it. `MissingProcess` and a failed probe are
+    // both "can't prove it's gone", so they fall through to the loop.
+    if let Ok(TaskProbe::NoTask) = ops.probe(container_id).await {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + timeout;
+    // Assigned by the probe at the bottom of every pass, and only read after
+    // it — the error message names what the survivor's status actually was.
+    let mut last_status: Option<i32>;
+    let mut backoff = Duration::from_millis(25);
+
+    loop {
+        // Repeated each pass: a task that raced into existence between probes
+        // still gets signalled, and SIGKILL on an already-dead task is benign.
+        ops.signal_kill(container_id).await;
+
+        // Wait on the shim's exit event rather than polling it, bounded by
+        // whatever is left of the deadline — a wait that never returns must
+        // not hold the deploy open forever.
+        if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            ops.await_exit(container_id, remaining).await;
+        }
+
+        if ops.delete(container_id).await == DeleteOutcome::Reaped {
+            return Ok(());
+        }
+
+        match ops.probe(container_id).await {
+            Ok(TaskProbe::NoTask) => return Ok(()),
+            Ok(TaskProbe::Status { code, .. }) => last_status = Some(code),
+            Ok(TaskProbe::MissingProcess) | Err(_) => last_status = None,
+        }
+
+        if Instant::now() >= deadline {
+            let detail = match last_status {
+                Some(TASK_STATUS_STOPPED) => {
+                    "task is STOPPED but its record could not be deleted".to_string()
+                }
+                Some(code) => format!("task still present with status code {code}"),
+                None => "task status could not be read".to_string(),
+            };
+            bail!("timed out after {timeout:?} reaping task for {container_id}: {detail}");
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(500));
+    }
+}
+
+/// [`TaskOps`] against a live containerd `Tasks` service.
+struct ContainerdTaskOps<'a> {
+    tasks: &'a mut TasksClient<Channel>,
+    namespace: &'a str,
+}
+
+impl TaskOps for ContainerdTaskOps<'_> {
+    async fn probe(&mut self, container_id: &str) -> Result<TaskProbe> {
+        get_task_status(self.tasks, self.namespace, container_id).await
+    }
+
+    async fn signal_kill(&mut self, container_id: &str) {
+        let req = KillRequest {
+            container_id: container_id.to_string(),
+            exec_id: String::new(),
+            // `all` reaches every process in the task's cgroup, not just pid 1
+            // — a forked child holding the cgroup open keeps the task from
+            // reaching STOPPED, which is exactly the state that blocks delete.
+            all: true,
+            signal: SIGKILL,
+        };
+        let req = with_namespace!(req, self.namespace);
+        let _ = self.tasks.kill(req).await;
+    }
+
+    async fn await_exit(&mut self, container_id: &str, budget: Duration) {
+        // `Tasks.Wait` returns immediately for an already-exited task and does
+        // NOT reap it (unlike Delete), so calling it before the delete is safe.
+        let req = WaitRequest {
+            container_id: container_id.to_string(),
+            exec_id: String::new(),
+        };
+        let req = with_namespace!(req, self.namespace);
+        let _ = tokio::time::timeout(budget, self.tasks.wait(req)).await;
+    }
+
+    async fn delete(&mut self, container_id: &str) -> DeleteOutcome {
+        let req = DeleteTaskRequest {
+            container_id: container_id.to_string(),
+        };
+        let req = with_namespace!(req, self.namespace);
+        match self.tasks.delete(req).await {
+            Ok(_) => DeleteOutcome::Reaped,
+            // Already gone is the postcondition we wanted.
+            Err(status) if status.code() == tonic::Code::NotFound => DeleteOutcome::Reaped,
+            Err(_) => DeleteOutcome::Refused,
+        }
+    }
+}
+
+/// `Tasks.Create`, self-healing over a stale task record (R854).
+///
+/// Returns the new task's pid. On `AlreadyExists` — a prior generation's task
+/// outliving the teardown that was supposed to reap it — this reaps the
+/// survivor via [`reap_task`] and retries the create exactly once, so a
+/// back-to-back redeploy is idempotent instead of 500ing and leaving the
+/// workload down. Any other error, and a second `AlreadyExists`, propagate:
+/// one retry distinguishes a lost race from a genuine invariant break.
+pub async fn create_task_reaping_stale(
+    tasks: &mut TasksClient<Channel>,
+    namespace: &str,
+    req: CreateTaskRequest,
+) -> Result<u32> {
+    let container_id = req.container_id.clone();
+    let retry_req = req.clone();
+
+    let first = tasks.create(with_namespace!(req, namespace)).await;
+    let err = match first {
+        Ok(resp) => return Ok(resp.into_inner().pid),
+        Err(status) if status.code() == tonic::Code::AlreadyExists => status,
+        Err(status) => return Err(anyhow!(status)),
+    };
+
+    reap_task(tasks, namespace, &container_id, TASK_REAP_TIMEOUT)
+        .await
+        .with_context(|| {
+            format!("task for {container_id} already exists ({err}) and could not be reaped")
+        })?;
+
+    tasks
+        .create(with_namespace!(retry_req, namespace))
+        .await
+        .map(|resp| resp.into_inner().pid)
+        .map_err(|e| {
+            anyhow!(e).context(format!(
+                "recreating task for {container_id} after reaping a stale one"
+            ))
+        })
 }
 
 // ── OCI runtime-spec building ──────────────────────────────────────────────────
@@ -989,6 +1213,165 @@ pub fn build_oci_spec_with(
 }
 
 #[cfg(test)]
+mod reap_tests {
+    //! R854 — the reap loop's contract, exercised through [`TaskOps`] so it
+    //! runs on a machine with no containerd. The live bug these pin down: the
+    //! old code killed the task, waited a fixed 500 ms (or not at all), fired
+    //! one delete, discarded its result, and reported success — so a task
+    //! slower than that survived, and the next deploy's `CreateTask` collided
+    //! with it.
+
+    use super::*;
+
+    /// A task that reports RUNNING and refuses deletion for its first
+    /// `refusals` delete attempts, then stops and lets itself be reaped.
+    struct SlowExit {
+        refusals: usize,
+        kills: usize,
+        deletes: usize,
+        gone: bool,
+    }
+
+    impl SlowExit {
+        fn new(refusals: usize) -> Self {
+            Self {
+                refusals,
+                kills: 0,
+                deletes: 0,
+                gone: false,
+            }
+        }
+    }
+
+    impl TaskOps for SlowExit {
+        async fn probe(&mut self, _: &str) -> Result<TaskProbe> {
+            Ok(if self.gone {
+                TaskProbe::NoTask
+            } else {
+                // 2 == RUNNING.
+                TaskProbe::Status {
+                    code: 2,
+                    pid: 4242,
+                    exit_status: 0,
+                }
+            })
+        }
+
+        async fn signal_kill(&mut self, _: &str) {
+            self.kills += 1;
+        }
+
+        async fn await_exit(&mut self, _: &str, _: Duration) {}
+
+        async fn delete(&mut self, _: &str) -> DeleteOutcome {
+            self.deletes += 1;
+            if self.deletes > self.refusals {
+                self.gone = true;
+                DeleteOutcome::Reaped
+            } else {
+                DeleteOutcome::Refused
+            }
+        }
+    }
+
+    /// A task that never dies — nothing kills it, nothing deletes it.
+    struct Immortal {
+        status: i32,
+        kills: usize,
+    }
+
+    impl TaskOps for Immortal {
+        async fn probe(&mut self, _: &str) -> Result<TaskProbe> {
+            Ok(TaskProbe::Status {
+                code: self.status,
+                pid: 7,
+                exit_status: 0,
+            })
+        }
+
+        async fn signal_kill(&mut self, _: &str) {
+            self.kills += 1;
+        }
+
+        async fn await_exit(&mut self, _: &str, _: Duration) {}
+
+        async fn delete(&mut self, _: &str) -> DeleteOutcome {
+            DeleteOutcome::Refused
+        }
+    }
+
+    /// No task at all — the first-deploy case.
+    struct NoTask {
+        kills: usize,
+    }
+
+    impl TaskOps for NoTask {
+        async fn probe(&mut self, _: &str) -> Result<TaskProbe> {
+            Ok(TaskProbe::NoTask)
+        }
+
+        async fn signal_kill(&mut self, _: &str) {
+            self.kills += 1;
+        }
+
+        async fn await_exit(&mut self, _: &str, _: Duration) {}
+
+        async fn delete(&mut self, _: &str) -> DeleteOutcome {
+            unreachable!("must not delete a task that was never there");
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_until_the_task_is_actually_gone() {
+        // Three refused deletes is what the old fixed-sleep shape reported as
+        // a successful teardown; the loop has to keep going instead.
+        let mut ops = SlowExit::new(3);
+        reap_task_with(&mut ops, "yah-cloud-admin", Duration::from_secs(5))
+            .await
+            .expect("task eventually reaped");
+        assert_eq!(ops.deletes, 4, "kept retrying the delete until it took");
+        assert!(ops.kills >= 4, "re-signalled on every pass");
+        assert!(ops.gone);
+    }
+
+    #[tokio::test]
+    async fn reports_the_survivor_instead_of_a_phantom_success() {
+        let mut ops = Immortal { status: 2, kills: 0 };
+        let err = reap_task_with(&mut ops, "yah-cloud-admin", Duration::from_millis(150))
+            .await
+            .expect_err("a task that never dies must not report a reap");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("yah-cloud-admin"), "names the container: {msg}");
+        assert!(msg.contains("status code 2"), "names the status: {msg}");
+        assert!(ops.kills >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_but_undeletable_task_says_so() {
+        let mut ops = Immortal {
+            status: TASK_STATUS_STOPPED,
+            kills: 0,
+        };
+        let err = reap_task_with(&mut ops, "stuck", Duration::from_millis(150))
+            .await
+            .expect_err("undeletable record is a failure");
+        assert!(
+            format!("{err:#}").contains("STOPPED but its record could not be deleted"),
+            "distinguishes a stuck record from a live process: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_task_is_a_silent_no_op() {
+        let mut ops = NoTask { kills: 0 };
+        reap_task_with(&mut ops, "fresh", Duration::from_secs(5))
+            .await
+            .expect("nothing to reap");
+        assert_eq!(ops.kills, 0, "must not SIGKILL on a first deploy");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use workload_spec::{
@@ -1033,7 +1416,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.to_string()),
-                    ports: vec![],
+                    ports: MeshExpose::anonymous_ports([]),
                     allow_from: vec![],
                 },
                 public: None,

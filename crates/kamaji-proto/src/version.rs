@@ -42,6 +42,42 @@ use serde::{Deserialize, Serialize};
 /// postcard has no field names to notice are missing. The bump turns that into
 /// a handshake refusal naming the version.
 ///
+/// V5 (R852-B4) added `spec_digest` to [`crate::WorkloadEntry`] — the digest of
+/// the spec kamaji was handed, which is what lets a reconciler tell an unchanged
+/// declaration from a changed one instead of re-deploying (and, on the JIT tier,
+/// re-binding) every workload on every sweep. Exactly the V4 situation: a field
+/// appended to an existing *struct* shifts every byte after it, `#[serde(default)]`
+/// cannot help because postcard has no field names to notice are missing, and the
+/// bump is what turns a mid-frame decode error into a handshake refusal naming the
+/// version.
+///
+/// V6 (R844-F15) added `named_ports` to [`crate::WorkloadEntry`] — the same
+/// resolved ports keyed by port name, so a consumer can ask for `wss` instead
+/// of guessing which of three numbers it is. Third instance of the identical
+/// V2/V4/V5 situation, and it cost a debugging cycle to re-learn: the field was
+/// first written with `#[serde(default, skip_serializing_if = ...)]` on the
+/// theory that an optional field is compatible. On a *self-describing* format
+/// it would be. Here it broke the wire against a peer of its OWN version —
+/// `skip_serializing_if` omits bytes the positional decoder still reads,
+/// so `List` came back `PeerClosed` — which is a nastier failure than the skew
+/// this enum guards, because it needs no version mismatch at all. Rule, stated
+/// once for whoever adds V7: **every field on a postcard message is mandatory
+/// and always encoded; the only compatibility mechanism here is this bump.**
+///
+/// V7 (R844-F17) changed `expose.mesh.ports` on [`workload_spec::MeshExpose`]
+/// from `Vec<u16>` to `Vec<MeshPort>`, so a manifest can *name* the ports every
+/// tier below already spoke by name. Unlike V2/V4/V5/V6 this is not a field
+/// appended to a struct — it is a field whose element type changed, inside
+/// `Workload::Container(WorkloadSpec)`, which the `Deploy` frame carries. On
+/// postcard a `Vec<u16>` is `len` followed by `len` varints; a `Vec<MeshPort>`
+/// is `len` followed by `len` two-`Option` structs. An unbumped peer decoding
+/// the wrong one does not fail cleanly at the port list — it consumes the wrong
+/// number of bytes and then misreads *every field after it* in the spec, which
+/// is how a wrong image or a wrong volume mount gets deployed instead of an
+/// error. The V6 rule applies unchanged and is the reason: **every field on a
+/// postcard message is mandatory and always encoded; the only compatibility
+/// mechanism here is this bump.**
+///
 /// The blast radius is one node: this protocol runs over a node-local UDS, and
 /// yubaba and kamaji self-install as a pair, so the skew window is a restart
 /// rather than a rolling fleet upgrade.
@@ -52,6 +88,9 @@ pub enum ProtocolVersion {
     V2,
     V3,
     V4,
+    V5,
+    V6,
+    V7,
 }
 
 impl Default for ProtocolVersion {
@@ -62,5 +101,5 @@ impl Default for ProtocolVersion {
 
 impl ProtocolVersion {
     /// The version this build of `kamaji-proto` produces by default.
-    pub const CURRENT: Self = Self::V4;
+    pub const CURRENT: Self = Self::V7;
 }

@@ -213,6 +213,62 @@ pub struct WorkloadEntry {
     /// workload declared.
     #[serde(default)]
     pub ports: Vec<u16>,
+    /// The same resolved ports, keyed by **port name** (R844-F15).
+    ///
+    /// [`Self::ports`] is three bare numbers: a consumer holding it cannot tell
+    /// which one is the websocket listener and has to guess by index or by
+    /// convention, which is wrong the first time a port moves. This carries the
+    /// names the supervisor's allocator assigned, so a peer resolving a service
+    /// asks for `wss` instead.
+    ///
+    /// **A new field here is a version bump, not a compatible addition, and it
+    /// must always be encoded.** This frame is *postcard* — positional, with no
+    /// field names on the wire — so `#[serde(default)]` cannot fill a missing
+    /// field and `skip_serializing_if` is actively wrong: omitting the bytes
+    /// produces a frame that even a *same-version* decoder cannot parse, since
+    /// it reads the next field's bytes out of this one's position. That is not
+    /// hypothetical — adding this field with `skip_serializing_if` is what made
+    /// `sibling_wire_e2e::accepted_deploy_appears_in_list_against_scripted_backend`
+    /// and `docker_backend_e2e::deploy_list_stop_through_kamaji_against_live_docker`
+    /// fail with `PeerClosed` on the `List` round-trip, mid-R844-F15. The
+    /// mechanism is the same one [`crate::ProtocolVersion`] documents for V4 and
+    /// V5; the bump for this field is **V6**.
+    ///
+    /// So there is no "peer that predates this field" case to handle: the
+    /// handshake refuses a mismatched version outright, which is exactly why
+    /// the bump exists. Both this and [`Self::ports`] are always populated by a
+    /// version-matched peer, and they describe the same ports — `ports` is the
+    /// anonymous view R844-F2 shipped, kept for callers that only want numbers.
+    ///
+    /// (The *other* wire this data crosses — yubaba's `GET /service-records` —
+    /// is JSON over HTTP between independently-versioned binaries across a
+    /// mixed fleet, and there the additive-field argument does hold. See
+    /// `yubaba::service_records::ServiceRecordWire::named_ports`. Do not carry
+    /// reasoning from that wire to this one.)
+    #[serde(default)]
+    pub named_ports: std::collections::BTreeMap<String, u16>,
+    /// Digest of the [`Workload`] this workload was deployed with (R852-B4),
+    /// as computed by [`crate::spec_digest`].
+    ///
+    /// This is what lets a reconciler tell an **unchanged** declaration from a
+    /// changed one without re-sending it. `Deploy` is idempotent by tearing
+    /// down — on the JIT tier it releases the held listen socket before binding
+    /// fresh — so a sweep that re-declares everything re-binds everything, and
+    /// kills any warm JIT child mid-life. Compare this against the digest of
+    /// the spec you were about to send and skip the deploy when they agree.
+    ///
+    /// `None` means **no digest on record**, which is not "no spec": kamaji
+    /// keeps this in memory alongside the deploy, so a restart, a workload
+    /// adopted from a backend that kamaji did not admit this process lifetime,
+    /// or a spec that would not encode all report `None`. `None` must be read
+    /// as "unknown, redeploy" — never as "unchanged".
+    ///
+    /// Read [`crate::digest`] before relying on equality: it is a sound
+    /// unchanged-check for specs whose maps are ordered and a best-effort one
+    /// for `HashMap`-carrying container specs, and the failure direction is
+    /// always toward a redundant redeploy rather than a missed one.
+    #[serde(default)]
+    pub spec_digest: Option<crate::digest::SpecDigest>,
 }
 
 /// Mesh-plane placement for a deployed workload (R599-F12) — yubaba's
