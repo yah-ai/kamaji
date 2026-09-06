@@ -417,6 +417,24 @@ pub enum YubabaToKamaji {
         request_id: RequestId,
         id: WorkloadId,
     },
+    /// Ask which execution backends this Kamaji can actually dispatch to
+    /// (R858-T4).
+    ///
+    /// Exists because the alternative is finding out at deploy time. On
+    /// 2026-09-03 the headscale appliance's owner moved to a node whose kamaji
+    /// had been started without `--native-exec-dir`; the deploy came back
+    /// `BackendRefused` *after* ownership had already moved, the failure was a
+    /// `warn!`, and the mesh had no coordination server for 37 hours. A
+    /// capability a scheduler can read before it places is the difference
+    /// between an ineligible candidate and an outage.
+    ///
+    /// Appended last to keep the postcard variant indices of the pre-existing
+    /// variants wire-stable, the same treatment [`Self::GracefulUpgrade`] and
+    /// [`Self::DeployStatus`] had — so this needs no [`ProtocolVersion`] bump.
+    /// An older Kamaji that does not know the variant fails the frame, which
+    /// the caller is expected to read as "capability unknown" and treat
+    /// permissively; see `yubaba`'s `NativeExecCapability`.
+    Capabilities { request_id: RequestId },
 }
 
 /// Kamaji → Yubaba message variants.
@@ -509,6 +527,41 @@ pub enum KamajiToYubaba {
         state: WorkloadState,
         detail: Option<String>,
     },
+    /// Response to [`YubabaToKamaji::Capabilities`] (R858-T4).
+    ///
+    /// Appended last to keep the postcard variant indices of the pre-existing
+    /// variants wire-stable.
+    CapabilitiesReport {
+        request_id: RequestId,
+        capabilities: NodeCapabilities,
+    },
+}
+
+/// What one Kamaji can actually dispatch to (R858-T4).
+///
+/// Deliberately a *struct* rather than a set of booleans on the message, so a
+/// later backend is a field here instead of a fourth reply variant — but note
+/// that adding a field IS a wire break (postcard is positional; see
+/// [`ProtocolVersion`]'s V2/V4/V5/V6 notes), so it costs a version bump. That
+/// is the right price: a scheduler silently reading a capability it did not
+/// actually receive is how the 37-hour outage happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCapabilities {
+    /// Whether this Kamaji can fork+exec a native (non-container) workload —
+    /// `true` exactly when it was built with the `native-exec` feature AND
+    /// started with `--native-exec-dir`.
+    ///
+    /// This is the fact whose absence produced `BackendRefused: workload
+    /// requests native host execution but no native backend is available` on
+    /// 2026-09-03, *after* appliance ownership had already moved to the node
+    /// that could not serve it.
+    pub native_exec: bool,
+    /// The directory native workloads are staged in, when `native_exec`. Not a
+    /// capability by itself — it is here because the caller's next question is
+    /// always "and is the binary I need sitting in it?", and answering that
+    /// without a second round trip is the difference between one probe and a
+    /// protocol.
+    pub native_exec_dir: Option<String>,
 }
 
 impl KamajiToYubaba {
@@ -533,7 +586,8 @@ impl KamajiToYubaba {
             | Self::DrainAck { request_id, .. }
             | Self::DrainCompleted { request_id, .. }
             | Self::WorkloadList { request_id, .. }
-            | Self::DeployStatusResult { request_id, .. } => Some(*request_id),
+            | Self::DeployStatusResult { request_id, .. }
+            | Self::CapabilitiesReport { request_id, .. } => Some(*request_id),
             Self::Error { request_id, .. } => *request_id,
             Self::Welcome { .. } | Self::WorkloadStarted { .. } | Self::WorkloadExited { .. } => {
                 None
@@ -596,6 +650,13 @@ mod reply_correlation_tests {
                 id: id(),
                 state: WorkloadState::Running,
                 detail: None,
+            },
+            KamajiToYubaba::CapabilitiesReport {
+                request_id: rid(),
+                capabilities: NodeCapabilities {
+                    native_exec: true,
+                    native_exec_dir: Some("/var/lib/yah/kamaji/native".into()),
+                },
             },
         ];
         for reply in replies {

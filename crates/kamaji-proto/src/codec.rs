@@ -566,6 +566,7 @@ mod tests {
                 ephemeral_storage_mb: 256,
             },
             depends_on: vec![MeshIdent("noisetable-db.pdx".into())],
+            requires: vec![],
             healthcheck: Some(Healthcheck {
                 probe: HealthProbe::HttpGet {
                     path: "/healthz".into(),

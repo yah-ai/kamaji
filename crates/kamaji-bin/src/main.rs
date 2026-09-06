@@ -63,6 +63,12 @@ struct Args {
     /// the tier; `None` leaves tenant-passway deploys refused.
     #[cfg_attr(not(feature = "tenant-passway"), allow(dead_code))]
     tenant_passway_dir: Option<PathBuf>,
+    /// Path to `turso-backup-hydrate` (R850-F1). `Some(path)` lets a workload
+    /// declaring `yah.durability.tier` be restored before it starts; `None`
+    /// makes such a deploy fail loudly rather than come up against an empty
+    /// volume. Not feature-gated — the engine lives in the helper process, so
+    /// this build carries only the path.
+    hydrate_helper: Option<PathBuf>,
 }
 
 fn parse_args() -> std::result::Result<Args, ParseError> {
@@ -111,6 +117,13 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
     // sockets because a variable was inherited.
     let mut tenant_passway_dir: Option<PathBuf> =
         std::env::var_os("KAMAJI_TENANT_PASSWAY_DIR").map(PathBuf::from);
+
+    // R850-F1: hydrate-on-place helper. Inheriting this from the environment is
+    // safe in a way the backend opt-ins above are not — pointing at the helper
+    // grants no capability by itself, since nothing runs unless a workload
+    // *declares* a durability tier.
+    let mut hydrate_helper: Option<PathBuf> =
+        std::env::var_os("KAMAJI_HYDRATE_HELPER").map(PathBuf::from);
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -170,6 +183,13 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--tenant-passway-dir"))?,
                 );
             }
+            "--hydrate-helper" => {
+                hydrate_helper = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or(ParseError::MissingValue("--hydrate-helper"))?,
+                );
+            }
             // Bare `--docker` inherits DOCKER_HOST; `--docker-host URL` pins one.
             "--docker" => docker_host = Some(String::new()),
             "--docker-host" => {
@@ -193,6 +213,7 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         native_exec_dir,
         microvm_dir,
         tenant_passway_dir,
+        hydrate_helper,
     })
 }
 
@@ -210,7 +231,7 @@ fn print_help() {
     println!(
         "Usage: kamaji [--socket PATH] [--containerd-socket PATH] [--docker | --docker-host URL]\n              \
          [--native-exec-dir PATH] [--microvm-dir PATH]\n              \
-         [--tenant-passway-dir PATH]\n              \
+         [--tenant-passway-dir PATH] [--hydrate-helper PATH]\n              \
          [--bundle-cache-dir PATH] [--bundle-origin URL] [--bundle-port PORT]"
     );
     println!();
@@ -238,6 +259,12 @@ fn print_help() {
     println!("                                Needs /dev/kvm openable by this user and");
     println!("                                CAP_NET_ADMIN for guest networking (default:");
     println!("                                $KAMAJI_MICROVM_DIR, else such deploys are refused)");
+    println!("      --hydrate-helper PATH     restore a workload's named volume from its declared");
+    println!("                                yah.durability.store before starting it, by running");
+    println!("                                the turso-backup-hydrate binary at PATH (default:");
+    println!("                                $KAMAJI_HYDRATE_HELPER; without one, a workload that");
+    println!("                                declares a durability tier is REFUSED rather than");
+    println!("                                started against an empty volume)");
     println!("      --tenant-passway-dir PATH  hold one TLS listen socket per enrolled custom");
     println!("                                domain and fork a cold `passway` on the first");
     println!("                                connection, capturing logs under PATH. This is the");
@@ -554,6 +581,32 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
         anyhow::bail!(
             "--tenant-passway-dir requires the kamaji binary be built with \
              --features tenant-passway"
+        );
+    }
+
+    // ── hydrate-on-place helper (R850-F1) ────────────────────────────────────
+    // No feature gate and no `bail!` twin: the database engine lives in the
+    // helper process, so every build can carry the path. Refusing a
+    // *nonexistent* path at startup is worth it though — the alternative is
+    // discovering it at the first appliance deploy, which is exactly the moment
+    // an operator has the least appetite for a typo.
+    if let Some(helper) = &args.hydrate_helper {
+        if !helper.is_file() {
+            anyhow::bail!(
+                "--hydrate-helper {} is not a file; point it at the turso-backup-hydrate binary",
+                helper.display()
+            );
+        }
+        tracing::info!(
+            helper = %helper.display(),
+            "hydrate-on-place armed; workloads declaring yah.durability.tier will be restored \
+             before they start"
+        );
+        ctx = ctx.with_hydrate_helper(helper.clone());
+    } else {
+        tracing::debug!(
+            "no --hydrate-helper; a workload declaring yah.durability.tier will be refused \
+             rather than started against an empty volume"
         );
     }
 

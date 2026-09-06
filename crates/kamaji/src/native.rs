@@ -205,6 +205,18 @@ impl NativeRuntime {
         }
     }
 
+    /// Where this runtime stages native workloads — the directory kamaji was
+    /// started with as `--native-exec-dir`.
+    ///
+    /// Exposed for R858-T4's capability report: a scheduler asking "can this
+    /// node fork+exec the appliance?" always asks "and is the binary in the
+    /// place you would exec it from?" next, and answering both from the runtime
+    /// that actually performs the exec is what keeps the advertised capability
+    /// and the exercised one from drifting.
+    pub fn exec_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     /// Give a number to every port the spec names but does not number
     /// (R844-F21), returning the spec that results.
     ///
@@ -1010,6 +1022,7 @@ mod tests {
                 ephemeral_storage_mb: 128,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Never,
             archetype: None,

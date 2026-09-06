@@ -63,7 +63,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use kamaji_proto::{
     decode_frame, encode_frame, DrainBudget, Error as CodecError, ErrorCode, KamajiToYubaba,
-    ProbeStatus, ProtocolVersion, RequestId, WorkloadEntry, WorkloadId, YubabaToKamaji,
+    NodeCapabilities, ProbeStatus, ProtocolVersion, RequestId, WorkloadEntry, WorkloadId,
+    YubabaToKamaji,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream};
@@ -281,6 +282,26 @@ impl KamajiClient {
             .await?;
         match reply {
             KamajiToYubaba::WorkloadList { entries, .. } => Ok(entries),
+            other => Err(ClientError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// `YubabaToKamaji::Capabilities` — what this Kamaji can dispatch to
+    /// (R858-T4).
+    ///
+    /// **A caller must treat an `Err` as "unknown", never as "incapable".** An
+    /// older Kamaji does not know the variant and fails the frame; reading that
+    /// as `native_exec: false` would make every not-yet-rolled node ineligible
+    /// the moment this shipped, which is the 2026-09-03 outage reproduced from
+    /// the other side. `yubaba`'s `NativeExecCapability::Unknown` is that
+    /// permissive reading.
+    pub async fn capabilities(&self) -> Result<NodeCapabilities, ClientError> {
+        let request_id = self.next_request_id();
+        let reply = self
+            .request(YubabaToKamaji::Capabilities { request_id }, request_id)
+            .await?;
+        match reply {
+            KamajiToYubaba::CapabilitiesReport { capabilities, .. } => Ok(capabilities),
             other => Err(ClientError::Unexpected(format!("{other:?}"))),
         }
     }

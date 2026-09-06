@@ -288,6 +288,17 @@ pub struct ServerCtx {
     /// bundle-serving" `BackendRefused`, exactly like the containerd None arm.
     #[cfg(feature = "bundle-serving")]
     pub bundle: Option<BundleBackend>,
+    /// Path to `turso-backup-hydrate`, from `--hydrate-helper` /
+    /// `KAMAJI_HYDRATE_HELPER` (R850-F1). `None` on a node that has not been
+    /// given one.
+    ///
+    /// Not behind a feature flag, unlike every backend beside it, and
+    /// deliberately: the *helper* is what carries the database engine, so the
+    /// only thing this build gains is a path and a `Command::output`. Gating it
+    /// would mean a node built without the feature silently starts a workload
+    /// whose declared restore never ran — the exact failure
+    /// [`crate::hydrate::run`] refuses.
+    pub hydrate_helper: Option<std::path::PathBuf>,
     /// Optional per-tenant passway JIT tier (R852-F1 / W267 §"Free-tier ingress
     /// at 10k domains"). `None` outside the `tenant-passway` feature build, or
     /// when kamaji is started without `--tenant-passway-dir`. When `None`, a
@@ -660,6 +671,7 @@ impl ServerCtx {
         Self {
             registry: Arc::new(Mutex::new(Registry::new())),
             log_sink: Arc::new(JournalSender::connect()),
+            hydrate_helper: None,
             #[cfg(feature = "containerd-integration")]
             containerd: None,
             #[cfg(feature = "bundle-serving")]
@@ -681,6 +693,7 @@ impl ServerCtx {
         Self {
             registry,
             log_sink: Arc::new(JournalSender::connect()),
+            hydrate_helper: None,
             #[cfg(feature = "containerd-integration")]
             containerd: None,
             #[cfg(feature = "bundle-serving")]
@@ -733,6 +746,16 @@ impl ServerCtx {
     #[cfg(feature = "tenant-passway")]
     pub fn with_tenant_passway(mut self, jit: Arc<kamaji::jit::JitRuntime>) -> Self {
         self.tenant_passway = Some(jit);
+        self
+    }
+
+    /// Point hydrate-on-place at `turso-backup-hydrate` (R850-F1). The binary
+    /// calls this in `main.rs` when the operator passed `--hydrate-helper`.
+    ///
+    /// Leaving it unset does not disable the feature — it makes a deploy that
+    /// *declares* a durability tier fail loudly. See [`crate::hydrate::run`].
+    pub fn with_hydrate_helper(mut self, helper: std::path::PathBuf) -> Self {
+        self.hydrate_helper = Some(helper);
         self
     }
 
@@ -1105,6 +1128,28 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             KamajiToYubaba::Welcome {
                 version: ProtocolVersion::CURRENT,
                 kamaji_version: CONSTABLE_VERSION.to_string(),
+            }
+        }
+        // R858-T4. Answered from the same `ctx.native` that `deploy_native_exec`
+        // dispatches on, so the capability a scheduler reads and the capability
+        // a deploy exercises cannot disagree — deriving it from the build
+        // features or the CLI args instead would be a second source of truth
+        // that drifts exactly when it matters.
+        YubabaToKamaji::Capabilities { request_id } => {
+            #[cfg(feature = "native-exec")]
+            let (native_exec, native_exec_dir) = match &ctx.native {
+                Some(rt) => (true, Some(rt.exec_dir().display().to_string())),
+                None => (false, None),
+            };
+            #[cfg(not(feature = "native-exec"))]
+            let (native_exec, native_exec_dir) = (false, None);
+
+            KamajiToYubaba::CapabilitiesReport {
+                request_id,
+                capabilities: kamaji_proto::NodeCapabilities {
+                    native_exec,
+                    native_exec_dir,
+                },
             }
         }
         YubabaToKamaji::List { request_id } => {
@@ -1630,6 +1675,31 @@ async fn deploy_container(
             code: ErrorCode::InvalidSpec,
             message: format!("workload {} not admitted: {e}", spec.name),
         };
+    }
+
+    // R850-F1: hydrate-on-place. Before any backend starts anything, a workload
+    // that declares a durability tier gets its named volume filled from the
+    // declared store — under an ownership fence — or the deploy is refused.
+    //
+    // Sited here rather than in the containerd backend for the reason the
+    // admission check above is: `deploy_native_exec` and the docker arm do not
+    // pass through `validate_spec_for_constable`, and a durability guard a
+    // workload can dodge by setting `yah.exec = native` is not a guard. This is
+    // inert for every spec that declares nothing, which is every spec in the
+    // tree today (`hydrate::plan` → `NotDeclared`).
+    match crate::hydrate::run(ctx.hydrate_helper.as_deref(), spec).await {
+        Ok(crate::hydrate::HydrateResult::Proceed(line)) => {
+            if let Some(line) = line {
+                info!(id = %id.0, outcome = %line, "hydrate-on-place");
+            }
+        }
+        Err(message) => {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message,
+            }
+        }
     }
 
     if spec.wants_native_exec() {
@@ -2725,6 +2795,7 @@ fn bundle_workload_spec(
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
         archetype: None,
@@ -4371,6 +4442,78 @@ mod tests {
         }
     }
 
+    /// R850-F1: the hydrate gate is on the *dispatch* path, not inside one
+    /// backend — so it fires on a ctx with no backend at all, which is what
+    /// proves it runs before any of them rather than after the first one that
+    /// happens to be configured.
+    ///
+    /// This is also the property that keeps an appliance from coming up empty:
+    /// a spec that declares durable state on a kamaji with no helper is refused
+    /// rather than started, and the refusal names the flag.
+    #[tokio::test]
+    async fn a_workload_declaring_durability_is_refused_when_no_hydrate_helper_is_configured() {
+        let ctx = Arc::new(ServerCtx::new());
+        let mut spec = make_minimal_container_spec("acct");
+        spec.volumes = vec![workload_spec::VolumeMount {
+            source: workload_spec::VolumeSource::Named {
+                name: "accounts".into(),
+            },
+            target: "/var/lib/app".into(),
+            read_only: false,
+        }];
+        for (k, v) in [
+            ("yah.durability.tier", "stream"),
+            ("yah.durability.engine", "turso"),
+            ("yah.durability.store", "s3://yah-backups/acct"),
+            ("yah.durability.subjects", "accounts.db"),
+        ] {
+            spec.annotations.insert(k.into(), v.into());
+        }
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(77),
+                id: WorkloadId::new("acct"),
+                spec: workload_spec::Workload::container(spec),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+        match reply {
+            KamajiToYubaba::Error { code, message, .. } => {
+                assert_eq!(code, ErrorCode::BackendRefused);
+                assert!(message.contains("--hydrate-helper"), "got: {message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// ...and the inverse, which is the one that would take the fleet down if
+    /// it broke: a spec declaring nothing must reach the backend exactly as it
+    /// did before this gate existed. Every spec in the tree is this shape.
+    #[tokio::test]
+    async fn a_workload_declaring_no_durability_reaches_the_backend_unchanged() {
+        let ctx = Arc::new(ServerCtx::new());
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(78),
+                id: WorkloadId::new("svc"),
+                spec: workload_spec::Workload::container(make_minimal_container_spec("svc")),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+        match reply {
+            KamajiToYubaba::Error { message, .. } => assert!(
+                !message.contains("hydrate"),
+                "an undeclared workload must fall through to the backend arms: {message}"
+            ),
+            // Any non-error means it got past the gate, which is the assertion.
+            _ => {}
+        }
+    }
+
     /// With the containerd-integration feature but no backend attached to
     /// ServerCtx, Deploy { Container } returns BackendRefused with a hint at
     /// the missing config.
@@ -4517,6 +4660,7 @@ mod tests {
                 ephemeral_storage_mb: 128,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
             archetype: None,

@@ -44,6 +44,8 @@ pub mod cgroup;
 #[cfg(feature = "containerd-integration")]
 pub mod containerd;
 pub mod drain;
+/// R850-F1: run the declared restore before a stateful workload starts.
+pub mod hydrate;
 pub mod journal;
 pub mod native;
 pub mod pidfd;

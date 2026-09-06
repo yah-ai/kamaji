@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
             ephemeral_storage_mb: 512,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Never,
         archetype: None,
