@@ -114,6 +114,24 @@ struct Inner {
     /// Lets R600-F4 orchestration tests assert *which* workloads were
     /// graceful-upgraded (and how many times) after a secret rotation.
     graceful_upgrades: Vec<String>,
+    /// Mesh idents passed to `deploy_workload`, in call order — **attempts**,
+    /// including ones an armed fault then refused (R858-B13).
+    ///
+    /// Attempts rather than successes because the caller a counter like this
+    /// catches is a control loop that re-places a workload faster than it can
+    /// start, and such a loop is just as harmful when every attempt fails. The
+    /// registry snapshot cannot show it: a redeploy of a workload that is
+    /// already `Running` leaves the snapshot byte-identical, so a hundred
+    /// deploys a second and a healthy steady state look the same from outside.
+    deploys: Vec<String>,
+    /// How many times `get_workload` has been called (R858-B13).
+    ///
+    /// The cheapest available proxy for **how often a control loop is running**:
+    /// a reconciler that asks the supervisor what is placed here once per pass
+    /// leaves its own cadence in this counter, and a loop paced off the wrong
+    /// clock is otherwise invisible — it converges to the same state, just
+    /// hundreds of times more often than it was written to.
+    get_workload_calls: usize,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -230,6 +248,21 @@ impl FakeRuntime {
         self.inner.lock().unwrap().graceful_upgrades.clone()
     }
 
+    /// The mesh idents passed to `deploy_workload`, in call order (R858-B13) —
+    /// every **attempt**, including ones an armed `FaultTarget::DeployWorkload`
+    /// refused. Lets a test assert on the *rate* a caller re-places a workload,
+    /// which no registry snapshot can show.
+    pub fn deploy_calls(&self) -> Vec<String> {
+        self.inner.lock().unwrap().deploys.clone()
+    }
+
+    /// How many `get_workload` calls this runtime has answered (R858-B13).
+    /// Counted before the fault check, so an armed `FaultTarget::GetWorkload`
+    /// does not hide the caller's cadence.
+    pub fn get_workload_calls(&self) -> usize {
+        self.inner.lock().unwrap().get_workload_calls
+    }
+
     // ── internal helpers ──────────────────────────────────────────────────────
 
     /// Check whether a fault fires for `target`. Updates the fired count and
@@ -285,6 +318,14 @@ impl Kamaji for FakeRuntime {
         spec: &workload_spec::WorkloadSpec,
         mesh: &MeshAssignment,
     ) -> anyhow::Result<DeployResult> {
+        // Recorded before the fault check, so the ledger counts what the caller
+        // ASKED FOR rather than what the fake allowed (R858-B13).
+        self.inner
+            .lock()
+            .unwrap()
+            .deploys
+            .push(spec.expose.mesh.identity.0.clone());
+
         if self.check_fault(&FaultTarget::DeployWorkload) {
             anyhow::bail!("fake: injected fault on deploy_workload");
         }
@@ -333,6 +374,7 @@ impl Kamaji for FakeRuntime {
     }
 
     async fn get_workload(&self, ident: &MeshIdent) -> anyhow::Result<Option<WorkloadState>> {
+        self.inner.lock().unwrap().get_workload_calls += 1;
         if self.check_fault(&FaultTarget::GetWorkload) {
             anyhow::bail!("fake: injected fault on get_workload");
         }

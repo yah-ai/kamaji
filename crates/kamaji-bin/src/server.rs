@@ -1153,9 +1153,37 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             }
         }
         YubabaToKamaji::List { request_id } => {
-            // Start with the in-memory registry entries (native workloads).
+            // Start with the in-memory registry entries. This list is a
+            // historical stub — nothing writes `Registry::workloads` outside
+            // tests — so on a live daemon it is empty and every backend below
+            // contributes its own live view.
             #[allow(unused_mut)]
             let mut entries = ctx.registry.lock().await.list();
+
+            // Merge native fork+exec workloads (R858-B14). `ctx.native` is the
+            // `--native-exec-dir` backend `deploy_native_exec` forks through —
+            // the headscale appliance among them — and it was the one runtime
+            // `List` never asked. Its workloads existed, were supervised, and
+            // were invisible on the wire: yubaba's `get_workload` filters this
+            // list by ident, so `observe_local_appliance` answered "not running
+            // here" about a healthy appliance, `decide_owner` never reached
+            // `OwnerServing(self)`, and every reconcile tick redeployed a
+            // coordinator kamaji was already supervising correctly.
+            #[cfg(feature = "native-exec")]
+            if let Some(native) = &ctx.native {
+                match native.list_workloads().await {
+                    Ok(states) => {
+                        entries.extend(states.into_iter().map(runtime_state_to_entry))
+                    }
+                    Err(e) => {
+                        return KamajiToYubaba::Error {
+                            request_id: Some(request_id),
+                            code: ErrorCode::BackendRefused,
+                            message: format!("native list failed: {e}"),
+                        };
+                    }
+                }
+            }
 
             // Merge containerd containers when the backend is configured.
             #[cfg(feature = "containerd-integration")]
@@ -3251,14 +3279,24 @@ fn dedupe_workload_entries(entries: Vec<WorkloadEntry>) -> Vec<WorkloadEntry> {
                 // two backends genuinely both hold a record — usually a stale
                 // container/process the operator still needs to reap. Say so,
                 // so the fix reports the condition instead of hiding it.
+                //
+                // R858-T4: the fields report the OUTCOME, not the incumbent. The
+                // warn used to fire before the swap, so it labelled the row it
+                // was about to discard `kept_` — a reader who trusted it saw
+                // "kept_state=Pending kept_pid=None" beside a live pid and read
+                // a correct dedupe as an inverted one. Measured on us-east-001
+                // 2026-09-06, where it cost a full investigation before the
+                // swap below proved the behaviour was right all along.
+                let replace = liveness_rank(&e) > liveness_rank(kept);
+                let (winner, loser) = if replace { (&e, &*kept) } else { (&*kept, &e) };
                 warn!(
                     id = %e.id.0,
-                    kept_state = ?kept.state, kept_pid = ?kept.pid,
-                    other_state = ?e.state, other_pid = ?e.pid,
+                    kept_state = ?winner.state, kept_pid = ?winner.pid,
+                    dropped_state = ?loser.state, dropped_pid = ?loser.pid,
                     "duplicate workload id across backends — collapsing to the \
-                     most-live row; the losing row is likely a stale record"
+                     most-live row; the dropped row is likely a stale record"
                 );
-                if liveness_rank(&e) > liveness_rank(kept) {
+                if replace {
                     *kept = e;
                 }
             }
@@ -3279,10 +3317,15 @@ fn dedupe_workload_entries(entries: Vec<WorkloadEntry>) -> Vec<WorkloadEntry> {
 /// or halted for a microVM). Was `bundle_state_to_entry` until R605-F8 gave it
 /// a third caller and the old name stopped being true. R852-F1 added a fourth
 /// (the per-tenant passway JIT tier), which reports through the same trait.
+/// R858-B14 added a fifth, `ServerCtx::native` — the `--native-exec-dir`
+/// fork+exec backend, whose `container_id` already carries the `native-<pid>`
+/// spelling this reads because it is the same `NativeRuntime` the bundle
+/// backend uses, only keyed on a different identity space.
 #[cfg(any(
     feature = "bundle-serving",
     feature = "microvm",
-    feature = "tenant-passway"
+    feature = "tenant-passway",
+    feature = "native-exec"
 ))]
 fn runtime_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
     use kamaji::WorkloadStatus;
@@ -3451,12 +3494,67 @@ async fn graceful_upgrade_workload(
 /// kill+delete; without a backend (or for a workload Kamaji doesn't know
 /// about) we return `Ack` regardless — Stop is idempotent and the absence
 /// of the workload satisfies the requested end-state.
+///
+/// @yah:ticket(R858-B15, "stop_workload has no ctx.native arm, so a Stop for a native-exec workload Acks while the process keeps running")
+/// @yah:status(review)
+/// @yah:at(2026-09-06T09:44:30Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R858)
+/// @yah:severity(high)
+/// @yah:verify("Add a test that is the write-side twin of R858-B14's a_native_exec_workload_is_visible_in_list: deploy a native-exec workload, issue YubabaToKamaji::Stop, then assert the workload is GONE from the next List reply (and that the pid is reaped). Falsify it by removing the new arm — it must fail, not merely pass. Do NOT verify this one on us-west-001 by driving a real leadership change until R858-T4 lands: east and south have no --native-exec-dir and no headscale binary, so an ownership move off west has nowhere to go and would decapitate the mesh whether or not this bug is fixed.")
+/// @yah:next("The fix is the exact mirror of B14's: a `#[cfg(feature = \"native-exec\")]` arm in `stop_workload` calling `native.teardown_workload(&MeshIdent(id.0.clone()))`, idempotent like every arm beside it, placed with the others. Note `NativeRuntime::teardown_workload` takes a MeshIdent and the native runtime keys its map on `ident.0` (oss/kamaji/crates/kamaji/src/native.rs:786), which for the appliance is HEADSCALE_IDENT == HEADSCALE_NAME == \"headscale\" — but for forge runs the id and the mesh identity differ (R590-B9), so check whether the native path needs the same resolve-by-either-key treatment the docker arm has (`teardown_by_key`, :3601) before assuming a bare ident lookup is enough.")
+/// @yah:gotcha("DELIBERATELY NOT FIXED IN B14's BINARY, AND THINK BEFORE YOU FIX IT. Right now this no-op is load-bearing in west's favour: R858-B13's D2 defect was a spurious `on_lost_leader -> stop_headscale` firing 4ms after a deploy. golem's `start_awaiting_proof` term fixed the yubaba side, but if ANY spurious-teardown path survives, this no-op is the only thing between it and a decapitated mesh — us-west-001 holds the cloud.mesh.yah.dev A record, the headscale DB and the ACME cache, and per R858-T4 neither east nor south can run the appliance at all (no --native-exec-dir, no headscale binary). So making teardown actually work converts a harmless lie into a real outage the moment anything calls it wrongly. LAND THIS AFTER R858-T4 gives the fleet somewhere to fail over to, or land it together with a hardware check that no spurious Stop is issued. It was left out of B14's ship on purpose: B14 needed a single-variable experiment to restore quorum, and this is a behaviour change whose blast radius is the mesh coordinator.")
+/// @yah:assumes("I did NOT measure this on hardware — it is read from the code, not from a journal. The read is direct (stop_workload's arms are all in one function and none of them touches ctx.native), and B14's read of the identical omission in List was confirmed on hardware, so the inference is strong. But nobody has issued a Stop for a native-exec workload on us-west-001 and watched the process survive, and that is the measurement this ticket should open with.")
+/// @yah:handoff("FIXED IN SOURCE, NOTHING ROLLED. Tree anchor 2a3bd7ed. Two files, both already carrying uncommitted peer work from R858-B14/R858-T4; I re-read each immediately before every Edit and did not commit, reformat, or touch a peer hunk. (1) oss/kamaji/crates/kamaji-bin/src/server.rs stop_workload — added the missing `#[cfg(feature = \"native-exec\")] if let Some(native) = &ctx.native` arm, placed FIRST to mirror the ordering R858-B14 gave the `List` merge. It calls `native.teardown_by_key(&id.0)` and then `ctx.registry.lock().await.remove_probe(&id)`. (2) oss/kamaji/crates/kamaji/src/native.rs — new `NativeRuntime::teardown_by_key`, plus a `name: String` field on WorkloadHandle populated from `spec.name` at the single insert site (native.rs:786).")
+/// @yah:handoff("THE BARE IDENT LOOKUP WAS **NOT** ENOUGH — the ticket's own next-step suspicion was right, and I proved it rather than reasoned it. `NativeRuntime` keys its map ONLY on `spec.expose.mesh.identity` (native.rs:786) and records the WorkloadId nowhere at all, while a `YubabaToKamaji::Stop` carries a WorkloadId. For the appliance those agree (HEADSCALE_IDENT == HEADSCALE_NAME == \"headscale\"), so a bare `MeshIdent(id.0.clone())` fixes headscale. For FORGE runs they do not: `WorkloadSpec::for_forge` is `name = forge-<uuid>` against `identity = forge.<uuid>` (oss/yah-base/crates/workload-spec/src/lib.rs:2720, R590-B9), and `mark_native_exec` (oss/qed/crates/velveteen-exec/src/remote.rs:851) converts exactly that spec into the fork+exec shape — so native forge runs are real, not hypothetical. A bare-ident arm would therefore have MOVED the lying Ack from the appliance to forge runs rather than fixed it. `teardown_by_key` resolves either spelling (identity first so the common case costs no scan, then a scan on the recorded `name`), which is the native twin of the docker backend's `teardown_by_key` / `yah.workload_id` label at server.rs:3621.")
+/// @yah:handoff("DISCOVERED WORK, both inside this ticket's blast radius. (a) The new arm also calls `remove_probe(&id)`: `deploy_native_exec` registers a control-socket ProbeTarget for any spec declaring one (server.rs:1846), and before this arm existed nothing ever removed it, so a probe would have outlived its child and kept polling a dead socket. (b) R858-B14's `a_native_exec_workload_is_visible_in_list` carried a trailing comment asserting `stop_workload` \"has no ctx.native arm either ... Filed separately rather than fixed here\". That is now false, so I retargeted the comment to point at the new write-side test. The manual runtime teardown in that test is unchanged and still correct.")
+/// @yah:verify("MY OWN BASELINE, measured on the same tree before any edit (not taken off the board). `cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-proto -p kamaji` = 91 passed / 0 failed (58 + 33, 1 ignored). `cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features containerd-integration,native-exec,bundle-serving` = 290 passed / 0 failed (285+2+2+1).")
+/// @yah:verify("AFTER: proto+kamaji 91 passed / 0 failed (unchanged). kamaji-bin 292 passed / 0 failed (287+2+2+1) — exactly +2, my two new tests, with zero pre-existing tests disturbed.")
+/// @yah:verify("NEW TEST 1 — `a_native_exec_workload_is_gone_from_list_after_stop` (server.rs), the write-side twin of B14's read-side test the ticket asked for: deploy a native-exec `headscale` workload, capture its live pid off `List` (the only channel that carries it), assert the child is alive, issue `YubabaToKamaji::Stop`, then assert BOTH that the workload is absent from the next `List` reply AND that the pid is reaped. Both halves are asserted because either alone is passable by a wrong fix — dropping the map entry without signalling leaks the process, killing without dropping leaves a corpse in every later List.")
+/// @yah:verify("NEW TEST 2 — `stop_tears_down_a_native_forge_workload_addressed_by_its_id` (server.rs), covering the R590-B9 divergence: deploy with `id`/`name` = `forge-abc123` but `expose.mesh.identity` = `forge.abc123`, Stop by the HYPHENATED id (what yubaba sends), assert gone from List and pid reaped.")
+/// @yah:verify("FALSIFICATION 1 — arm removed (cfg'd out, whole arm dead): kamaji-bin = 285 passed / 2 FAILED. Both failures are exactly the two new tests, nothing else moved. So they FAIL without the fix, they do not merely pass with it.")
+/// @yah:verify("FALSIFICATION 2 — arm present but reverted to the ticket's literally-suggested `native.teardown_workload(&MeshIdent(id.0.clone()))`: kamaji-bin = 286 passed / 1 FAILED. The appliance test PASSES and only the forge test FAILS. That is the empirical answer to 'does the native path need resolve-by-either-key': yes, and this run is the single-variable proof.")
+/// @yah:verify("Pid reaping is checked with `kill -0` via a subprocess, not `libc::kill`: kamaji-bin's libc dep is `[target.'cfg(target_os = \"linux\")']` (Cargo.toml:157) and this camp's machines are darwin. `stop_child` awaits `child.wait()`, so a correct teardown leaves ESRCH rather than a zombie — which is precisely the distinction the assertion needs. Both new tests are gated `#[cfg(all(unix, feature = \"native-exec\"))]`.")
+/// @yah:verify("clippy: `cargo clippy -p kamaji -p kamaji-bin --features containerd-integration,native-exec,bundle-serving --all-targets` produces NO diagnostic in native.rs or in any changed hunk. The two warnings it does emit are pre-existing test-code lint far from this work — `function free_port is never used` (server.rs:7789) and a single-pattern `match` (server.rs:4913).")
+/// @yah:verify("NOT VERIFIED, STATED PLAINLY: nothing was run on hardware. Per this ticket's own scope limit I did not ssh anywhere, did not roll, did not deploy, and specifically did not drive a leadership change on us-west-001. The parent relay's `@yah:assumes` — that nobody has yet watched a native-exec process survive a Stop on a real node — is still unretired; this ticket closes the source defect, not that measurement.")
+/// @yah:gotcha("ROLL GATE — THIS FIX MUST NOT SHIP AHEAD OF R858-T4 AND R858-T16. Landing it in SOURCE is safe and is what happened here, because a source change reaches no node: code arrives on a voter only via a deliberate yubaba/kamaji release plus scripts/roll-node.sh. ROLLING it is the gated act. This arm converts a Stop that used to Ack-and-no-op into one that really kills the child, and the child in question is the mesh coordinator — so any surviving spurious-teardown path that was previously harmless becomes a real decapitation the moment this binary is on a node. The gate is satisfied only when the release that carries this ALSO carries R858-T4 (all three voters given kamaji --native-exec-dir and the headscale v0.23.0 binary, so the fleet has somewhere to fail over to) and R858-T16 (config.yaml hydration in leader::start_headscale). Both were done/at-review when this landed, so the safe forward path is one release containing T4 + T16 + B13 + B14 + this. Whoever cuts that release: verify T4 and T16 are in the same build before rolling, and keep honouring the parent relay's warning against rolling published 0.8.33 onto us-west-001, which still runs two hand-built musl binaries.")
+/// @yah:cleanup("UNCHECKED, ADJACENT, DELIBERATELY NOT TOUCHED: the bundle-serving arm of stop_workload still calls `backend.native.teardown_workload(&ident)` with a bare `MeshIdent(id.0.clone())`, as do the tenant-passway and microvm arms. Those are different runtime instances from `ctx.native` and I did not establish whether any of them can see a spec whose `name` and `expose.mesh.identity` diverge — I grepped oss/kamaji/crates/kamaji-bin/src/bundle.rs and oss/kamaji/crates/kamaji/src/jit.rs for an identity assignment and found no site, which is inconclusive rather than reassuring. If a bundle or JIT workload can ever be forge-shaped, those three arms carry the identical R590-B9 no-op and `NativeRuntime::teardown_by_key` is now sitting right there for the bundle one.")
 #[allow(unused_variables)]
 async fn stop_workload(
     ctx: &Arc<ServerCtx>,
     request_id: kamaji_proto::RequestId,
     id: WorkloadId,
 ) -> KamajiToYubaba {
+    // Route teardown to the native fork+exec backend (R858-B15), the write-side
+    // twin of the `List` merge R858-B14 added. `ctx.native` is the
+    // `--native-exec-dir` backend `deploy_native_exec` forks through — the
+    // headscale appliance among them — and it was the one runtime `Stop` never
+    // asked. Every arm below it is docker/containerd/bundle/microvm, so a Stop
+    // for a native workload fell through all of them and Acked while the child
+    // kept running: a lying Ack, the same class R590-B9 fixed on the container
+    // path.
+    //
+    // Resolved `by_key`, not by a bare `MeshIdent(id.0)`: the native runtime
+    // keys its map on `expose.mesh.identity` while a Stop carries a
+    // `WorkloadId`, and for forge runs those differ (`forge.<uuid>` vs
+    // `forge-<uuid>`, R590-B9) — a native forge step is exactly the shape
+    // `mark_native_exec` produces. A bare ident lookup would reintroduce the
+    // lying Ack for that workload kind while fixing it for the appliance.
+    // Idempotent (Ok when nothing answers to the key), like every arm beside it.
+    #[cfg(feature = "native-exec")]
+    if let Some(native) = &ctx.native {
+        if let Err(e) = native.teardown_by_key(&id.0).await {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message: format!("native teardown: {e:#}"),
+            };
+        }
+        // `deploy_native_exec` registers a control-socket probe for any spec
+        // that declares one; a probe outliving its child would keep polling a
+        // socket nothing is listening on.
+        ctx.registry.lock().await.remove_probe(&id);
+    }
     #[cfg(feature = "containerd-integration")]
     if let Some(backend) = ctx.containerd.clone() {
         if let Err(e) = backend.teardown(&id).await {
@@ -4031,6 +4129,329 @@ mod tests {
             }
             other => panic!("expected Error(InvalidSpec), got {other:?}"),
         }
+    }
+
+    /// R858-B14: a workload the `--native-exec-dir` backend is supervising must
+    /// appear in `List` — the regression that kept us-west-001 out of raft
+    /// quorum for a day.
+    ///
+    /// `ctx.native` was wired into `Deploy` and into `Welcome`'s capability
+    /// report but into neither `List` nor the registry, and `Registry::workloads`
+    /// (whose comment called itself the native list) has no writer outside
+    /// tests. So the headscale appliance forked, ran, was supervised — and was
+    /// absent from every `List` reply. Yubaba's `get_workload` filters that list
+    /// by ident, so `observe_local_appliance` reported "not running here" about a
+    /// healthy coordinator and every reconcile tick redeployed it, killing a
+    /// process kamaji was tending correctly. The pid assertion is the other half:
+    /// yubaba logs `pid: 0` on deploy by design (the sibling `Deploy` acks on
+    /// admission, before the fork), so `List` is the *only* channel that can
+    /// carry the real pid back.
+    #[cfg(feature = "native-exec")]
+    #[tokio::test]
+    async fn a_native_exec_workload_is_visible_in_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(
+            ServerCtx::new()
+                .with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir.path()))),
+        );
+
+        let mut inner = make_minimal_container_spec("headscale");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        inner.command = Some(vec!["/bin/sleep".into(), "30".into()]);
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(140),
+                id: WorkloadId::new("headscale"),
+                spec: workload_spec::Workload::container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(
+                reply,
+                KamajiToYubaba::Ack {
+                    kind: kamaji_proto::AckKind::Deploy,
+                    ..
+                }
+            ),
+            "native deploy should Ack, got {reply:?}"
+        );
+
+        let list = handle_message(
+            YubabaToKamaji::List {
+                request_id: RequestId(141),
+            },
+            &ctx,
+        )
+        .await;
+        let entries = match list {
+            KamajiToYubaba::WorkloadList { entries, .. } => entries,
+            other => panic!("expected WorkloadList, got {other:?}"),
+        };
+        let entry = entries
+            .iter()
+            .find(|e| e.id == WorkloadId::new("headscale"))
+            .unwrap_or_else(|| {
+                panic!("a supervised native workload must appear in List, got {entries:?}")
+            });
+        assert_eq!(
+            entry.state,
+            WorkloadState::Running,
+            "yubaba adopts only on Running; anything else redeploys"
+        );
+        assert!(
+            entry.pid.is_some_and(|p| p != 0),
+            "List is the only channel carrying the forked pid back, got {entry:?}"
+        );
+        assert_eq!(
+            entry.mesh_ident.as_deref(),
+            Some("headscale"),
+            "yubaba's get_workload matches on mesh_ident, got {entry:?}"
+        );
+
+        // Torn down through the runtime rather than through `Stop`, so this test
+        // keeps covering only the read side. `stop_workload` grew its
+        // `ctx.native` arm in R858-B15; the write side is asserted by
+        // `a_native_exec_workload_is_gone_from_list_after_stop` below.
+        {
+            use kamaji::Kamaji as _;
+            let native = ctx.native.clone().expect("native backend attached above");
+            native
+                .teardown_workload(&workload_spec::MeshIdent("headscale".into()))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// True when `pid` names no live process — i.e. the child was killed *and*
+    /// reaped, not merely signalled into a zombie.
+    ///
+    /// `kill -0` rather than `libc::kill`: kamaji-bin's `libc` dependency is
+    /// `[target.'cfg(target_os = "linux")']`, and this test runs on the camp's
+    /// darwin machines too. A reaped pid gives ESRCH and a non-zero exit; a
+    /// zombie would still answer 0, which is exactly the distinction being
+    /// asserted — `stop_child` awaits `child.wait()`, so a correct teardown
+    /// leaves nothing behind.
+    #[cfg(all(unix, feature = "native-exec"))]
+    fn pid_is_reaped(pid: u32) -> bool {
+        !std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn kill -0")
+            .success()
+    }
+
+    /// R858-B15: a `Stop` for a native-exec workload must actually stop it —
+    /// the write-side twin of `a_native_exec_workload_is_visible_in_list`.
+    ///
+    /// Every arm of `stop_workload` was containerd / tenant-passway / bundle /
+    /// microvm / docker, so a Stop addressed to the `--native-exec-dir` backend
+    /// fell through all of them and returned `Ack{Stop}` while the forked child
+    /// kept running. That is a *lying* Ack: yubaba's teardown path reads the Ack
+    /// as "it is gone", so `on_lost_leader -> stop_headscale` would report a
+    /// torn-down coordinator over a live one, and the next `List` would still
+    /// show it Running — two channels contradicting each other about the mesh
+    /// coordinator.
+    ///
+    /// Both halves are asserted because either alone is passable by a wrong fix:
+    /// dropping the map entry without signalling the child satisfies the List
+    /// assertion while leaking the process, and killing the child without
+    /// dropping the entry satisfies the pid assertion while leaving a corpse in
+    /// every subsequent List reply.
+    #[cfg(all(unix, feature = "native-exec"))]
+    #[tokio::test]
+    async fn a_native_exec_workload_is_gone_from_list_after_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(
+            ServerCtx::new()
+                .with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir.path()))),
+        );
+
+        let mut inner = make_minimal_container_spec("headscale");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        inner.command = Some(vec!["/bin/sleep".into(), "30".into()]);
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(150),
+                id: WorkloadId::new("headscale"),
+                spec: workload_spec::Workload::container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(
+                reply,
+                KamajiToYubaba::Ack {
+                    kind: kamaji_proto::AckKind::Deploy,
+                    ..
+                }
+            ),
+            "native deploy should Ack, got {reply:?}"
+        );
+
+        // Capture the live pid off `List` — the only channel that carries it
+        // (R858-B14) — so the reaping assertion below has something to check.
+        let pid = native_list_pid(&ctx, RequestId(151), "headscale")
+            .await
+            .expect("a supervised native workload must appear in List before Stop");
+        assert!(pid != 0, "expected a real forked pid, got 0");
+        assert!(
+            !pid_is_reaped(pid),
+            "precondition: the child must be alive before Stop, pid {pid}"
+        );
+
+        let stop = handle_message(
+            YubabaToKamaji::Stop {
+                request_id: RequestId(152),
+                id: WorkloadId::new("headscale"),
+            },
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(
+                stop,
+                KamajiToYubaba::Ack {
+                    kind: AckKind::Stop,
+                    ..
+                }
+            ),
+            "Stop should Ack, got {stop:?}"
+        );
+
+        assert_eq!(
+            native_list_pid(&ctx, RequestId(153), "headscale").await,
+            None,
+            "a stopped native workload must be absent from List"
+        );
+        assert!(
+            pid_is_reaped(pid),
+            "Stop Acked but pid {pid} is still alive — the lying Ack R858-B15 exists to fix"
+        );
+    }
+
+    /// R858-B15 / R590-B9: a `Stop` for a native **forge** workload resolves by
+    /// workload id even though the runtime is keyed by mesh identity.
+    ///
+    /// This is the half a bare `native.teardown_workload(&MeshIdent(id.0))`
+    /// would get wrong. `WorkloadSpec::for_forge` is `name = forge-<uuid>`
+    /// against `identity = forge.<uuid>` — dots are not DNS-label safe — and
+    /// `mark_native_exec` turns exactly that spec into a fork+exec one. So the
+    /// id yubaba addresses is not the key the native map holds, and looking up
+    /// only the identity would Ack over a live child: the same lying Ack, moved
+    /// from the appliance to forge runs rather than fixed. `teardown_by_key`
+    /// resolves either spelling, mirroring the docker backend's
+    /// `yah.workload_id` label.
+    #[cfg(all(unix, feature = "native-exec"))]
+    #[tokio::test]
+    async fn stop_tears_down_a_native_forge_workload_addressed_by_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(
+            ServerCtx::new()
+                .with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir.path()))),
+        );
+
+        // The R590-B9 divergence, deliberately constructed: id/name hyphenated,
+        // mesh identity dotted.
+        let mut inner = make_minimal_container_spec("forge-abc123");
+        inner.expose.mesh.identity = workload_spec::MeshIdent("forge.abc123".into());
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        inner.command = Some(vec!["/bin/sleep".into(), "30".into()]);
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(154),
+                id: WorkloadId::new("forge-abc123"),
+                spec: workload_spec::Workload::container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(
+                reply,
+                KamajiToYubaba::Ack {
+                    kind: kamaji_proto::AckKind::Deploy,
+                    ..
+                }
+            ),
+            "native forge deploy should Ack, got {reply:?}"
+        );
+
+        // Listed under the mesh identity, which is precisely why the id lookup
+        // needs help.
+        let pid = native_list_pid(&ctx, RequestId(155), "forge.abc123")
+            .await
+            .expect("native forge workload must appear in List under its mesh identity");
+        assert!(pid != 0, "expected a real forked pid, got 0");
+
+        let stop = handle_message(
+            YubabaToKamaji::Stop {
+                request_id: RequestId(156),
+                // The hyphenated id, NOT the dotted identity — what yubaba sends.
+                id: WorkloadId::new("forge-abc123"),
+            },
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(
+                stop,
+                KamajiToYubaba::Ack {
+                    kind: AckKind::Stop,
+                    ..
+                }
+            ),
+            "Stop should Ack, got {stop:?}"
+        );
+
+        assert_eq!(
+            native_list_pid(&ctx, RequestId(157), "forge.abc123").await,
+            None,
+            "a Stop carrying the workload id must remove the workload the native \
+             runtime keyed under its mesh identity"
+        );
+        assert!(
+            pid_is_reaped(pid),
+            "Stop Acked but pid {pid} is still alive — a bare ident lookup no-opped"
+        );
+    }
+
+    /// `List` the native workloads and return the pid of the entry whose
+    /// `mesh_ident` is `ident`, or `None` when no such entry exists.
+    #[cfg(all(unix, feature = "native-exec"))]
+    async fn native_list_pid(
+        ctx: &Arc<ServerCtx>,
+        request_id: RequestId,
+        ident: &str,
+    ) -> Option<u32> {
+        let list = handle_message(YubabaToKamaji::List { request_id }, ctx).await;
+        let entries = match list {
+            KamajiToYubaba::WorkloadList { entries, .. } => entries,
+            other => panic!("expected WorkloadList, got {other:?}"),
+        };
+        entries
+            .iter()
+            .find(|e| e.mesh_ident.as_deref() == Some(ident))
+            .and_then(|e| e.pid)
     }
 
     /// R577-T1: an unresolved secret reaching the native path is a hard error,

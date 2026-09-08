@@ -152,6 +152,15 @@ struct SpawnedChild {
 /// supervisor task; this is the caller-side handle onto it.
 struct WorkloadHandle {
     mesh_ip: Ipv4Addr,
+    /// `spec.name` — the *other* key this workload answers to (R858-B15).
+    ///
+    /// The map is keyed by `expose.mesh.identity`, but yubaba addresses a
+    /// workload by its `WorkloadId`, and for forge runs those are different
+    /// strings: `WorkloadSpec::for_forge` is `name = forge-<uuid>` (DNS-label
+    /// safe) against `identity = forge.<uuid>` (R590-B9). Recording the name
+    /// here is what lets [`NativeRuntime::teardown_by_key`] resolve either
+    /// spelling, exactly as the docker backend's `yah.workload_id` label does.
+    name: String,
     /// Port(s) this workload's argv actually told it to bind (R844-F2).
     ///
     /// A native workload is a plain host process in the host's own network
@@ -264,6 +273,36 @@ impl NativeRuntime {
             }
         }
         Ok(Some(spec))
+    }
+
+    /// Tear down whichever workload answers to `key`, where `key` may be either
+    /// the mesh identity or the `spec.name` (R858-B15).
+    ///
+    /// The docker backend's `teardown_by_key` exists for exactly this reason and
+    /// this is its native twin: the map is keyed by `expose.mesh.identity`, but
+    /// a `YubabaToKamaji::Stop` carries a `WorkloadId`, and for forge runs the
+    /// two are different strings (`forge.<uuid>` vs `forge-<uuid>`, R590-B9).
+    /// Resolving only the identity would make `Stop` Ack while the fork+exec'd
+    /// child kept running — the same lying-Ack class of bug R590-B9 fixed on the
+    /// container path.
+    ///
+    /// Identity is tried first so the common case (name == identity, which is
+    /// every workload but forge — the headscale appliance included, where
+    /// `HEADSCALE_IDENT == HEADSCALE_NAME`) costs no scan. Idempotent: `Ok(())`
+    /// when nothing answers to `key`, like [`Kamaji::teardown_workload`].
+    pub async fn teardown_by_key(&self, key: &str) -> Result<()> {
+        let ident = {
+            let map = self.workloads.lock().await;
+            if map.contains_key(key) {
+                MeshIdent(key.to_string())
+            } else {
+                match map.iter().find(|(_, h)| h.name == key) {
+                    Some((ident, _)) => MeshIdent(ident.clone()),
+                    None => return Ok(()),
+                }
+            }
+        };
+        self.teardown_workload(&ident).await
     }
 }
 
@@ -787,6 +826,7 @@ impl Kamaji for NativeRuntime {
             ident.0,
             WorkloadHandle {
                 mesh_ip: mesh.mesh_ip,
+                name: spec.name.clone(),
                 ports: crate::declared_port_names(&spec.expose.mesh),
                 stdout_path,
                 stderr_path,
