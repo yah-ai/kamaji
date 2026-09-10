@@ -19,7 +19,7 @@ serde_json = "1.0"
 # workload adopting the channel must not be made to link the supervisor's wire
 # protocol to answer one JSON line. Supervisor-side consumers (kamaji-bin) turn
 # it on to get the conversions.
-kamaji-proto = { version = "0.8.34", path = "../kamaji-proto", optional = true }
+kamaji-proto = { version = "0.8.36", path = "../kamaji-proto", optional = true }
 
 # Async client. Also off by default — the producer half is std-only on purpose
 # so a GUI app with no runtime can adopt it (noisetable's winit loop is the

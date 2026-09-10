@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 # Intent payloads ride workload-spec's existing Workload envelope so yubaba and
 # kamaji share one source of truth for spec shape.
-workload-spec = { package = "yah-workload-spec", version = "0.8.34" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.36" }
 
 serde = { version = "1.0", features = ["derive"] }
 # R852-B4: SHA-256 over the postcard encoding of a `Workload`, so a caller can

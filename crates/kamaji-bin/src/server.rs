@@ -168,6 +168,30 @@
 //! @yah:verify("cargo test -p kamaji-bin --features containerd-integration,native-exec,bundle-serving (oss/kamaji) = 257 lib tests passed + all integration binaries green. New: bundle_serving::a_recorded_keepalive_bundle_is_resumed_by_a_fresh_kamaji (deploy under ctx A, tear the child down as systemd would, drop A, new ctx B over the same state dir resumes 1 record, DeployStatus reaches Running, List shows it Running; Stop removes the record and a third ctx resumes 0) and bundle_serving::an_unreadable_record_is_skipped_not_fatal.")
 //! @yah:verify("cargo clippy -p kamaji-bin --features containerd-integration,native-exec,bundle-serving --all-targets: no diagnostics in the changed code (two pre-existing test-line unwrap_or warnings at server.rs:6130-6131 untouched).")
 //! @yah:verify("The ticket's own verify (systemctl restart kamaji on us-east-001 brings all three yah-marketing workloads back with no apply) needs a release carrying this fix rolled onto the node first; not yet run.")
+//!
+//! @yah:ticket(R876-B5, "hotship's bundle-serve activation is not tenant-scoped: shipping one tenant re-forks every mesofact serve on the node")
+//! @yah:at(2026-09-09T08:51:04Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:severity(high)
+//! @yah:next("Tier: Warrior — the defect is understood and located, the fix is a narrower process match; what makes it non-trivial is choosing the right identity to match on, not finding the bug. FILED BY THE AUTHOR OF THE DEFECT (2026-09-08 chat session): I wrote the bundle-serve arm and did not scope it. It has already run twice against production.")
+//! @yah:next("THE DEFECT. scripts/hotship.sh's `bundle-serve` activation does `sudo pkill -TERM -f \"<ndir>/runtimes/mesofact/\"`. That path is the RUNTIME ASSET, which is shared by every bundle naming the same runtime — it is the whole point of the shared runtime tier (R746-F1, W272 §2/§7). So the pattern matches every mesofact serve process on the box regardless of which tenant or service it belongs to. Measured on us-east-001 2026-09-09: three matches — yah-marketing's bundle (:34759), its revalidate tier (:40995), and NOISETABLE's bundle (:41507, tenant 2, R870). A hot ship aimed at yah.dev re-forks a second tenant's site, with the same ~2s of 502 R876-T1 measured on the apex, and says nothing about having done so.")
+//! @yah:next("THE FIX IS A NARROWER MATCH, BUT PICK THE IDENTITY DELIBERATELY. The serve argv carries `--bundle <ndir>/bundles/<digest>` (and the revalidate tier carries the bundle path plus `--allow-route`), so the bundle DIGEST is available and is per-service. Options worth weighing rather than grabbing the first: (a) match on the bundle digest(s) belonging to the named service, which needs hotship to learn which service it is shipping — today `--binaries mesofact` names a RUNTIME, not a workload; (b) ask kamaji which workloads use the runtime and signal by pid; (c) add a `--service` param to the hotship arm and refuse to activate without one. Note (a)/(c) change the arm's argument shape: a runtime asset is shared by construction, so \\\"hot-ship mesofact\\\" is genuinely ambiguous about blast radius and the CLI should probably stop pretending otherwise.")
+//! @yah:gotcha("THE INSTALL HALF IS SHARED ON PURPOSE AND MUST NOT BE 'FIXED' WITH THE ACTIVATION HALF. One runtime asset backs every tenant naming that version, so replacing the file at `<ndir>/runtimes/mesofact/<ver>/<triple>/serve` necessarily changes the bytes all of them will fork next. That is correct and unavoidable for a runtime tier — the bug is only that ACTIVATION re-forks tenants nobody asked about, converting a shared-bytes change into a shared-outage change. Scoping activation leaves an un-activated tenant running old bytes off its open inode until it next restarts, which is the same staged state `--no-restart` already produces and is the honest behaviour; say so in the output rather than silently.")
+//! @yah:verify("Reproduce before fixing, on us-east-001 or any node running two tenants off one runtime version: `pgrep -af \"/var/lib/yah/kamaji/bundles/runtimes/mesofact/\"` should list yah-marketing's two processes AND noisetable's. After the fix, a `--binaries mesofact` ship scoped to yah-marketing must leave noisetable's pid unchanged — assert on the pid, not on a log line. R876-T1's probe (scripts/hotship-probe.sh) points at yah.dev; point a second one at noisetable's hostname for the same run and it should show zero non-200s.")
+//! @yah:handoff("FIXED, and the arm's argument shape changed as intended (option (c)+(a), no compatibility fallback — CLAUDE.md \"break it, don't tape it\"). scripts/hotship.sh gains `--services LIST`; .yah/qed/hotship.toml gains a `services` param (required=false, default=\"\", wired into build-and-ship). REFUSAL: if --binaries names a bundle-serve app and restart is on, an absent --services is a hard exit(1) BEFORE anything is built or shipped, with the `ls &lt;node&gt;:/var/lib/yah/kamaji/bundles/state/deploys/` command that lists the candidates. The converse is also an error: --services with no bundle-serve app in --binaries scopes nothing and says so. --no-restart needs no scope (it activates nothing). Service ids are charset-validated ([A-Za-z0-9._-] plus commas) because they are interpolated into a remote shell script.")
+//! @yah:handoff("THE RESOLVER: service -&gt; bundle digest -&gt; pids, entirely from files already on the node, no kamaji round-trip (option (b) rejected as too heavy for a bash script). kamaji records each deploy at &lt;ndir&gt;/state/deploys/&lt;svc&gt;.json (BundleBackend::record_deploy, oss/kamaji/crates/kamaji-bin/src/server.rs:624) carrying `bundle.digest`; that digest appears in every serve argv the service owns — the bundle tier as `--bundle &lt;ndir&gt;/bundles/&lt;digest&gt;`, the revalidate tier as the same path positionally plus --allow-route — so ONE digest covers a service and its revalidate tier, which is the correct grouping. Matching is `pgrep -f \"^&lt;ndir&gt;/runtimes/&lt;rt&gt;/.*&lt;digest&gt;\"`, anchored so the ssh command's own cmdline cannot self-match. It then SIGNALS BY PID, not by pattern: the pid set is resolved once, printed, and killed, so what the run reports and what it kills cannot drift apart.")
+//! @yah:handoff("BOTH REQUIRED BEHAVIOURS ARE EXPLICIT, not silent. (1) What was NOT restarted: every serve process under the runtime path that is out of scope is listed as `pid &lt;n&gt; &lt;listen&gt; bundle &lt;digest12&gt; service &lt;owner&gt;` under a header saying it keeps serving the OLD bytes off its already-open inode until it next restarts (owner reverse-mapped by grepping the deploys/*.json for the digest). The end-of-run summary repeats it: runtime bytes were replaced for every tenant, only [services] was re-forked. (2) What WAS restarted: `pids before:` / `pids after:` by number. Plus a standing assertion re-run on every ship — each out-of-scope pid is re-checked alive afterwards and an over-match prints a WARNING naming the pid. --dry-run now resolves and PRINTS the same scope through the SAME code path in `preview` mode, touching nothing, so a blast radius is inspectable before it is pointed at a tenant.")
+//! @yah:handoff("DISCOVERED WORK DONE IN THIS PASS, not filed. (a) A node that does not run a named service is a loud SKIP, not an abort — the first cut exited 1 and would have half-applied a multi-node roll over a node that was never a customer for that tenant, which contradicts the rule the script already states for a missing `unit:` unit (hotship.sh, \"A missing unit is not an error\"). It now prints the service, the deployed list, and continues. (b) Every read of the deploy state goes through `sudo` even though the files are world-readable today — see R876-B9: they are 0644 with cleartext credentials, and that fix (0600/0700) would otherwise have silently disarmed this hot-ship arm the day it landed. (c) Filed R876-B9 for that exposure itself, parented to R876 for want of a better home — re-parent it if there is one; it is a kamaji-crate concern, not a hotship one.")
+//! @yah:handoff("TWO REPORTING BUGS THE FIRST LIVE SHIP EXPOSED, both fixed and both worth knowing because each produced a CONFIDENT WRONG REPORT rather than a failure. (1) `kill -0 &lt;pid&gt;` as the login user against a root-owned process fails with EPERM, indistinguishable from ESRCH — the out-of-scope assertion printed \"WARNING: pid 614524 was OUT of scope and is gone\" about noisetable while noisetable was running untouched. Now `[ -d /proc/&lt;pid&gt; ]`, which needs no privilege. (2) A fixed `sleep 3` after SIGTERM reads the pid table inside the bundle spec's own 5s stop grace, so `pids before` and `pids after` came back byte-identical (611260 611273) on a ship that did re-fork both. Now it polls /proc until every signalled pid is gone, then polls until the replacement count matches the before count (capped 20s/15s) and warns with the shortfall if it does not.")
+//! @yah:verify("BEFORE, us-east-001 2026-09-09 08:33Z, `pgrep -af \"/var/lib/yah/kamaji/bundles/runtimes/mesofact/\"` — exactly the three the ticket predicts: 611260 (yah-marketing revalidate, :40995, bundle dd8bdfb7, argv is the positional bundle path + --allow-route, NO --bundle flag), 611273 (yah-marketing bundle, :34759, dd8bdfb7), 614524 (noisetable, :41507, bundle 86b2fa81, started 07:45:39). NOTE the unanchored pattern in the ticket also matches the operator's own pgrep pipeline (two spurious pids appeared in a hand-run); the shipped matcher anchors with ^ and does not.")
+//! @yah:verify("STEP 2, SCOPE PROVEN WITHOUT KILLING ANYTHING (--dry-run preview). `--services yah-marketing` resolves to bundle dd8bdfb7 and returns EXACTLY {611260, 611273}, with 614524/noisetable listed under NOT-restarted. The inverse checks too, which is what proves the match is real rather than accidentally yah-marketing-shaped: `--services noisetable` returns exactly {614524} and lists yah-marketing's two as out of scope; `--services yah-marketing,noisetable` returns all three; `--services nosuchsvc` skips loudly, resolves nothing, and lists all three as out of scope. Re-run after the sudo hardening — identical in all four directions.")
+//! @yah:verify("STEP 3, FOUR REAL SHIPS against us-east-001 (0.8.36-h12/h13/h14/h15), each `--binaries mesofact --services yah-marketing` with scripts/hotship-probe.sh running against BOTH https://yah.dev/ and https://noisetable.com/ for the window. PASS CONDITION MET ON EVERY RUN. noisetable's pid 614524 is UNCHANGED across all four — asserted on the pid and on `ps -o lstart=` (Wed Sep 9 07:45:39 2026, i.e. predating every ship), not on a log line. noisetable probes: 66/60/38/36 = 200 samples, ZERO non-200s, all 200/8441 (constant body size, so not a served error page). yah-marketing re-forked every time: 611260,611273 -&gt; 617664,617671 -&gt; 617987,617998 -&gt; 618240,618253 -&gt; 619423,619436. yah.dev cost exactly 1x502/0 per activation (08:34:54, 08:36:33, 08:37:50, 08:43:02) against 55/49/30/30 x 200/44242 — a ~1s gap, tighter than the ~2s R876-T1 measured, and in-scope/expected.")
+//! @yah:verify("HONEST LIMIT ON WHAT THE FOUR SHIPS PROVE. Per the dispatch, no artifact was built (`yah qed run mesofact-musl` is unsafe right now, R876-B8); the newest existing artifact was used — .yah/cache/artifacts/named/f5211a44c8b1.../mesofact-x86_64-unknown-linux-musl.tar.gz, sha256 7201cbbcdc1b13cc40bdb109c04c16a084518ac779c3490c76e2d0ce45eb5290 — which is BYTE-IDENTICAL to what was already installed at runtimes/mesofact/0.8.32/x86_64-unknown-linux-musl/serve. So these runs exercise install + activation + scoping in full, at zero behaviour risk, but they do not additionally demonstrate new code taking effect. Node left with serve.hotship stamped 0.8.36-h15, release_version 0.8.32, same sha. TOOLING: `bash -n scripts/hotship.sh` clean; `shellcheck -s bash` reports only the three PRE-EXISTING findings (SC2016 DOOR_ACTIVATE, SC2034 leader_id, SC2012 ls -t) and nothing in the new code; the remote heredoc extracted and checked separately is `sh -n` clean and shellcheck-clean at zero findings. `yah qed pipelines` parses hotship with the new `services` param, and the `[ -n \"{{services}}\" ] && args+=` line was tested to exit 0 under `set -euo pipefail` when services is empty (so the default yubaba ship is unaffected).")
+//! @yah:handoff("LEADER DECISION, so the ticket's three-way \"which identity to match on\" question is settled: option (c) + (a) — an explicit required scope on the arm that REFUSES to activate without one, resolved to the per-service bundle digest for the match. Option (b) (ask kamaji by pid) was rejected as adding a runtime round-trip to a bash script for something already present in the serve argv. The install half was deliberately left shared and unchanged: one runtime asset backs every tenant naming that version, and that is correct for a runtime tier — the bug was only that ACTIVATION converted a shared-bytes change into a shared-outage change.")
+//! @yah:verify("LIVE MEASUREMENT, four real ships against us-east-001 (0.8.36-h12/h13/h14/h15), asserted on pid rather than on a log line as the ticket demanded. yah-marketing re-forked 611260,611273 -> 617664,617671 -> 617987,617998 -> 618240,618253 -> 619423,619436 while noisetable's pid 614524 stayed UNCHANGED throughout, confirmed by both pid and `ps -o lstart`. noisetable's probe: zero non-200s across 200 samples. yah.dev cost exactly 1x502 per activation — its own restart, which is in-scope and expected. Before the fix the same ship re-forked all three processes.")
+//! @yah:gotcha("THE FIRST LIVE SHIP EXPOSED TWO REPORTING BUGS IN THE NEW ARM AND BOTH WERE FIXED IN THE SAME PASS, which is worth knowing because both would have made a correct ship look wrong: a `kill -0` EPERM false alarm, and a fixed `sleep 3` that read pid state inside the 5s stop grace and so saw a partial set. The \"service not deployed on this node\" case was also changed from aborting a multi-node roll to a loud skip, matching the `unit:` arm's stated convention. Deploy-state reads were routed through sudo so that R876-B9's permission fix will not silently disarm this arm — that coupling is deliberate and B9 must not undo it.")
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -204,7 +228,22 @@ use kamaji::Kamaji as _;
 use std::path::PathBuf;
 
 /// Build version reported in [`KamajiToYubaba::Welcome`].
-pub const CONSTABLE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version this binary reports — over the UDS handshake (which is where
+/// yubaba's `/health` `kamaji_version` comes from) and from `--version`.
+///
+/// `CARGO_PKG_VERSION` unless `YAH_HOTSHIP_VERSION` was set at compile time.
+/// See `yubaba::VERSION` for the full rationale and for why the stamp is a
+/// prerelease of the NEXT patch (`0.8.36-h1`) rather than build metadata: in
+/// short, a hot-shipped binary must not be able to claim a published release's
+/// version, and us-east-001 reporting `kamaji 0.8.22` while carrying none of
+/// the 0.8.22 tree (R746-T3) is what happens when it can.
+///
+/// `build.rs` carries the `rerun-if-env-changed` that makes changing the
+/// variable actually invalidate the build.
+pub const CONSTABLE_VERSION: &str = match option_env!("YAH_HOTSHIP_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// Per-workload state Kamaji needs to drive a structured drain (R406-T7).
 ///
@@ -430,6 +469,13 @@ pub struct BundleBackend {
     /// Sits beside (not inside) the native supervisor's per-ident log dirs.
     /// `NativeRuntime` never scans `state_dir`, so a `deploys/` sibling cannot
     /// be mistaken for a workload's capture dir.
+    ///
+    /// R876-B9: **owner-only, 0700.** A record is the whole admission input,
+    /// which includes the revalidate tier's `env` — live cleartext credentials
+    /// on a multi-tenant box. The mode is enforced in
+    /// [`BundleBackend::record_deploy`] rather than here so that it is applied
+    /// on every write, including to a directory an older kamaji already
+    /// created at 0755.
     pub records_dir: PathBuf,
 }
 
@@ -456,6 +502,25 @@ pub struct BundleDeployRecord {
     pub mesh: Option<kamaji_proto::MeshAssignment>,
 }
 
+/// @yah:ticket(R876-B9, "kamaji writes bundle deploy records world-readable (0644) with live secrets inside")
+/// @yah:at(2026-09-09T09:16:19Z)
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:parent(R876)
+/// @yah:severity(high)
+/// @yah:gotcha("MEASURED ON LIVE PRODUCTION us-east-001 2026-09-09 by @Glimmerstone:griffin while working R876-B5 (found reading kamaji deploy state to resolve service -> bundle digest; not fixed there because it is a different crate and a separable concern). `stat -c '%a %U:%G'` gives `644 root:root` on /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json, with `755 root:root` on both parent dirs — so ANY unprivileged local account reads it. I read it end to end as the plain `debian` login user, no sudo. That file's `revalidate.env` block carries live credential material in cleartext: a CLOUDFLARE_API_TOKEN, a MESOFACT_S3_ACCESS_KEY_ID and a MESOFACT_S3_SECRET_ACCESS_KEY (values deliberately not reproduced here). Every deployed bundle gets one of these files, so the exposure is per-tenant and grows with the fleet.")
+/// @yah:next("THE WRITE SITE: BundleBackend::record_deploy, oss/kamaji/crates/kamaji-bin/src/server.rs:624-630 — `std::fs::write(&tmp, bytes)` then `std::fs::rename`. std::fs::write creates with 0666 &amp; ~umask, i.e. 0644 under the default umask, and the subsequent rename preserves that mode. The record was added for restart-replay (the @yah:handoff at server.rs:164 describes it); persisting it is right, the mode is not.")
+/// @yah:next("FIX SHAPE: create the tmp file with mode 0600 (OpenOptions + std::os::unix::fs::OpenOptionsExt::mode, or fs::set_permissions on the tmp before the rename — set it on the TMP, since setting it after the rename leaves a window where the final path is readable), and chmod the records_dir (server.rs:510, state_dir.join(&quot;deploys&quot;)) to 0700 at creation. Then remediate the fleet: the existing 0644 files on every node need chmod, and any credential that has been sitting world-readable on a multi-tenant box should be treated as disclosed and rotated — that rotation call is the operator's, not an agent's.")
+/// @yah:verify("Reproduce: `ssh &lt;node&gt; 'stat -c &quot;%a %U:%G %n&quot; /var/lib/yah/kamaji/bundles/state/deploys/*.json /var/lib/yah/kamaji/bundles/state/deploys'` as the unprivileged login user — currently 644 on the files and 755 on the dir. After the fix a freshly-recorded deploy must be 600 in a 700 dir, still readable by kamaji (root) on restart-replay, and `resume_bundle_workloads()` must still find and replay it. NOTE for whoever takes this: R876-B5's hotship activation resolves service -&gt; bundle digest by reading these same files as the LOGIN user (scripts/hotship.sh, bundle_serve_remote). Tightening the mode to 0600/0700 will break that read — it must move behind `sudo` in the same pass, or the fix lands a broken hot-ship. That is a two-line change in the remote script (sudo on the grep and on the deploys-dir listing), not a redesign.")
+/// @yah:handoff("CODE FIXED at the write site. BundleBackend::record_deploy (oss/kamaji/crates/kamaji-bin/src/server.rs, now ~:660) no longer uses std::fs::write. The tmp is created through OpenOptions with .mode(0o600) AND then f.set_permissions(0o600) on the open handle before any bytes are written - the second call is not redundant: .mode() applies only when THAT call creates the file, so a 0644 tmp left by an older kamaji that crashed mid-write would otherwise be reused as-is. The mode is set on the TMP and never after the rename, so the final path is never observable world-readable. records_dir is chmodded 0700 on EVERY record_deploy rather than only at creation, because DirBuilder::mode applies solely to dirs it creates (the same fact bind_listener documents at :1084) - so an upgraded node whose deploys/ already exists at 0755 self-heals on its next deploy instead of staying loose forever. Imports (std::io::Write, std::os::unix::fs::OpenOptionsExt) are scoped inside the fn: the module also compiles without the bundle-serving feature, where both would be unused. Doc comments at both sites (records_dir field and record_deploy) state why.")
+/// @yah:handoff("EXPOSURE INVENTORY - what the operator needs to scope a rotation. Credential NAMES only; no value was read, printed or logged anywhere. ONE NODE IS AFFECTED: us-east-001 (vps-8dba9ff8, debian@51.81.85.145). FILE 1: /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json, was 644 root:root, and it is the one carrying credential material - CLOUDFLARE_API_TOKEN, MESOFACT_S3_ACCESS_KEY_ID, MESOFACT_S3_SECRET_ACCESS_KEY, in cleartext in its revalidate env block. FILE 2: deploys/noisetable.json, also was 644 root:root, but a grep for the whole TOKEN/SECRET/KEY/PASSWORD name class returned zero hits, so no credential of that class is in it. Parent dir state/deploys was 755 root:root. DURATION, lower bound: the deploys DIRECTORY birth is 2026-08-31 19:42:36Z, i.e. at least 9 days of exposure to 2026-09-09. Do NOT read the per-file birth times as the exposure start - yah-marketing.json birth 2026-09-09 01:34:53Z and noisetable.json birth 2026-09-09 07:45:31Z are the CURRENT inodes only, because each redeploy renames a fresh file over the old one; the record itself has existed since the dir did. EXPLOITABILITY CONFIRMED, not inferred: read end to end as the plain debian login user with no sudo (READ OK before, READ DENIED after). NO OTHER NODE HAS RECORDS - checked us-west-001 (no /var/lib/yah/kamaji/bundles at all), us-south-001 (state/ exists, no deploys/), us-west-003, us-west-011, us-west-013, us-west-014, us-west-015: all absent. us-west-002 is the ONE GAP: ssh to struc@100.64.0.4 timed out, so it is unverified rather than clean. ROTATION IS THE OPERATOR CALL AND WAS NOT TOUCHED: nothing was rotated, revoked or re-issued by this ticket.")
+/// @yah:handoff("FLEET REMEDIATED, us-east-001 only (it is the only node with records). sudo chmod 0600 on both deploys/*.json and sudo chmod 0700 on the deploys dir, one node, live. Health confirmed after and identical to the before-baseline: all four serve pids still alive by /proc presence - 610122 (almanac-feed), 614524 (noisetable serve), 619423 (yah-marketing revalidate), 619436 (yah-marketing bundle) - kamaji and yubaba both systemctl is-active, and yah.dev 200/44242, yah.dev/releases 200/41629, noisetable.com 200/8441, byte-identical sizes to the pre-chmod reading. Nothing was restarted; a chmod is invisible to a process that already holds the file open, and kamaji reads these as root. AN INCIDENTAL PROOF WORTH KNOWING: the verification stat failed the first time with a literal-glob error because the LOGIN user's shell could no longer expand deploys/*.json - that failure is itself the confirmation the dir is closed, and any later check of these files needs the glob inside sudo sh -c, not outside it.")
+/// @yah:verify("THE TICKET'S OWN REPRODUCTION, run as the unprivileged debian login user on us-east-001, before and after. BEFORE: 755 root:root on state and on state/deploys, 644 root:root on both deploys/noisetable.json and deploys/yah-marketing.json, and an unprivileged cat of yah-marketing.json succeeded (READ OK). AFTER: 700 root:root on state/deploys, 600 root:root on both json files, and the same unprivileged cat now fails - READ DENIED, with ls reporting Permission denied on the directory. state/ itself was deliberately left 755: only the records dir needed closing, and tightening the shared state dir would have reached past the fix into the native supervisor's capture-dir siblings.")
+/// @yah:verify("TESTS, against a baseline measured BEFORE the change on the same tree. BASELINE: cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features bundle-serving = lib 270 passed / 0 failed / 0 ignored, plus the five integration targets (0+0+2+2+1) and 0 doc-tests, exit 0. AFTER: lib 271 passed / 0 failed / 0 ignored, same five targets unchanged, exit 0 - the +1 is exactly the one test added. cargo check --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --all-targets (i.e. WITHOUT bundle-serving) exit 0 with no unused-import warning, which is the check the fn-scoped imports exist for; the only two warnings on that run are the pre-existing never-used control_sock_from_spec (:2184) and free_port (:8277). NEW TEST a_deploy_record_is_written_owner_only_and_still_replays asserts all three claims together: mode 0600 on the record and 0700 on the dir; that a PRE-EXISTING 0755 dir and a stale 0644 tmp are tightened rather than trusted (the case that makes the explicit chmod load-bearing rather than decorative); and that recorded_deploys still round-trips the record byte-equal, which is the availability half - this fix must not trade a disclosure bug for a restart-replay bug. The existing end-to-end a_recorded_keepalive_bundle_is_resumed_by_a_fresh_kamaji also gained the two mode assertions, because it is the only test that reaches record_deploy through handle_message, so a regression that tightened only the direct callers would pass the focused test alone.")
+/// @yah:verify("R876-B5's HOT-SHIP ARM IS INTACT - verified, not re-done. Confirmed by content in the current scripts/hotship.sh that every deploy-state read already goes through sudo: deploy_files is `sudo find` (:331), owner_of is `sudo grep` (:336), the presence check is `sudo test -f` (:357), and both the digest and runtime extractions are `sudo grep` (:366, :371), under B5's own comment at :325 naming this ticket. Then run for real AFTER the chmod: scripts/hotship.sh --nodes us-east-001 --binaries mesofact --services yah-marketing --dry-run resolved `scope: yah-marketing -> bundle dd8bdfb75a53 (runtime mesofact/0.8.32)`, put 619423 and 619436 in scope, and correctly reverse-mapped the out-of-scope pid 614524 to `service noisetable` - that reverse mapping is owner_of grepping every file in the now-0700 dir, so it is the strictest available proof the sudo route works against the tightened mode. Nothing was signalled (dry run). No change to hotship.sh was needed or made.")
+/// @yah:handoff("FLEET REMEDIATION WAS DONE, NOT JUST THE WRITE PATH — that distinction matters, because fixing only `record_deploy` would have left every already-written 0644 file exposed forever. us-east-001 was the only node in the fleet carrying deploy records and was remediated live: files 0600, dir 0700, unprivileged read now denied, all four serve pids alive, and yah.dev / yah.dev/releases / noisetable.com byte-identical 200s afterwards. **us-west-002 is UNREACHABLE and therefore UNVERIFIED, not clean** — if it comes back and holds deploy records, it still needs the chmod.")
+/// @yah:verify("THE R876-B5 COUPLING HELD: `scripts/hotship.sh --dry-run --services yah-marketing` still resolves the bundle digest and reverse-maps the out-of-scope noisetable pid through B5's sudo route against the now-0700 dir, so no script change was needed. This was the one way B9 could have silently disarmed the hot-ship arm, and it was checked rather than assumed. Leader re-verification of the sibling ticket also came back clean: yah-cloud lib re-run 1137/0/4 exactly as R876-B7 reported, and `public-ip` confirmed an AFFINITY key by code (`taint_effect` returns `Repels` only for `no-<archetype>` keys; `AFFINITY_TAINT_KEYS` holds `PUBLIC_IP_TAINT`), so B7 did not move any live placement.")
+/// @yah:gotcha("THE CREDENTIAL ROTATION IS DELIBERATELY NOT DONE AND IS THE OPERATOR'S CALL — do not read this ticket reaching review as \"the exposure is closed\". Three credentials (CLOUDFLARE_API_TOKEN, MESOFACT_S3_ACCESS_KEY_ID, MESOFACT_S3_SECRET_ACCESS_KEY, values never reproduced) sat world-readable in /var/lib/yah/kamaji/bundles/state/deploys/ on us-east-001, a multi-tenant production box, for a 9-day LOWER BOUND measured from the deploys dir birth time. The permissions are now closed; the secrets should still be treated as disclosed until rotated.")
 #[cfg(feature = "bundle-serving")]
 impl BundleBackend {
     /// Build a bundle backend over `store`, caching materialized trees under
@@ -541,6 +606,51 @@ impl BundleBackend {
             .map_err(|e| format!("could not resolve a listen port for {ident}: {e:#}"))
     }
 
+    /// The store a workload's bundle objects are fetched from (R870-B6):
+    /// **its own origin first, this node's behind it**.
+    ///
+    /// `origin` is `serve_bundle.origin`, the public HTTPS origin serving the
+    /// bucket the workload was actually published to. `None` — every yah-owned
+    /// mirror today — returns [`Self::store`] itself, so the single-tenant path
+    /// is byte-identical and makes no extra request.
+    ///
+    /// This is [`Self::bind_port`]'s history on the store axis. A node-wide
+    /// `KAMAJI_BUNDLE_ORIGIN` is correct exactly while every workload on the
+    /// fleet publishes to the store the node was pointed at; the second tenant
+    /// published to its own bucket, and its deploy passed admission and then
+    /// failed with `missing blob manifests/<digest>` because the node looked in
+    /// yah's store for noisetable's manifest.
+    ///
+    /// The node origin stays *behind* the workload's rather than being replaced
+    /// by it, and that is deliberate: the stock `mesofact/<ver>` serve runtime
+    /// is published once by the fleet, and a tenant that has not mirrored ~70MB
+    /// of it into their own bucket must still be able to fork one. Chaining is
+    /// safe because every key here is content-addressed and verified after the
+    /// fetch — see [`yah_object_store::FallbackObjectStore`].
+    ///
+    /// Async because building the origin's `reqwest::blocking::Client` panics
+    /// inside a tokio runtime; construction goes to the blocking pool, exactly
+    /// as `attach_bundle_backend` does for the node-wide one.
+    pub async fn store_for(
+        &self,
+        origin: Option<&str>,
+    ) -> std::result::Result<Arc<dyn yah_object_store::ObjectStore>, String> {
+        let Some(origin) = origin.map(str::to_string) else {
+            return Ok(Arc::clone(&self.store));
+        };
+        let built = tokio::task::spawn_blocking({
+            let origin = origin.clone();
+            move || yah_object_store::HttpReadOnlyObjectStore::new(origin)
+        })
+        .await
+        .map_err(|e| format!("workload bundle-origin construction task panicked: {e}"))?
+        .map_err(|e| format!("workload bundle origin {origin:?}: {e}"))?;
+        Ok(Arc::new(yah_object_store::FallbackObjectStore::new(
+            Arc::new(built),
+            Arc::clone(&self.store),
+        )))
+    }
+
     fn record_path(&self, id: &WorkloadId) -> PathBuf {
         self.records_dir.join(format!("{}.json", id.0))
     }
@@ -549,12 +659,47 @@ impl BundleBackend {
     /// sibling temp file and renamed, so a crash mid-write leaves either the
     /// previous record or none, never a half-record that fails to parse on
     /// resume.
+    ///
+    /// R876-B9: **0600 in a 0700 dir, and the mode is set on the TMP.** A
+    /// record carries the deploy's `env` verbatim, which for the revalidate
+    /// tier is live credential material (`CLOUDFLARE_API_TOKEN`,
+    /// `MESOFACT_S3_*`). `std::fs::write` creates 0666 & ~umask — 0644 under
+    /// the default umask — and `rename` preserves the source's mode, so the
+    /// previous shape published every tenant's secrets to any local account.
+    /// Tightening after the rename would be wrong for the same reason the
+    /// write is done through a tmp at all: it leaves a window in which the
+    /// *final* path is world-readable, and that path is the one another
+    /// process is watching for.
+    ///
+    /// The dir is chmodded on every write rather than only at creation.
+    /// `DirBuilder::mode` applies solely to directories it creates, so a node
+    /// upgraded from an older kamaji would otherwise keep its 0755 `deploys/`
+    /// forever; doing it here makes the next deploy self-heal the mode.
     pub fn record_deploy(&self, record: &BundleDeployRecord) -> std::io::Result<()> {
+        // Scoped to this fn: the rest of the module is compiled without the
+        // `bundle-serving` feature too, where these two would be unused.
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         std::fs::create_dir_all(&self.records_dir)?;
+        std::fs::set_permissions(&self.records_dir, std::fs::Permissions::from_mode(0o700))?;
         let final_path = self.record_path(&WorkloadId::new(&record.id));
         let tmp = self.records_dir.join(format!(".{}.json.tmp", record.id));
         let bytes = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp, bytes)?;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            // `.mode()` only applies when THIS call creates the file. A tmp
+            // left behind by an older kamaji that crashed mid-write is 0644
+            // and would be reused as-is, so tighten the open handle before any
+            // bytes land in it.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.write_all(&bytes)?;
+        }
         std::fs::rename(&tmp, &final_path)
     }
 
@@ -2466,10 +2611,17 @@ async fn materialize_and_resolve_serve(
     let digest = yah_mesofact_bundle::BundleHash::parse(bundle.digest.0.clone())
         .map_err(|e| format!("bundle digest {:?} is not a valid blake3: {e}", bundle.digest.0))?;
 
+    // R870-B6: the workload's own store, with the node's behind it. Resolved
+    // once here and reused for the runtime asset below — the manifest, the
+    // blobs and the serve runtime all have to come from the same chain, or a
+    // tenant's bundle materializes and then fails to find anything to fork it
+    // with.
+    let workload_store = backend.store_for(bundle.origin.as_deref()).await?;
+
     // Cache materialize is synchronous fs + object-store I/O (a cold deploy may
     // fetch from R2). Run it on the blocking pool so the dispatch loop isn't
     // parked. A fresh BundleCache is cheap and stateless beyond root+budget.
-    let store = Arc::clone(&backend.store);
+    let store = Arc::clone(&workload_store);
     let cache_dir = backend.cache_dir.clone();
     let budget = backend.cache_budget;
     let digest_for_task = digest.clone();
@@ -2513,7 +2665,10 @@ async fn materialize_and_resolve_serve(
         // materialize above: a cold fetch is a ~70MB download.
         let runtime = yah_mesofact_bundle::RuntimeRef::parse(&bundle.runtime)
             .map_err(|e| format!("bundle runtime {:?}: {e}", bundle.runtime))?;
-        let store = Arc::clone(&backend.store);
+        // Same chain the materialize used (R870-B6). A tenant may publish its
+        // own runtime asset; one that doesn't reads through to the node origin's
+        // stock copy, and the miss costs one extra GET on a cold resolve only.
+        let store = Arc::clone(&workload_store);
         let cache_dir = backend.cache_dir.clone();
         let triple_for_task = triple.clone();
         let resolved = tokio::task::spawn_blocking(move || {
@@ -2660,7 +2815,15 @@ async fn run_bundle_keepalive(
     // static server stays up (reap it via Stop), but a declared receiver
     // that silently didn't start is the failure to avoid.
     if let Some(rv) = revalidate {
-        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip)
+        fork_revalidate_receiver(
+            backend,
+            id,
+            &bundle_dir,
+            &serve_bin,
+            rv,
+            bind_ip,
+            bundle.origin.as_deref(),
+        )
             .await
             .map_err(|e| {
                 format!("mesofact revalidate receiver for {} failed to start: {e}", id.0)
@@ -2742,7 +2905,15 @@ async fn run_bundle_on_demand(
     // accept pokes at any time), independent of the static server's JIT
     // idle-reaping. Fork it against the same materialized bundle.
     if let Some(rv) = revalidate {
-        fork_revalidate_receiver(backend, id, &bundle_dir, &serve_bin, rv, bind_ip)
+        fork_revalidate_receiver(
+            backend,
+            id,
+            &bundle_dir,
+            &serve_bin,
+            rv,
+            bind_ip,
+            bundle.origin.as_deref(),
+        )
             .await
             .map_err(|e| {
                 format!("mesofact revalidate receiver for {} failed to start: {e}", id.0)
@@ -2941,6 +3112,10 @@ async fn fork_revalidate_receiver(
     serve_bin: &Path,
     receiver: &workload_spec::MesofactRevalidateReceiver,
     bind_ip: std::net::Ipv4Addr,
+    // R870-B6: the workload's `serve_bundle.origin`, carried through only so
+    // the feed tier below resolves its runtime asset from the same store the
+    // serve binary came from.
+    origin: Option<&str>,
 ) -> std::result::Result<(), String> {
     let rv_id = WorkloadId(format!("{}-revalidate", id.0));
     // R844-F14: the receiver is its own ident with its own `http` port, not a
@@ -2960,7 +3135,7 @@ async fn fork_revalidate_receiver(
     // re-renders the data the bundle was built with forever. It is forked after
     // the receiver because its whole job is to poke it.
     if !receiver.feeds.is_empty() {
-        fork_feed_tier(backend, id, bundle_dir, &listen, receiver).await?;
+        fork_feed_tier(backend, id, bundle_dir, &listen, receiver, origin).await?;
     }
     Ok(())
 }
@@ -2998,6 +3173,7 @@ async fn fork_feed_tier(
     bundle_dir: &Path,
     receiver_listen: &str,
     receiver: &workload_spec::MesofactRevalidateReceiver,
+    origin: Option<&str>,
 ) -> std::result::Result<(), String> {
     use std::net::Ipv4Addr;
 
@@ -3011,7 +3187,10 @@ async fn fork_feed_tier(
         // is still network I/O that must not park the dispatch loop.
         let rref = yah_mesofact_bundle::RuntimeRef::parse(runtime)
             .map_err(|e| format!("feed_runtime {runtime:?}: {e}"))?;
-        let store = Arc::clone(&backend.store);
+        // R870-B6: the workload's store chain, same as the serve runtime's. A
+        // tenant naming a `feed_runtime` it published itself resolves from its
+        // own origin; one naming the stock fetcher reads through to the node's.
+        let store = backend.store_for(origin).await?;
         let cache_dir = backend.cache_dir.clone();
         let triple_for_task = triple.clone();
         let resolved = tokio::task::spawn_blocking(move || {
@@ -4009,6 +4188,7 @@ mod tests {
                 lifecycle: BundleLifecycle::default(),
                 port: None,
                 env: Default::default(),
+                origin: None,
             }),
             revalidate_receiver: None,
         });
@@ -5549,6 +5729,9 @@ mod tests {
                     // keeps no readable copy of a forked spec, so these
                     // end-to-end deploys can only assert admission.
                     env: Default::default(),
+                    // R870-B6. `None` is the single-tenant fleet: the node's
+                    // own store answers, which is what these tests inject.
+                    origin: None,
                 }),
                 revalidate_receiver: None,
             })
@@ -5844,6 +6027,228 @@ mod tests {
             );
         }
 
+        // ── R870-B6: the bundle's store travels with the workload ────────────
+
+        /// Point a bundle workload at the store it was published to.
+        fn with_bundle_origin(spec: Workload, origin: &str) -> Workload {
+            let Workload::MesofactStatic(mut w) = spec else {
+                unreachable!("serve_bundle_workload_with_runtime builds a MesofactStatic")
+            };
+            w.serve_bundle
+                .as_mut()
+                .expect("a bundle workload carries a serve_bundle")
+                .origin = Some(origin.to_string());
+            Workload::MesofactStatic(w)
+        }
+
+        /// Serve `store` over a throwaway HTTP/1.1 origin on loopback — the
+        /// shape an R2 custom domain presents to a node — and return its URL.
+        ///
+        /// Real HTTP rather than an injected `ObjectStore` on purpose: the
+        /// thing under test is that a *URL on the wire* reaches
+        /// `HttpReadOnlyObjectStore` and is what the fetch actually goes to. A
+        /// test that handed the backend a second in-memory store would pass
+        /// with the URL ignored, which is the bug.
+        async fn serve_store_over_http(store: Arc<dyn ObjectStore>) -> String {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let store = Arc::clone(&store);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0u8; 8192];
+                        let read = match sock.read(&mut buf).await {
+                            Ok(n) if n > 0 => n,
+                            _ => return,
+                        };
+                        let head = String::from_utf8_lossy(&buf[..read]).into_owned();
+                        let mut request = head.split_whitespace();
+                        let method = request.next().unwrap_or_default().to_string();
+                        let key = request
+                            .next()
+                            .unwrap_or("/")
+                            .trim_start_matches('/')
+                            .to_string();
+                        // The store is sync; keep it off the runtime thread.
+                        let found = tokio::task::spawn_blocking(move || store.get(&key))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let mut out = match &found {
+                            Some(bytes) => format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                bytes.len()
+                            )
+                            .into_bytes(),
+                            None => b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\
+                                      connection: close\r\n\r\n"
+                                .to_vec(),
+                        };
+                        if method != "HEAD" {
+                            out.extend(found.unwrap_or_default());
+                        }
+                        let _ = sock.write_all(&out).await;
+                        let _ = sock.flush().await;
+                    });
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        /// THE noisetable case, end to end. A second tenant publishes its
+        /// bundle to its **own** store; the node's store holds the fleet's
+        /// stock serve runtime and nothing of the tenant's. Both halves have to
+        /// resolve for the deploy to come up: the manifest and blobs from the
+        /// tenant's origin, the ~70MB runtime it did not republish from the
+        /// node's.
+        #[tokio::test]
+        async fn a_second_tenants_bundle_materializes_from_its_own_origin() {
+            let tenant: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_vanilla_bundle(tenant.as_ref(), "<html>noisetable</html>");
+
+            // The node's own store — the fleet's, holding no tenant object.
+            let node: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            publish_stock_runtime(node.as_ref());
+
+            let origin = serve_store_over_http(Arc::clone(&tenant)).await;
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(
+                BundleBackend::new(Arc::clone(&node), cache.path(), state.path())
+                    .with_bind_port(0),
+            ));
+
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(190),
+                    id: WorkloadId::new("noisetable-marketing"),
+                    spec: with_bundle_origin(
+                        serve_bundle_workload_with_runtime(
+                            &digest,
+                            STOCK_RUNTIME,
+                            BundleLifecycle::KeepAlive,
+                            Some(0),
+                        ),
+                        &origin,
+                    ),
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            await_deploy_ok(&ctx, "noisetable-marketing").await;
+
+            // The tenant's content came from the tenant's origin…
+            assert!(cache
+                .path()
+                .join("bundles")
+                .join(&digest)
+                .join("app/index.html")
+                .is_file());
+            // …and the stock runtime read through to the node's store, which is
+            // the only place it was ever published.
+            assert!(cache
+                .path()
+                .join("runtimes/mesofact/0.8.20")
+                .join(node_triple())
+                .join("serve")
+                .is_file());
+
+            let _ = handle_message(
+                YubabaToKamaji::Stop {
+                    request_id: RequestId(191),
+                    id: WorkloadId::new("noisetable-marketing"),
+                },
+                &ctx,
+            )
+            .await;
+        }
+
+        /// The negative control for the test above, and the reported bug
+        /// verbatim: the same tenant bundle with no `origin` on the wire is
+        /// admitted and then cannot be materialized, because the node looks in
+        /// its own store for a digest only the tenant's holds.
+        #[tokio::test]
+        async fn without_an_origin_a_tenant_bundle_fails_after_a_clean_admission() {
+            let tenant: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_vanilla_bundle(tenant.as_ref(), "<html>noisetable</html>");
+            let node: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            publish_stock_runtime(node.as_ref());
+
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(
+                BundleBackend::new(Arc::clone(&node), cache.path(), state.path())
+                    .with_bind_port(0),
+            ));
+
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(192),
+                    id: WorkloadId::new("noisetable-marketing"),
+                    spec: serve_bundle_workload_with_runtime(
+                        &digest,
+                        STOCK_RUNTIME,
+                        BundleLifecycle::KeepAlive,
+                        Some(0),
+                    ),
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+
+            let (state, detail) = await_deploy(&ctx, "noisetable-marketing").await;
+            assert_eq!(state, WorkloadState::Failed);
+            let message = detail.expect("a failed deploy must carry its reason");
+            assert!(message.contains(&digest), "got: {message}");
+        }
+
+        /// The node-wide origin is not *replaced* by a declared one, and a
+        /// workload that declares none does not pay for the mechanism: it gets
+        /// the node's store itself, with no second lookup behind it.
+        #[tokio::test]
+        async fn an_undeclared_origin_resolves_to_the_node_store_unchanged() {
+            let node: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            node.put("blobs/x", b"node".to_vec()).unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let backend = BundleBackend::new(Arc::clone(&node), cache.path(), state.path());
+
+            let plain = backend.store_for(None).await.unwrap();
+            assert!(
+                Arc::ptr_eq(&plain, &node),
+                "an undeclared origin must be the node's own store, not a wrapper"
+            );
+
+            // A tenant origin that holds nothing — the shape of a tenant that
+            // published its site but not the stock runtime.
+            let empty: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let origin = serve_store_over_http(empty).await;
+            let chained = backend.store_for(Some(&origin)).await.unwrap();
+            let looked = chained.locate("blobs/x");
+            assert!(
+                looked.contains(&format!("{origin}/blobs/x")),
+                "the declared origin is where it looks first: {looked}"
+            );
+            // The node's store stays reachable behind it — this is what lets a
+            // tenant fork the stock runtime it never republished. Off the
+            // runtime thread: the origin above is served by a task on it.
+            let read = tokio::task::spawn_blocking(move || chained.get("blobs/x"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.unwrap(), b"node".to_vec());
+        }
+
         // ── R844-F2: automatic port allocation + the resolved-port return ──
 
         /// THE motivating case, end to end through the real Deploy handler.
@@ -6137,6 +6542,7 @@ mod tests {
                 lifecycle: BundleLifecycle::KeepAlive,
                 port: None,
                 env: Default::default(),
+                origin: None,
             };
             assert_eq!(pinned.declared_pin(&bundle), Some(9100));
             let err = pinned
@@ -6530,6 +6936,17 @@ mod tests {
             await_deploy_ok(&first, "yah-marketing").await;
             let record = state.path().join("deploys/yah-marketing.json");
             assert!(record.is_file(), "admission must leave a record at {}", record.display());
+            // R876-B9: the record is the admission input, secrets included, so
+            // the real Deploy path must land it owner-only. Asserted here as
+            // well as in the focused test below because this is the only test
+            // that goes through `handle_message` — a regression that only
+            // tightened `record_deploy`'s direct callers would pass there.
+            assert_eq!(mode_of(&record), 0o600, "deploy record must be 0600");
+            assert_eq!(
+                mode_of(&state.path().join("deploys")),
+                0o700,
+                "deploy records dir must be 0700"
+            );
             // Kill the first daemon's child the way systemd would, so the
             // resumed one is provably a NEW fork and not the survivor.
             first
@@ -6601,6 +7018,71 @@ mod tests {
                 state.path(),
             )));
             assert_eq!(ctx.resume_bundle_workloads().await, 0);
+        }
+
+        /// Permission bits of `p`, minus the file-type bits.
+        fn mode_of(p: &std::path::Path) -> u32 {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+        }
+
+        /// R876-B9. A deploy record is the admission input *verbatim*, and for
+        /// any bundle with a revalidate tier that includes cleartext
+        /// credentials — on us-east-001 a `CLOUDFLARE_API_TOKEN` and two
+        /// `MESOFACT_S3_*` keys, measured 0644 in a 0755 dir, readable by every
+        /// local account on a multi-tenant box.
+        ///
+        /// Three things are asserted together because the fix is only worth
+        /// anything if all three hold: the mode is right, an *already loose*
+        /// dir and a stale tmp are tightened rather than trusted, and
+        /// `recorded_deploys` (the restart-replay reader, running as root) can
+        /// still read what was written. The last one is the trade this fix must
+        /// not make — a disclosure bug swapped for an availability bug.
+        #[test]
+        fn a_deploy_record_is_written_owner_only_and_still_replays() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+
+            // Pre-create the state an older kamaji leaves behind: a 0755 dir
+            // and a world-readable tmp from a crash mid-write. `.mode()` on
+            // OpenOptions does nothing when the file already exists, so this is
+            // the case that makes the explicit chmod load-bearing.
+            let dir = state.path().join("deploys");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let stale = dir.join(".yah-marketing.json.tmp");
+            std::fs::write(&stale, b"stale").unwrap();
+            std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let record = BundleDeployRecord {
+                id: "yah-marketing".to_string(),
+                bundle: MesofactServeBundle {
+                    digest: BlakeHash("a".repeat(64)),
+                    runtime: "self".to_string(),
+                    lifecycle: BundleLifecycle::KeepAlive,
+                    port: None,
+                    env: Default::default(),
+                    origin: None,
+                },
+                revalidate: None,
+                mesh: None,
+            };
+            backend.record_deploy(&record).unwrap();
+
+            let written = dir.join("yah-marketing.json");
+            assert_eq!(mode_of(&written), 0o600, "record must be 0600, not 0644");
+            assert_eq!(mode_of(&dir), 0o700, "a pre-existing 0755 dir must be tightened");
+            assert!(!stale.exists(), "the tmp is renamed onto the final path, not left behind");
+
+            // Restart-replay still works: same bytes back out.
+            assert_eq!(backend.recorded_deploys(), vec![record.clone()]);
+
+            // And a second write over an existing 0600 record keeps it 0600
+            // (`.mode()` alone would not, since it does not create the tmp).
+            backend.record_deploy(&record).unwrap();
+            assert_eq!(mode_of(&written), 0o600);
+            assert_eq!(mode_of(&dir), 0o700);
         }
 
         /// (a1) R330-F12: the receiver's argv must match `mesofact serve`'s

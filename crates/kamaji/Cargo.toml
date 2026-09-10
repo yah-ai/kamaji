@@ -72,14 +72,14 @@ tracing = "0.1"
 # `workload_spec::admission`. Not optional — deciding what is allowed to run
 # is kamaji's job description, and a build that could silently omit the
 # admission gate is a build an operator cannot tell apart from one that has it.
-workload-spec = { package = "yah-workload-spec", version = "0.8.34", features = ["admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.36", features = ["admission-verify"] }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.34", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.36", default-features = false }
 
 # SIGTERM for the native backend's graceful stop (optional — native-integration).
 libc = { version = "0.2", optional = true }
@@ -90,7 +90,7 @@ libc = { version = "0.2", optional = true }
 nix = { version = "0.29", optional = true, features = ["socket", "sched", "uio"] }
 
 # Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
-kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.34" }
+kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.36" }
 
 [dev-dependencies]
 tempfile = "3"
