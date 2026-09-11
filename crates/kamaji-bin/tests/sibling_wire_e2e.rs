@@ -190,6 +190,7 @@ fn full_container_spec() -> WorkloadSpec {
         },
         labels: HashMap::new(),
         annotations: HashMap::new(),
+        files: Vec::new(),
     }
 }
 

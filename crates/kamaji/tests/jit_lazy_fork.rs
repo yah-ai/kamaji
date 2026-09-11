@@ -353,6 +353,7 @@ mod imp {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 }

@@ -33,16 +33,20 @@
 //!   these to `KamajiToYubaba::Error { code, message }` for the wire.
 //!
 //! @yah:ticket(R881-S2, "Decide how a tenant-tier workload gets a reachable address: real CNI plumbing vs widening the host-network gate")
-//! @yah:at(2026-09-09T08:15:19Z)
+//! @yah:phase(P1)
+//! @yah:status(review)
+//! @yah:at(2026-09-10T02:24:47Z)
 //! @yah:kind(spike)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R881)
 //! @yah:next("THE ARCHITECTURE CALL BEHIND R881, held for the operator rather than decided by an agent. A tenant-tier workload in its own netns currently has no reachable networking shape at all. Two ways out, and they are not equivalent in cost or in what they promise. (A) MAKE PER-WORKLOAD MESH ADDRESSING REAL — CNI/veth/bridge plumbing attached at or immediately after oss/kamaji/crates/kamaji-containerd-core/src/lib.rs:1101, where the netns is currently created bare. This is the thing yah-cloud-admin.toml:112-117 calls \"still a stub\" and defers to; doing it retires the host-networking escape hatch's reason to exist and gives every tenant workload a real address. Largest change, correct end state. (B) WIDEN THE GATE — permit host port publishing below tier=infra with its own guard rails, moving the check at oss/kamaji/crates/kamaji-bin/src/containerd.rs:1159. Much smaller, unblocks noisetable-account immediately, and the cost is that a privilege boundary written deliberately gets loosened for convenience — worth naming plainly rather than discovering later. NOTE the workload-spec doc at oss/yah-base/crates/workload-spec/src/lib.rs:2860-2863 frames host networking as \"a privileged escape hatch for the few infra workloads that must bind a host port... without CNI/bridge plumbing\", i.e. (B) is explicitly the shape (A) is supposed to make unnecessary.")
-//! @yah:blocked_on(operator)
 //! @yah:gotcha("DO NOT let a consumer unblock itself by flipping its tier to \"infra\" while this is undecided — that dodges the privilege boundary rather than moving it, and the noisetable camp explicitly declined to do so on its own CLAUDE.md's instruction. If (B) is chosen, the widening should be an explicit, named capability with guard rails, not a tier reclassification of the workload asking for it.")
 //! @yah:gotcha("THE FLAGGED veth HIT IS REAL AND WAS READ — resolving the unread-hit caveat R881 filed against itself. `setup_veth_for_pid(pid, id)` at app/yah/cli/src/camp.rs:6849-6923 is REUSABLE IN TECHNIQUE BUT NOT IN POLICY. In its favour: it is PID-generic (it operates on /proc/&lt;pid&gt;/ns/net via ip + nsenter, so a containerd task PID would work) and it carries an RAII pair-delete guard. Against: it allocates link-local 169.254.x.y/30 with NO default route and NO NAT, and that absence is deliberate — it is precisely what denies the CLI sandbox internet access. So option (A) would reuse the mechanism and REPLACE the address plan, not adopt it wholesale. Useful, but it is not a shortcut to a finished (A).")
 //! @yah:gotcha("SCOPE NARROWED BY R881-B1 LANDING: the silent-failure half is FIXED, so this ticket is now purely about reachability. As of R881-B1 the noisetable-account shape produces a record that is published but never Ready (`NotReady { reason: \"unroutable\" }`), and `yah cloud apply` now ERRORS naming the hostname instead of rendering a dead upstream. That means the 503 is no longer silent and nobody is losing an afternoon to it — this ticket is no longer urgent, only blocking. It blocks exactly one known consumer: noisetable's R131-T12 (api.noisetable.com), which is set down at handoff waiting on it. Also note the docker-backend correction on the parent: `yah.docker.publish` already publishes host ports, so option (B) has a nearer precedent in-tree than the framing here first suggested.")
+//! @yah:handoff("THREE CHILDREN FILED IN DEPLOY ORDER, mapping 1:1 onto W343's \"What changes, in deploy order\": R881-T3 (kamaji, steps 1-3 — build the netns before runc and tear it down after, joined via the PodOptions::join_netns mechanism that containerd-core ALREADY honours at lib.rs:1097 and already tests at lib.rs:1776, so only the producer is missing); R881-T4 (yubaba, steps 4-5 — allocate a per-workload address, widen the R881-B1 routable predicate); R881-T5 (fleet, step 6 — advertise the /24, blocked_on operator because it is the one step that touches live infrastructure).")
+//! @yah:verify("Every code location cited in W343 was opened and read this session, not inferred: containerd-core lib.rs:1090-1151 (the bare netns and the resolv.conf condition), kamaji-bin containerd.rs:1164-1192 (the tier gate), kamaji-bin server.rs:1886-1904 (backend.deploy drops the MeshAssignment), kamaji lib.rs:214-247 (MeshAssignment shape), kamaji-proto messages.rs:373-378 (Deploy carries mesh since V2), yubaba service_records.rs:401 (binds_node_ports), workload-spec lib.rs:2855-2868 (the \"without CNI/bridge plumbing\" sentence this design retires).")
+//! @yah:handoff("DECISION MADE BY THE OPERATOR 2026-09-09, via ask_user with prefer=human, and recorded as canon in .yah/docs/working/W343-per-workload-mesh-addressing.md. CHOSEN: option (A) real per-workload mesh addressing — one bridge per node, one veth pair per workload, one routed /24 per node advertised to headscale as a subnet route. REJECTED: (B) widening the tier=infra host-network gate. ALSO REJECTED, and it was not in the ticket's original framing — a middle option (C) I put on the form: publish each workload's declared ports from the node's own address by DNAT, docker-style, keeping the container in its own netns without touching the privilege gate. Worth knowing why A beat C, because C is the cheaper build and the reasoning is the design's spine: DNAT makes the NODE's address the workload's address, so two workloads on one node cannot both hold the port their spec declares and the number a consumer dials stops being the number the author wrote. A routed /24 costs one extra moving part (route advertisement, R881-T5) and buys back \"a workload's declared port is its actual port, on an address that is its own\".")
+//! @yah:gotcha("THE \"NO LONGER URGENT, ONLY BLOCKING\" FRAMING IS WRONG ON THE LIVE FLEET — R881-B1 landed in code but is NOT DEPLOYED. Measured from the noisetable camp 2026-09-09 by @Ashguard:polaris (courier, session:f98a1bf4) under noisetable R131-T12. B1's changes are confined to oss/yubaba/crates/yubaba/src/{service_records.rs,lib.rs} — the yubaba SERVER lib — and the yah CLI deliberately links the thin yubaba-client instead (app/yah/cli/Cargo.toml:169-171, with a comment saying so), so B1's runtime effect depends entirely on the yubaba running ON the node. `yah cloud apply --service noisetable-api --env cloud`, run twice from a CLI built at rev 74874f3e (which has bf89bfb5, B1's commit, as a `git merge-base --is-ancestor` ancestor), STILL RENDERED `PASSWAY_UPSTREAMS=api.noisetable.com=100.64.0.3:4332` — the exact dead-upstream render B1 exists to refuse. So the fleet-side yubaba on us-east-001 predates bf89bfb5, or its ledger entry predates the `routable` field, which service_records.rs:691 documents as defaulting TRUE for pre-R881 files. CONSEQUENCE FOR THIS TICKET: the 503 is still silent in production, so the urgency this gotcha retired has not actually been retired — it is deferred until the fleet rolls. Someone should confirm whether a yubaba fleet roll is needed for B1 to take effect, and whether the pre-R881 `routable` default means even a rolled node keeps trusting stale ledger entries.")
 
 #![cfg(feature = "containerd-integration")]
 
@@ -228,12 +232,30 @@ impl ContainerdBackend {
     /// and holds its listen socket, so a later cert reload can hot-swap the
     /// process with **zero dropped connections** (R600-F9). Ordinary workloads
     /// take the plain path (no pod placement, no custody).
-    pub async fn deploy(&self, id: &WorkloadId, spec: &WorkloadSpec) -> Result<u32, BackendError> {
+    ///
+    /// `netns` (R881-T3 / W343) is a namespace the caller has already created
+    /// and wired — bridge, veth, address, default route. Passing it makes runc
+    /// `setns` into it instead of unsharing an empty one, which is the whole
+    /// difference between a workload something can dial and a workload that can
+    /// only reach itself. `None` keeps the empty-namespace behaviour.
+    ///
+    /// A custody workload ignores it, and correctly: custody requires host
+    /// networking (see [`deploy_custody`](Self::deploy_custody)), so there is no
+    /// namespace of its own to join.
+    pub async fn deploy(
+        &self,
+        id: &WorkloadId,
+        spec: &WorkloadSpec,
+        netns: Option<&Path>,
+    ) -> Result<u32, BackendError> {
         if kcc::upgrade_sock_dir(spec).is_some() {
             return self.deploy_custody(id, spec).await;
         }
-        self.deploy_generation(id, spec, &kcc::PodOptions::default(), &[])
-            .await
+        let pod = kcc::PodOptions {
+            join_netns: netns.map(|p| p.to_string_lossy().into_owned()),
+            shared_dir: None,
+        };
+        self.deploy_generation(id, spec, &pod, &[]).await
     }
 
     /// Create + start one containerd generation of `spec` under container id
@@ -525,7 +547,8 @@ impl ContainerdBackend {
                 container_id = %id.as_str(),
                 "graceful_upgrade: not a passway workload; connection-dropping redeploy"
             );
-            return self.deploy(id, spec).await;
+            // A passway is host-networked, so it has no namespace to join.
+            return self.deploy(id, spec, None).await;
         }
         if !self.custodian.holds(id.as_str()) {
             // No held socket (never custody-deployed, or the daemon restarted).
@@ -534,7 +557,8 @@ impl ContainerdBackend {
                 container_id = %id.as_str(),
                 "graceful_upgrade: no held socket; custody-deploying fresh"
             );
-            return self.deploy(id, spec).await;
+            // A passway is host-networked, so it has no namespace to join.
+            return self.deploy(id, spec, None).await;
         }
 
         // 1. Drain the running passway (SIGQUIT), give it its stop grace.
@@ -1271,6 +1295,7 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 

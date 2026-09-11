@@ -554,6 +554,7 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 

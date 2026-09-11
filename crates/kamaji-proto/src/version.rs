@@ -78,6 +78,34 @@ use serde::{Deserialize, Serialize};
 /// postcard message is mandatory and always encoded; the only compatibility
 /// mechanism here is this bump.**
 ///
+/// V8 (R870-F23) appends `files: Vec<InlineFile>` to
+/// [`workload_spec::WorkloadSpec`] — config a workload reads at startup,
+/// carried in the spec so the file and the process that reads it are one
+/// deploy rather than two. Fourth instance of the V2/V4/V5/V6 shape, and it
+/// nearly shipped unbumped on the same reasoning V6's stanza already refutes:
+/// the field has `#[serde(default)]`, so an *old* spec decodes fine and the
+/// JSON leg is genuinely unaffected. That is not the direction that breaks.
+/// `default` only affects DEserialization; a V8 yubaba still *encodes* the
+/// field — a length varint at minimum — and a V7 kamaji then reads it as
+/// whatever the next field is and misparses from there. Caught in review by
+/// @Ashguard:eclipse (session:e188ccc2) before it left the working tree, which
+/// is why this paragraph names the wrong reasoning rather than only the rule:
+/// **every field on a postcard message is mandatory and always encoded; the
+/// only compatibility mechanism here is this bump.**
+///
+/// V9 (R605-T27) appends `microvm: MicroVmHealth` to
+/// [`crate::NodeCapabilities`] — whether this node attached the microVM
+/// backend and, if it did, a live re-probe of `/dev/kvm`. Fifth instance of
+/// the V2/V4/V5/V6/V8 shape (a field appended to a struct carried inside an
+/// existing message), same rule applies unchanged: every field on a postcard
+/// message is mandatory and always encoded, so an unbumped peer on either
+/// side misreads every byte after this one. Before this field the only
+/// honest remote answer to "did this node attach the microVM backend" was
+/// the kamaji startup journal line — `GET /health` returns a fixed body with
+/// nothing per-backend, and the sibling wire had no capability query for this
+/// backend at all (unlike `native_exec`, already covered by
+/// [`crate::YubabaToKamaji::Capabilities`] / [`crate::NodeCapabilities`]).
+///
 /// The blast radius is one node: this protocol runs over a node-local UDS, and
 /// yubaba and kamaji self-install as a pair, so the skew window is a restart
 /// rather than a rolling fleet upgrade.
@@ -91,6 +119,8 @@ pub enum ProtocolVersion {
     V5,
     V6,
     V7,
+    V8,
+    V9,
 }
 
 impl Default for ProtocolVersion {
@@ -101,5 +131,5 @@ impl Default for ProtocolVersion {
 
 impl ProtocolVersion {
     /// The version this build of `kamaji-proto` produces by default.
-    pub const CURRENT: Self = Self::V7;
+    pub const CURRENT: Self = Self::V9;
 }

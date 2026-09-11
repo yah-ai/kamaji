@@ -94,6 +94,26 @@
 //! @yah:gotcha("The Stop handler is mirror_run_down (app/yah/desktop/src/mirror_run.rs), NOT GeneralSection.tsx or TabStrip.tsx — the dev tier is a Run-tab mirror cell, not a Service-category plugin instance. It does route through the reconciler's own lifecycle contract (RunningWorkload::shutdown), so the original next-step's suspicion of a bare process kill was also wrong. The handle it was calling shutdown() on simply had nothing attached to it.")
 //! @yah:handoff("Three children landed and in review: B1 (adopted mesofact-dev gets a real teardown + a log tail), B2 (workload.start/stop off the 500ms RPC floor), T3 (a restart verb + ⟳ button). Green with no input skew on the final runs: yah-cloud lib 17/17 on the touched modules, yah-agent-tools daemon_client 36/36, cargo check -p desktop --lib zero errors, bun typecheck clean, MirrorPanel+mirrorTier 40/40.")
 //! @yah:verify("MANUAL, and the only thing left — needs a desktop rebuild+install (`yah qed run yah-desktop-install`, or Settings -> build -> \"Install & restart\"). None of this reaches the operator until then, because the running app carries the binary it was built with.")
+//!
+//! @yah:relay(R885, "Native workloads run unbounded: wire kamaji cgroup + sandbox boundary onto the live deploy path")
+//! @yah:at(2026-09-10T07:28:48Z)
+//! @yah:status(open)
+//! @arch:see(.yah/docs/working/W344-native-workloads-run-unbounded.md)
+//!
+//! @yah:ticket(R885-B1, "Wire CgroupV2 + spawn_native onto NativeRuntime, resolving the delegated cgroup root at runtime")
+//! @yah:at(2026-09-10T07:29:18Z)
+//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:parent(R885)
+//! @yah:next("Tier: Warrior. This is the only ticket in R885 with a live blast radius: it changes what already-running fleet workloads do. Everything else under R885 is additive and should land behind it.")
+//! @yah:next("THE CODE ALREADY EXISTS AND IS GOOD. kamaji-bin/src/cgroup.rs (CgroupV2::create_workload :93, attach_pid :138, ensure_root :76) and kamaji-bin/src/native.rs (spawn :284) are complete and unit-tested. The parent-attaches / child-blocks-on-a-sync-pipe handshake at native.rs:364-372 (child side :475-480) is race-free — the child does nothing but a blocking read(2) until attach completes, then landlock + cap-drop + setresuid + execvpe. Do NOT rewrite it toward CLONE_INTO_CGROUP; just call it.")
+//! @yah:next("WHAT ACTUALLY RUNS TODAY is kamaji::native::NativeRuntime — tokio::process::Command::new at kamaji/src/native.rs:434, .spawn() at :464. No cgroup, no landlock, no capability drop. Its module header at :6 says the R406 layers arrive when the backend graduates to fleet hosts; it graduated and they did not follow. server.rs:2326 states the consequence in as many words.")
+//! @yah:next("THE PATH BUG THAT MUST LAND WITH THE WIRING, not after. kamaji.service sets Slice=yubaba.slice (:81), Delegate=yes (:85), DelegateSubgroup=native (:86), which puts kamaji at /yubaba.slice/kamaji.service/native and delegates THAT subtree. cgroup.rs DEFAULT_SLICE_ROOT (:31) plus the pushed \"native\" (:56-60) targets /sys/fs/cgroup/yubaba.slice/native — a SIBLING of kamaji.service, inside the slice but outside the delegation. Nothing reads /proc/self/cgroup (grep returns zero). Wire it as-is and kamaji writes into territory systemd owns and reconciles. Fix: resolve the delegated root from /proc/self/cgroup at startup instead of assuming a path.")
+//! @yah:next("Two smaller corrections in the same unit while you are there: the comment at kamaji.service:83-84 has the delegation direction backwards (Delegate=yes delegates FROM systemd TO the service), and ReadWritePaths=/sys/fs/cgroup (:122) grants the whole cgroupfs where the delegated subtree would do.")
+//! @yah:verify("Acceptance names a CALL SITE, not a test count: rg -n \"spawn_native|CgroupV2|create_workload\" --type rust -g \"!oss/kamaji/crates/kamaji-bin/src/cgroup.rs\" must return a live runtime call site in the deploy path, not only the lib.rs:64/:71 re-exports.")
+//! @yah:verify("On a Linux fleet node with a deployed native workload: systemctl show kamaji.service -p ControlGroup; cat /proc/<workload-pid>/cgroup — the workload must sit in its OWN leaf INSIDE the delegated subtree, not in 0::/yubaba.slice/kamaji.service/native (which is what us-west-001 shows today, recorded at oss/yubaba/crates/cloud/src/config.rs:292).")
+//! @yah:verify("cat /sys/fs/cgroup/<that-leaf>/memory.max — a real number, not the inherited parent value.")
+//! @yah:gotcha("R406 children T4 and T5 both reached review having never been reachable from a running binary, and sat there ~2 months (cgroup.rs last changed 2026-07-17, kamaji-bin/src/native.rs 2026-07-12, neither dirty). The tests passed the whole time. That is why this ticket must NOT be accepted on a test count.")
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -335,6 +355,41 @@ pub(crate) fn argv(spec: &WorkloadSpec) -> Result<Vec<String>> {
     Ok(argv)
 }
 
+/// Write out [`WorkloadSpec::files`] before the child that reads them execs
+/// (R870-F23).
+///
+/// Whole-file writes, never merges: the file on disk is exactly what the spec
+/// says, so a config that *shrinks* between deploys cannot leave a tail of the
+/// previous one behind. Parent directories are created.
+///
+/// Failure is fatal to the spawn rather than logged and stepped over. The
+/// workload this exists for — R870's inner door — reads its entire route table
+/// from such a file, so starting it against a stale or absent one is the
+/// silent-wrong-answer outcome the whole mechanism exists to remove: it would
+/// come up healthy and route to the wrong place.
+async fn materialize_files(spec: &WorkloadSpec) -> Result<()> {
+    for file in &spec.files {
+        if let Some(parent) = file.path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {} for a spec file", parent.display()))?;
+        }
+        tokio::fs::write(&file.path, &file.content)
+            .await
+            .with_context(|| format!("writing spec file {}", file.path.display()))?;
+        #[cfg(unix)]
+        if let Some(mode) = file.mode {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(mode))
+                .await
+                .with_context(|| {
+                    format!("chmod {mode:o} on spec file {}", file.path.display())
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// fork+exec one child from `spec`. `truncate_logs` truncates the capture files
 /// (initial deploy) vs. appends to them (respawns, so crash-loop history is
 /// preserved). `extra_env` layers on top of the spec env (used by graceful
@@ -371,6 +426,13 @@ async fn spawn_child(
         open(&stdout_path).with_context(|| format!("opening {}", stdout_path.display()))?;
     let stderr_file =
         open(&stderr_path).with_context(|| format!("opening {}", stderr_path.display()))?;
+
+    // R870-F23: config the workload reads at startup, carried in the spec.
+    // Written on EVERY spawn, not just the initial deploy, and deliberately:
+    // a respawn is the process re-reading its config, so the file it reads
+    // must be the one the current spec names. The supervisor retains the spec
+    // (see this module's doc), so the content is always the deployed one.
+    materialize_files(spec).await?;
 
     // NOTE: no `env_clear()`, and that is load-bearing in two directions.
     //
@@ -1091,7 +1153,78 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: vec![],
         }
+    }
+
+    /// R870-F23. The inner door reads its whole route table out of a file the
+    /// spec carries, so the guarantee under test is ordering: by the time the
+    /// child execs, the file is on disk with the *current* spec's bytes.
+    #[tokio::test]
+    async fn spec_files_are_written_before_the_child_reads_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let routes = tmp.path().join("nested/dir/inner.routes.json");
+        let echoed = tmp.path().join("echoed.txt");
+
+        let mut spec = native_spec(
+            "native-files",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("cat {} > {}", routes.display(), echoed.display()),
+            ],
+        );
+        spec.files = vec![workload_spec::InlineFile {
+            path: routes.clone(),
+            content: "{\"schema_version\":1,\"routes\":[]}".to_string(),
+            mode: Some(0o600),
+        }];
+
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+
+        // Parent directories were created for us.
+        assert_eq!(
+            std::fs::read_to_string(&routes).unwrap(),
+            "{\"schema_version\":1,\"routes\":[]}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&routes).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "declared mode is applied");
+        }
+
+        // The child could actually read it — i.e. the write happened first,
+        // not merely at some point during the deploy.
+        for _ in 0..50 {
+            if std::fs::read_to_string(&echoed).is_ok_and(|s| s.contains("schema_version")) {
+                runtime.teardown_workload(&spec.expose.mesh.identity).await.unwrap();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("child never read the materialized file at {}", routes.display());
+    }
+
+    /// The negative for every backend that does NOT write them: refuse the
+    /// spec rather than start a process against a file that is not there.
+    #[test]
+    fn a_backend_that_cannot_materialize_files_refuses_the_spec() {
+        let mut spec = native_spec("no-files-here", vec!["/bin/true".into()]);
+        assert!(crate::reject_unmaterializable_files(&spec, crate::Backend::Containerd).is_ok());
+
+        spec.files = vec![workload_spec::InlineFile {
+            path: "/etc/passway/inner.routes.json".into(),
+            content: "{}".into(),
+            mode: None,
+        }];
+        let err = crate::reject_unmaterializable_files(&spec, crate::Backend::Containerd)
+            .expect_err("containerd does not write spec files")
+            .to_string();
+        assert!(err.contains("/etc/passway/inner.routes.json"), "{err}");
+        assert!(err.contains("Containerd"), "{err}");
     }
 
     #[tokio::test]

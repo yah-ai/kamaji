@@ -192,6 +192,26 @@
 //! @yah:handoff("LEADER DECISION, so the ticket's three-way \"which identity to match on\" question is settled: option (c) + (a) — an explicit required scope on the arm that REFUSES to activate without one, resolved to the per-service bundle digest for the match. Option (b) (ask kamaji by pid) was rejected as adding a runtime round-trip to a bash script for something already present in the serve argv. The install half was deliberately left shared and unchanged: one runtime asset backs every tenant naming that version, and that is correct for a runtime tier — the bug was only that ACTIVATION converted a shared-bytes change into a shared-outage change.")
 //! @yah:verify("LIVE MEASUREMENT, four real ships against us-east-001 (0.8.36-h12/h13/h14/h15), asserted on pid rather than on a log line as the ticket demanded. yah-marketing re-forked 611260,611273 -> 617664,617671 -> 617987,617998 -> 618240,618253 -> 619423,619436 while noisetable's pid 614524 stayed UNCHANGED throughout, confirmed by both pid and `ps -o lstart`. noisetable's probe: zero non-200s across 200 samples. yah.dev cost exactly 1x502 per activation — its own restart, which is in-scope and expected. Before the fix the same ship re-forked all three processes.")
 //! @yah:gotcha("THE FIRST LIVE SHIP EXPOSED TWO REPORTING BUGS IN THE NEW ARM AND BOTH WERE FIXED IN THE SAME PASS, which is worth knowing because both would have made a correct ship look wrong: a `kill -0` EPERM false alarm, and a fixed `sleep 3` that read pid state inside the 5s stop grace and so saw a partial set. The \"service not deployed on this node\" case was also changed from aborting a multi-node roll to a loud skip, matching the `unit:` arm's stated convention. Deploy-state reads were routed through sudo so that R876-B9's permission fix will not silently disarm this arm — that coupling is deliberate and B9 must not undo it.")
+//!
+//! @yah:ticket(R605-T27, "No remote surface reports whether a node attached the microVM backend — the kvm probe is in-process only")
+//! @yah:status(review)
+//! @yah:at(2026-09-10T09:28:18Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R605)
+//! @yah:next("Tier: Cleric — a field on an existing response body plus its plumbing, with the design question being how much per-backend detail health should carry. Note the probe is deliberately uncached (it re-opens /dev/kvm per call), so whatever surface is added inherits that cost per request; decide whether that matters at health-check frequency before copying the behaviour outward.")
+//! @yah:verify("A remote caller can determine, without shell access to the node, whether that node has the microVM backend attached and why not if it isn't. The three call sites that currently make this impossible are named in this ticket's gotcha.")
+//! @yah:gotcha("ESTABLISHED BY R605-T15 while trying to satisfy a verify criterion I wrote that turned out to be unreachable by the route it named. GET /health returns yubaba's FIXED body — status, version, mode, hostkey, epochs, the kamaji version string — and nothing per-backend. MicroVmRuntime::health() really does re-probe /dev/kvm on every call rather than caching, so the answer exists; nothing carries it over a wire. The sibling client's health is hardcoded to ok with a comment saying there is no health message in the protocol, and the handshake carries only a protocol version and a version string. So the probe is in-process only, and today the ONLY honest remote check that a node attached the backend is the kamaji startup journal line. Any ticket whose verification reads 'GET /health on the node' for a backend-specific fact is unverifiable as written — R605-T15's was, and R605-T24's is sequenced to use the journal instead.")
+//! @yah:handoff("Wired the whole path: kamaji-proto's `NodeCapabilities` (the existing R858-T4 native_exec surface) grows a `microvm: MicroVmHealth { attached, kvm_ok, detail }` field, ProtocolVersion bumped V8->V9 per the crate's own field-append-is-a-wire-break rule. kamaji-bin's `YubabaToKamaji::Capabilities` handler populates it from `ctx.microvm.health()` (MicroVmRuntime's existing uncached /dev/kvm re-probe) when attached, or attached:false/None when the backend was never configured. New `GET /capabilities` route on yubaba (lib.rs) calls the sibling client's existing `.capabilities()` method and returns it as JSON — this is the actual remote-without-shell-access surface the ticket asked for; NodeCapabilities existed on the wire before this ticket but was reachable only in-process by yubaba's scheduler.")
+//! @yah:handoff("Design call, made per your ask rather than handed back: did NOT put this on GET /health (that body is documented to stay fixed/cheap/backend-agnostic) and did NOT touch sibling.rs's Kamaji::health() (that answers connection-liveness, a different question from backend-attachment — the two were already correctly separated by the native_exec precedent, which surfaces via Capabilities/NodeCapabilities, not health()). Scoped to microvm only, not a general per-backend health sweep across native/containerd/docker — out of this ticket's verify criterion.")
+//! @yah:handoff("The uncached-cost question you flagged: decided it's fine to pay a live /dev/kvm open+close on every /capabilities call, same as MicroVmRuntime::health() already does by design (permission/device changes are exactly what an operator does live; a cached answer would hide that). This is a cheap device-open, not a socket connect-with-timeout like containerd/docker's probes, so it's a different cost class from the probes that motivated caching elsewhere.")
+//! @yah:handoff("The fourth failure mode named in the ticket (missing vmlinux/rootfs/VMM binary) is NOT reachable as a live health state and MicroVmHealth's doc comment says so explicitly: MicroVmRuntime::new refuses to construct when those are missing, and per main.rs's own handoff that refusal is FATAL to process boot (not a warning), so a running kamaji that answers this message was either never asked to attach (attached:false) or attached successfully — the missing-artifact case only ever shows up in the startup journal, never on a live wire.")
+//! @yah:handoff("Did not touch oss/kamaji/crates/kamaji/src/microvm.rs (R605-F22's live working set per your blast-radius note) or sibling.rs beyond reading it.")
+//! @yah:verify("cd oss/kamaji && cargo test -p kamaji-proto -p kamaji --all-features: 33 + 24 passed, 0 failed.")
+//! @yah:verify("cd oss/kamaji && cargo test --workspace --all-features: 311 passed, 1 failed (server::tests::tenant_passway::deploy_arms_the_declared_socket_and_stop_releases_it) — confirmed pre-existing/flaky, unrelated to this change: passes clean in isolation with --test-threads=1, and touches tenant-passway socket teardown, nothing this ticket edited.")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba --lib --all-features: 953 passed, 0 failed.")
+//! @yah:verify("cd oss/kamaji && cargo check -p kamaji-bin (no microvm feature, default): clean, only 2 pre-existing unrelated warnings.")
+//! @yah:verify("cd oss/kamaji && cargo check --workspace --all-features and cd oss/yubaba && cargo check -p yubaba --all-features: both clean.")
+//! @yah:gotcha("THIS TICKET BUMPED THE WIRE PROTOCOL, V8 -> V9, so it is not shippable on its own — sequence the roll as if both versions exist, because on a live fleet they will. kamaji-proto's NodeCapabilities grew a `microvm: MicroVmHealth { attached, kvm_ok, detail }` field and the bump is per the crate's own wire-break rule, which is the right call under the camp's pre-1.0 \"break it, don't tape it\" policy. But it means a yubaba speaking V9 and a kamaji speaking V8 must not meet: roll kamaji before yubaba, or roll them together. Compounding this, R605-B26 enabled the `microvm` cargo feature in the build recipes and NOTHING HAS BEEN BUILT OR SHIPPED with it yet — nobody has cross-compiled that feature for either musl triple. So the next fleet build carries two unshipped changes at once (feature-on kamaji, V9 protocol) plus R605-F22's networking work. Do not roll any of it piecemeal.")
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -320,6 +340,19 @@ pub struct ServerCtx {
     /// the legacy "not implemented" message.
     #[cfg(feature = "containerd-integration")]
     pub containerd: Option<Arc<crate::containerd::ContainerdBackend>>,
+    /// Optional container networking (R881-T3 / W343). `Some` when kamaji was
+    /// started with `--container-net`, which is what makes a namespaced
+    /// workload reachable: a bridge, a veth pair, an address out of the given
+    /// range, a default route, and egress NAT.
+    ///
+    /// `None` is the pre-R881 behaviour, and it is not a degraded mode so much
+    /// as the absence of a capability: runc unshares an empty namespace, the
+    /// workload can reach nothing and nothing can reach it, and
+    /// `yubaba::service_records::binds_node_ports` publishes its record as
+    /// `NotReady { reason: "unroutable" }` rather than as a live upstream
+    /// (R881-B1). A node without this flag is honest about it end to end.
+    #[cfg(feature = "containerd-integration")]
+    pub container_net: Option<kamaji::container_net::ContainerNet>,
     /// Optional keep-alive bundle backend (R599-F10). `None` outside the
     /// `bundle-serving` feature build, or when kamaji is started without a node
     /// bundle store configured. When `None`, Deploy of a `serve_bundle`
@@ -338,6 +371,20 @@ pub struct ServerCtx {
     /// whose declared restore never ran — the exact failure
     /// [`crate::hydrate::run`] refuses.
     pub hydrate_helper: Option<std::path::PathBuf>,
+    /// Path to `turso-backup-tail`, from `--tail-helper` / `KAMAJI_TAIL_HELPER`
+    /// (R850-F1). `None` on a node that has not been given one, which makes a
+    /// deploy that *declares* a tier fail loudly — see [`crate::tail::spawn`].
+    ///
+    /// Separate from [`Self::hydrate_helper`] rather than one "turso-backup
+    /// bindir" for the reason the two halves are separate binaries: a node can
+    /// legitimately be able to restore and not to stream (a migration target
+    /// being prepared), and collapsing them would make that state unexpressible.
+    pub tail_helper: Option<std::path::PathBuf>,
+    /// The durability tails this node is running, one per workload that
+    /// declares a bytes-shipping tier (R850-F1). Not an `Option` and not behind
+    /// a feature: an empty supervisor is the correct state for a node with no
+    /// such workload, which is every node today.
+    pub tail: crate::tail::TailSupervisor,
     /// Optional per-tenant passway JIT tier (R852-F1 / W267 §"Free-tier ingress
     /// at 10k domains"). `None` outside the `tenant-passway` feature build, or
     /// when kamaji is started without `--tenant-passway-dir`. When `None`, a
@@ -817,8 +864,12 @@ impl ServerCtx {
             registry: Arc::new(Mutex::new(Registry::new())),
             log_sink: Arc::new(JournalSender::connect()),
             hydrate_helper: None,
+            tail_helper: None,
+            tail: crate::tail::TailSupervisor::default(),
             #[cfg(feature = "containerd-integration")]
             containerd: None,
+            #[cfg(feature = "containerd-integration")]
+            container_net: None,
             #[cfg(feature = "bundle-serving")]
             bundle: None,
             #[cfg(feature = "tenant-passway")]
@@ -839,8 +890,12 @@ impl ServerCtx {
             registry,
             log_sink: Arc::new(JournalSender::connect()),
             hydrate_helper: None,
+            tail_helper: None,
+            tail: crate::tail::TailSupervisor::default(),
             #[cfg(feature = "containerd-integration")]
             containerd: None,
+            #[cfg(feature = "containerd-integration")]
+            container_net: None,
             #[cfg(feature = "bundle-serving")]
             bundle: None,
             #[cfg(feature = "tenant-passway")]
@@ -867,6 +922,16 @@ impl ServerCtx {
     #[cfg(feature = "containerd-integration")]
     pub fn with_containerd(mut self, backend: Arc<crate::containerd::ContainerdBackend>) -> Self {
         self.containerd = Some(backend);
+        self
+    }
+
+    /// Attach container networking (R881-T3). Only available with the
+    /// `containerd-integration` feature — it is the containerd path's namespace
+    /// that this wires, and the docker backend publishes host ports by a
+    /// different mechanism (`yah.docker.publish`).
+    #[cfg(feature = "containerd-integration")]
+    pub fn with_container_net(mut self, net: kamaji::container_net::ContainerNet) -> Self {
+        self.container_net = Some(net);
         self
     }
 
@@ -901,6 +966,15 @@ impl ServerCtx {
     /// *declares* a durability tier fail loudly. See [`crate::hydrate::run`].
     pub fn with_hydrate_helper(mut self, helper: std::path::PathBuf) -> Self {
         self.hydrate_helper = Some(helper);
+        self
+    }
+
+    /// Point the durability tail at `turso-backup-tail` (R850-F1). The twin of
+    /// [`Self::with_hydrate_helper`], and unset behaves the same way: a deploy
+    /// that declares a tier is refused rather than started with nothing
+    /// shipping its state.
+    pub fn with_tail_helper(mut self, helper: std::path::PathBuf) -> Self {
+        self.tail_helper = Some(helper);
         self
     }
 
@@ -1289,11 +1363,46 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             #[cfg(not(feature = "native-exec"))]
             let (native_exec, native_exec_dir) = (false, None);
 
+            // R605-T27: answered from `ctx.microvm`, the same
+            // `Option<Arc<MicroVmRuntime>>` `deploy_workload`'s microvm arm
+            // dispatches on, for the same reason `native_exec` reads
+            // `ctx.native` above — a capability a scheduler reads and one a
+            // deploy exercises must not be able to disagree. `health()` is a
+            // live `/dev/kvm` re-probe, not cached from attach time (see
+            // `MicroVmHealth::kvm_ok`'s doc).
+            #[cfg(feature = "microvm")]
+            let microvm = match &ctx.microvm {
+                Some(rt) => match rt.health().await {
+                    Ok(h) => kamaji_proto::MicroVmHealth {
+                        attached: true,
+                        kvm_ok: Some(h.ok),
+                        detail: h.detail,
+                    },
+                    Err(e) => kamaji_proto::MicroVmHealth {
+                        attached: true,
+                        kvm_ok: Some(false),
+                        detail: Some(e.to_string()),
+                    },
+                },
+                None => kamaji_proto::MicroVmHealth {
+                    attached: false,
+                    kvm_ok: None,
+                    detail: None,
+                },
+            };
+            #[cfg(not(feature = "microvm"))]
+            let microvm = kamaji_proto::MicroVmHealth {
+                attached: false,
+                kvm_ok: None,
+                detail: None,
+            };
+
             KamajiToYubaba::CapabilitiesReport {
                 request_id,
                 capabilities: kamaji_proto::NodeCapabilities {
                     native_exec,
                     native_exec_dir,
+                    microvm,
                 },
             }
         }
@@ -1823,8 +1932,78 @@ async fn deploy_tenant_passway(
 /// the deploy reports a `BackendRefused` naming what this specific build is
 /// missing — feature not compiled in vs compiled but unconfigured — so an
 /// operator can tell a rebuild from a restart-with-flags.
+///
+/// @yah:ticket(R881-T3, "kamaji: build a real network namespace before runc — bridge + veth + address + route, joined via PodOptions::join_netns")
+/// @yah:phase(P1)
+/// @yah:status(review)
+/// @yah:at(2026-09-10T02:48:33Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R881)
+/// @yah:next("READ W343 FIRST — it is the adopted design (operator chose option A on R881-S2, 2026-09-09). Steps 1-3 of its \"What changes, in deploy order\" are this ticket.")
+/// @arch:see(.yah/docs/working/W343-per-workload-mesh-addressing.md)
+/// @yah:handoff("LANDED. A tenant container now gets a real network namespace instead of the empty one runc unshares. New module oss/kamaji/crates/kamaji/src/container_net.rs holds the whole address plan and every privileged step; kamaji-bin wires it at the two seams that had none. Deploy: server.rs build_container_netns() runs bridge + veth + address + route before backend.deploy, which now takes `netns: Option<&Path>` and passes it as PodOptions::join_netns — the mechanism kamaji-containerd-core/src/lib.rs:1097 already honoured and already tested, so only the producer was missing. Stop: the containerd arm of stop_workload deletes the namespace after the container teardown, best-effort, so a workload that never had one stops exactly as before.")
+/// @yah:handoff("PLAN-THEN-APPLY, AND IT IS NOT CEREMONY. Every `ip`/`iptables` step is produced as a `Cmd` by a pure function and only then executed by `apply`. Neither binary exists on a darwin camp host, so a shell-out module would have had zero test coverage of the thing that can actually be wrong here — argument ORDER. Three of the setup steps are order-dependent in ways the kernel enforces (a link can only be moved into a namespace that exists, renamed while it is down, and default-routed after its address is on), and `the_setup_sequence_is_the_order_the_kernel_requires` pins all twelve lines verbatim. Idempotency is expressed the same way: `Cmd.ignore_failure`, with every iptables rule DELETED before it is ADDED, so N deploys leave one rule rather than N. Pinned by `re_running_the_bridge_setup_cannot_accumulate_duplicate_rules`.")
+/// @yah:handoff("TWO PIECES OF DISCOVERED WORK, both inside the blast radius and both done here. (1) EGRESS WAS BROKEN TOO, and nobody had written it down — R881 was filed as an ingress bug. kamaji-containerd-core/src/lib.rs bound /etc/resolv.conf only under `wants_host_network()`, on the stated reasoning that \"an isolated netns has no upstream resolver to inherit\". That was true only because an isolated netns had no route at all; a workload joining a namespace this ticket wires has a default route and MASQUERADE, so the host resolver is as reachable from inside as from the host. Without the widening such a workload gets an address, gets IP egress, and still cannot resolve a name — which reads as a networking bug and is a missing file. Condition is now `wants_host_network() || pod.join_netns.is_some()`, pinned by `a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not`, whose other half asserts a BARE namespace still gets no resolv.conf (a resolver pointing at an unreachable nameserver turns an instant failure into a DNS timeout on every lookup). (2) THE SHARED ADDRESS PLAN, built here rather than left for R881-T4: `ContainerNet::node_subnet(node_mesh_ip)` and `workload_address(node_mesh_ip, n)`. yubaba will call them to allocate; kamaji never does — it recovers the same /24 from the address it is handed. Two implementations of one scheme is exactly the drift R881 was, so there is one, in one file, with `yubabas_allocation_and_kamajis_recovery_agree_without_talking` asserting the round trip.")
+/// @yah:verify("FULL RADIUS, exit codes echoed rather than inferred from an empty grep. `cargo check --workspace --all-features --all-targets` in oss/kamaji = KAMAJI_CHECK_EXIT 0 (two warnings, both pre-existing and unrelated: yah-object-store parse_list_v2 dead_code, kamaji-bin pidfd events_tx). `cargo test --workspace --all-features` in oss/kamaji = KAMAJI_TEST_EXIT 0, zero failures across every target; the two suites this touched are kamaji lib (303, +20 new container_net tests) and kamaji-bin lib (200, +4 new). `cargo check --workspace --all-targets` from the REPO ROOT = ROOT_CHECK_EXIT 0 — the run that would have caught a call site outside the oss/kamaji workspace, since kamaji is patched in via [patch.crates-io]; `ContainerdBackend::deploy` gained a parameter and a workspace-local check cannot see past its own members. Grepped app/ crates/ oss/yubaba/ xtask/ for ContainerdBackend first: only two doc-comment mentions, no call sites.")
+/// @yah:gotcha("THIS IS INERT ON EVERY NODE UNTIL TWO THINGS HAPPEN, AND THAT IS BY DESIGN — do not read a green build as \"the fleet has container networking now\". (a) `--container-net CIDR` / `$KAMAJI_CONTAINER_NET` is off by default, the same explicit opt-in every other kamaji backend requires; no node's kamaji.service passes it yet. (b) EVEN WITH THE FLAG SET, `ContainerNet::plan()` returns None for every workload today, because yubaba still sends the NODE's own mesh address (100.64.0.x) in the MeshAssignment for everybody — that is R881-T4's job. Building a namespace around the node's own address would put it on a veth and break every container on the box, so the None arm is load-bearing rather than a stub, and `a_node_address_builds_no_namespace_rather_than_a_broken_one` is the test that keeps it. Consequence for whoever rolls this: the safe order is T4 first (or same release), then the flag, then R881-T5's route advertisement. A node with the flag and no T4 behaves exactly like a node without it.")
+/// @yah:assumes("NOTHING RAN AGAINST A LINUX NODE — stated plainly, because it is the honest limit of this ticket's verification. Every test here is pure: it asserts the COMMAND SEQUENCE, not its effect, since `ip` and `iptables` do not exist on a darwin camp host. What is therefore unproven by test and reasoned from documented behaviour: that `ip -n <ns> link set <peer> name eth0` succeeds on a link that is down but already moved (it is, the rename precedes the `up`); that deleting a namespace destroys its veth and with it the host-side peer (the basis for teardown naming only the namespace); and that runc accepts /var/run/netns/<name> as a `{\"type\":\"network\",\"path\":...}` target (the same path shape kamaji::socket_custody::netns_path already builds for the custody netns). First live deploy on a node with --container-net set is the real test, and it should be one workload on one node, not a fleet roll.")
 #[allow(unused_variables)]
 async fn deploy_container(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: &WorkloadId,
+    spec: &workload_spec::WorkloadSpec,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
+) -> KamajiToYubaba {
+    // R850-F1, the backup half. Checked BEFORE the deploy and started AFTER it,
+    // and the split is the point: a node that cannot ship this workload's state
+    // should refuse it without having restored a volume or started a container,
+    // while the tail itself must not take the ownership claim until the
+    // workload is actually running — a claim taken for a deploy that then fails
+    // fences whichever node succeeds.
+    //
+    // The hydrate precondition is checked here too, ahead of the tail's, so a
+    // node missing both helpers names the restore first: it is the earlier gate
+    // in the workload's life and the more dangerous omission — an empty volume
+    // at boot is indistinguishable from a healthy first boot, while a missing
+    // tail is at least a workload that came up with its real data.
+    for message in [
+        crate::hydrate::preflight(ctx.hydrate_helper.as_deref(), spec),
+        crate::tail::preflight(ctx, spec),
+    ] {
+        if let Err(message) = message {
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message,
+            };
+        }
+    }
+
+    let reply = deploy_container_inner(ctx, request_id, id, spec, mesh).await;
+
+    if matches!(
+        reply,
+        KamajiToYubaba::Ack { kind: kamaji_proto::AckKind::Deploy, .. }
+    ) {
+        if let Err(message) = crate::tail::spawn(ctx, id, spec).await {
+            // Preflight already cleared the declared-but-unconfigured case, so
+            // reaching here means the helper would not spawn. Stop what we just
+            // started rather than leave it running with nothing shipping its
+            // state — an un-backed-up appliance that looks healthy is the exact
+            // failure this whole ticket exists to remove.
+            let _ = stop_workload(ctx, request_id, id.clone()).await;
+            return KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
+                message,
+            };
+        }
+    }
+    reply
+}
+
+async fn deploy_container_inner(
     ctx: &Arc<ServerCtx>,
     request_id: kamaji_proto::RequestId,
     id: &WorkloadId,
@@ -1885,7 +2064,22 @@ async fn deploy_container(
 
     #[cfg(feature = "containerd-integration")]
     if let Some(backend) = ctx.containerd.clone() {
-        return match backend.deploy(id, spec).await {
+        // R881-T3 / W343: build the workload's network namespace before runc is
+        // asked to join it. `None` here — no `--container-net`, no assignment,
+        // or an address outside this node's range — leaves the pre-R881
+        // behaviour, where runc unshares an empty namespace and the workload is
+        // reachable from nothing.
+        let netns = match build_container_netns(ctx, id, spec, mesh).await {
+            Ok(netns) => netns,
+            Err(message) => {
+                return KamajiToYubaba::Error {
+                    request_id: Some(request_id),
+                    code: ErrorCode::BackendRefused,
+                    message,
+                };
+            }
+        };
+        return match backend.deploy(id, spec, netns.as_deref()).await {
             Ok(_pid) => KamajiToYubaba::Ack {
                 request_id,
                 kind: kamaji_proto::AckKind::Deploy,
@@ -1934,6 +2128,61 @@ async fn deploy_container(
     }
 
     no_container_backend_error(request_id)
+}
+
+/// Build the network namespace a container will be started inside, returning
+/// the path for `PodOptions::join_netns` (R881-T3 / W343).
+///
+/// `Ok(None)` means "this workload gets the namespace runc unshares", and is
+/// the answer in four distinct situations that all look the same from here:
+/// this node was started without `--container-net`; the workload asked for host
+/// networking, so it has no namespace of its own to wire; yubaba sent no mesh
+/// assignment; or the address yubaba sent is not one this node routes — which
+/// is every workload until R881-T4 teaches yubaba to allocate, since today it
+/// sends the *node's own* mesh address to everybody.
+///
+/// `Err` is reserved for a node that was told to do container networking and
+/// then could not, which is a refused deploy rather than a silent fallback: the
+/// workload would come up unreachable, and shipping unreachable workloads that
+/// look healthy is the defect this relay exists to remove.
+#[cfg(feature = "containerd-integration")]
+async fn build_container_netns(
+    ctx: &Arc<ServerCtx>,
+    id: &WorkloadId,
+    spec: &workload_spec::WorkloadSpec,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let (Some(net), Some(mesh)) = (ctx.container_net.as_ref(), mesh) else {
+        return Ok(None);
+    };
+    if spec.wants_host_network() {
+        return Ok(None);
+    }
+    let Some(plan) = net.plan(id.as_str(), mesh.mesh_ip) else {
+        tracing::debug!(
+            id = %id.0,
+            mesh_ip = %mesh.mesh_ip,
+            range = %net.range(),
+            "container networking configured but the workload's address is outside this node's range"
+        );
+        return Ok(None);
+    };
+
+    let mut cmds = net.bridge_commands(&plan);
+    cmds.extend(net.setup_commands(&plan));
+    kamaji::container_net::apply(&cmds)
+        .await
+        .map_err(|e| format!("container networking for {}: {e:#}", id.as_str()))?;
+
+    let path = plan.netns_path();
+    tracing::info!(
+        id = %id.0,
+        netns = %path.display(),
+        address = %plan.container_ip,
+        gateway = %plan.gateway,
+        "container network namespace wired"
+    );
+    Ok(Some(path))
 }
 
 /// Run a native-marked container workload on the node's own userland
@@ -3029,6 +3278,7 @@ fn bundle_workload_spec(
         },
         labels: Default::default(),
         annotations: Default::default(),
+        files: Vec::new(),
     }
 }
 
@@ -3699,11 +3949,18 @@ async fn graceful_upgrade_workload(
 /// @yah:gotcha("ROLL GATE — THIS FIX MUST NOT SHIP AHEAD OF R858-T4 AND R858-T16. Landing it in SOURCE is safe and is what happened here, because a source change reaches no node: code arrives on a voter only via a deliberate yubaba/kamaji release plus scripts/roll-node.sh. ROLLING it is the gated act. This arm converts a Stop that used to Ack-and-no-op into one that really kills the child, and the child in question is the mesh coordinator — so any surviving spurious-teardown path that was previously harmless becomes a real decapitation the moment this binary is on a node. The gate is satisfied only when the release that carries this ALSO carries R858-T4 (all three voters given kamaji --native-exec-dir and the headscale v0.23.0 binary, so the fleet has somewhere to fail over to) and R858-T16 (config.yaml hydration in leader::start_headscale). Both were done/at-review when this landed, so the safe forward path is one release containing T4 + T16 + B13 + B14 + this. Whoever cuts that release: verify T4 and T16 are in the same build before rolling, and keep honouring the parent relay's warning against rolling published 0.8.33 onto us-west-001, which still runs two hand-built musl binaries.")
 /// @yah:cleanup("UNCHECKED, ADJACENT, DELIBERATELY NOT TOUCHED: the bundle-serving arm of stop_workload still calls `backend.native.teardown_workload(&ident)` with a bare `MeshIdent(id.0.clone())`, as do the tenant-passway and microvm arms. Those are different runtime instances from `ctx.native` and I did not establish whether any of them can see a spec whose `name` and `expose.mesh.identity` diverge — I grepped oss/kamaji/crates/kamaji-bin/src/bundle.rs and oss/kamaji/crates/kamaji/src/jit.rs for an identity assignment and found no site, which is inconclusive rather than reassuring. If a bundle or JIT workload can ever be forge-shaped, those three arms carry the identical R590-B9 no-op and `NativeRuntime::teardown_by_key` is now sitting right there for the bundle one.")
 #[allow(unused_variables)]
-async fn stop_workload(
+pub(crate) async fn stop_workload(
     ctx: &Arc<ServerCtx>,
     request_id: kamaji_proto::RequestId,
     id: WorkloadId,
 ) -> KamajiToYubaba {
+    // R850-F1: the durability tail first, before any backend teardown. Order
+    // matters in one direction only — a tail that outlives its workload keeps
+    // holding the ownership claim, so the node this workload moves TO gets
+    // fenced by a corpse. The reverse (stopping the tail slightly early) costs
+    // at most the last interval's frames, which the next node's hydrate does
+    // not need because it restores from what did land.
+    ctx.tail.stop(&id).await;
     // Route teardown to the native fork+exec backend (R858-B15), the write-side
     // twin of the `List` merge R858-B14 added. `ctx.native` is the
     // `--native-exec-dir` backend `deploy_native_exec` forks through — the
@@ -3742,6 +3999,20 @@ async fn stop_workload(
                 code: ErrorCode::BackendRefused,
                 message: format!("containerd teardown: {e}"),
             };
+        }
+        // R881-T3: the namespace outlives the container unless something
+        // deletes it, and with it the veth pair and the address. Deliberately
+        // AFTER the container teardown — deleting a namespace out from under a
+        // running task would take its networking away mid-request — and
+        // deliberately not fatal: every command in it is best-effort, so a
+        // workload that never had a namespace stops exactly as it did before.
+        #[cfg(feature = "containerd-integration")]
+        if ctx.container_net.is_some() {
+            let cmds = kamaji::container_net::teardown_by_workload(id.as_str());
+            if let Err(e) = kamaji::container_net::apply(&cmds).await {
+                tracing::warn!(id = %id.0, error = %format!("{e:#}"),
+                    "container network teardown failed; the namespace may have leaked");
+            }
         }
     }
     // Route teardown to the per-tenant passway tier (R852-F1). Idempotent for
@@ -5280,7 +5551,103 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
+    }
+
+    // ── R881-T3: container networking (W343) ─────────────────────────────────
+    //
+    // Only the `None` arms are exercised here, and that is the whole testable
+    // surface on this machine: the `Some` arm's next act is to run `ip` and
+    // `iptables`, neither of which exists on a darwin camp host. The *plan* it
+    // would run is unit-tested where it is built (`kamaji::container_net`); what
+    // these guard is the decision to run one at all, which is where a mistake
+    // costs a fleet-wide deploy failure rather than one workload's networking.
+
+    #[cfg(feature = "containerd-integration")]
+    fn test_container_net() -> kamaji::container_net::ContainerNet {
+        kamaji::container_net::ContainerNet::defaults()
+    }
+
+    #[cfg(feature = "containerd-integration")]
+    fn mesh_at(ip: &str) -> kamaji_proto::MeshAssignment {
+        kamaji_proto::MeshAssignment {
+            mesh_ip: ip.parse().unwrap(),
+            wg_private_key: String::new(),
+            wg_listen_port: 0,
+            peers: vec![],
+            netns_name: None,
+        }
+    }
+
+    /// A node started without `--container-net` must not touch the network at
+    /// all, however addressable the assignment looks.
+    #[cfg(feature = "containerd-integration")]
+    #[tokio::test]
+    async fn an_unconfigured_node_builds_no_namespace() {
+        let ctx = Arc::new(ServerCtx::new());
+        let spec = make_minimal_container_spec("acct");
+        let got =
+            build_container_netns(&ctx, &WorkloadId::new("acct"), &spec, Some(&mesh_at("10.128.3.7")))
+                .await
+                .unwrap();
+        assert_eq!(got, None);
+    }
+
+    /// THE ARM THAT KEEPS THE FLEET UP WHILE R881-T4 IS UNBUILT. Until yubaba
+    /// allocates per-workload addresses it sends the NODE's own mesh address for
+    /// every workload, so a node with `--container-net` set sees that address on
+    /// every deploy. Building a namespace around it would put the node's own
+    /// address on a veth and break every container on the box.
+    #[cfg(feature = "containerd-integration")]
+    #[tokio::test]
+    async fn a_node_address_builds_no_namespace_rather_than_a_broken_one() {
+        let ctx = Arc::new(ServerCtx::new().with_container_net(test_container_net()));
+        let spec = make_minimal_container_spec("acct");
+        for ip in ["100.64.0.3", "127.0.0.1"] {
+            let got =
+                build_container_netns(&ctx, &WorkloadId::new("acct"), &spec, Some(&mesh_at(ip)))
+                    .await
+                    .unwrap();
+            assert_eq!(got, None, "{ip} is not an address this node routes");
+        }
+    }
+
+    /// A host-networked workload shares the host namespace, so there is nothing
+    /// of its own to wire — and wiring one anyway would create a bridge port and
+    /// an address that no process ever binds.
+    #[cfg(feature = "containerd-integration")]
+    #[tokio::test]
+    async fn a_host_networked_workload_builds_no_namespace() {
+        let ctx = Arc::new(ServerCtx::new().with_container_net(test_container_net()));
+        let mut spec = make_minimal_container_spec("ingress");
+        spec.annotations.insert(
+            workload_spec::HOST_NETWORK_ANNOTATION.to_string(),
+            workload_spec::HOST_NETWORK_VALUE.to_string(),
+        );
+        assert!(spec.wants_host_network());
+        let got = build_container_netns(
+            &ctx,
+            &WorkloadId::new("ingress"),
+            &spec,
+            Some(&mesh_at("10.128.3.7")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, None);
+    }
+
+    /// yubaba sends no assignment on a node with no mesh plane (pond, a dev
+    /// host). There is no address to wire, and inventing one is the R881 bug.
+    #[cfg(feature = "containerd-integration")]
+    #[tokio::test]
+    async fn no_mesh_assignment_builds_no_namespace() {
+        let ctx = Arc::new(ServerCtx::new().with_container_net(test_container_net()));
+        let spec = make_minimal_container_spec("acct");
+        let got = build_container_netns(&ctx, &WorkloadId::new("acct"), &spec, None)
+            .await
+            .unwrap();
+        assert_eq!(got, None);
     }
 
     // ── R406-T7: drain handler ───────────────────────────────────────────────

@@ -14,6 +14,40 @@
 //! @yah:next("Postcard/runtime note: env-var name is not on the wire; pure string-contract rename. No protocol impact.")
 //! @yah:verify("cd oss/kamaji && cargo build -p kamaji-bin; pond-supervise.sh + Dockerfile reference KAMAJI_SOCK and /run/kamaji/kamaji.sock as the default path value")
 //! @yah:gotcha("Tier: Thief -- rote cross-file string rename of a single env-var token, no logic. The only care is atomicity across the 4 sites (binary reader + qed Dockerfile/script setters + service comment) so a deploy can't read one name while the image sets the other.")
+//!
+//! @yah:ticket(R605-T24, "Prove a real forge dispatch reaches a microVM guest through yubaba, closing the unproven half of F14's verify")
+//! @yah:at(2026-09-10T08:26:53Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R605)
+//! @yah:verify("A forge dispatched through yubaba with the microvm annotation lands on us-west-003, boots a guest, and its artifacts appear under /var/lib/yah/qed/produced/<forge-id> on the host. That is the last unproven clause of R605-F14's verify criterion.")
+//! @yah:gotcha("R605-F14's e2e test drives kamaji's OWN MicroVmRuntime::deploy_workload directly. So the deploy -> boot -> mounts -> argv -> Stopped -> artifacts-on-host half of F14's verify criterion is genuinely asserted (2 pass / 0 fail on us-west-003), and everything ABOVE kamaji is not: whether a forge spec dispatched through yubaba reaches a node carrying the microvm annotation at all has never been exercised. Do not read F14 as having proven the dispatch path.")
+//! @yah:depends_on(R605-T15)
+//! @yah:gotcha("CORRECTION FROM R605-T15, 2026-09-10 — THIS TICKET'S OWN NEXT-STEP TEXT IS WRONG AND WILL MISLEAD YOU. It says the service-flag leg \"is the actual gate and it is cheap\", citing kamaji-bin/src/main.rs:748 as proof everything downstream is proven. That framing was mine and it is false. Adding `--microvm-dir` to the deployed kamaji.service on us-west-003 would NOT have enabled the backend — it would have KILLED THE SUPERVISOR. The binary deployed there was built without the `microvm` cargo feature, so `--microvm-dir` is a fatal argument: it aborts before binding its socket, and with the unit's restart limit systemd gives up inside a minute, leaving the node with no workload supervisor. T15's courier proved this off the INSTALLED BYTES, not a version number — the binary carries the error string that exists only in the feature-off arm and lacks the log line that exists only in the feature-on arm. `--help` advertises `--microvm-dir` either way, because the flag is parsed unconditionally and rejected later. That is what makes it look like a one-liner right up until the restart.")
+//! @yah:gotcha("SECOND CORRECTION, FROM R605-B26 — THE EXECSTART EDIT IS THE WRONG MECHANISM ENTIRELY. Both this ticket and R605-T15 are written around adding `--microvm-dir` to kamaji.service's ExecStart. Don't. kamaji reads a `KAMAJI_MICROVM_DIR` ENVIRONMENT VARIABLE as a fallback entry point and that is the SUPPORTED one: the tracked unit's own header says extra options belong in a drop-in as `Environment=`, never as a second ExecStart, because a drop-in that re-declares ExecStart silently drops every flag the base unit later gains and a subsequent roll does not fix it. That header names this as half of the 37-hour mesh outage on the third. So the change on us-west-003 is a DROP-IN SETTING THAT VARIABLE, not an ExecStart edit. NOBODY HAS ESTABLISHED WHETHER us-west-003 ALREADY HAS A DROP-IN — all that was observed is that its running ExecStart matches the tracked base unit exactly, which is consistent with no clobbering drop-in but does not prove one is absent, and the box stopped answering before it could be checked. That is precisely the shape that caused the outage, so check it FIRST, not last.")
+//! @yah:next("THE SERVICE-FLAG LEG IS DONE — R605-T15 LANDED IT 2026-09-10 AND THIS TICKET'S GATE IS OPEN. The retired next-step told you to do it and called it cheap; both corrections in the gotchas above were right and the leg turned out to need a rebuilt binary, a vmm_bin fix and a paired ship. What actually happened: us-west-003 now runs a tree build (0.8.38-h2) of yubaba+kamaji built WITH the microvm feature, and the backend is enabled through /etc/systemd/system/kamaji.service.d/10-microvm.conf setting Environment=KAMAJI_MICROVM_DIR=/var/lib/yah/kamaji/microvm — a drop-in, not an ExecStart edit, per the second correction. Verified by journal: 'microVM backend attached' at 23:27:20 with the right microvm_dir, both fatal strings absent, active with NRestarts=0 at +30s and +90s. There was never a pre-existing drop-in on that box (`systemctl show -p DropInPaths` was empty), which settles the unknown the gotcha flagged. Do NOT redo any of this.")
+//! @yah:next("SEQUENCE THE PROOF IN TWO STEPS SO A FAILURE HAS ONE CAUSE. This ticket's verify criterion is argv-level — a forge lands, a guest boots, artifacts appear under /var/lib/yah/qed/produced/<forge-id> — and needs NO compiler in the guest, so the currently deployed 0.8.38-h2 is sufficient for it. Prove THAT first: it isolates the one genuinely unproven question, which is whether a forge spec dispatched through yubaba with the microvm annotation reaches the node and selects the microVM backend at all. Only then consider shipping a newer pair to re-run it with a real build.")
+//! @yah:next("R605-F23 IS COMMITTED BUT NOT DEPLOYED, which matters if you want the stronger proof. 88533e01 added a third read-only drive carrying a 1166 MB Rust toolchain, folded into the guest overlay as a lower layer, with CARGO_HOME and TMPDIR defaulted onto the per-job scratch disk — so a guest booted from THAT tree can run a real cargo build, and one on us-west-003 already did (cargo 1.98.0 + rustc 1.98.0 + cc inside the guest, plus a live crates.io fetch over TLS). The kamaji RUNNING on the node predates it and still boots two-drive guests with no compiler. To prove a real BUILD forge step end to end you must first `scripts/hotship.sh --binaries yubaba,kamaji` from the current tree — NEVER kamaji alone, ProtocolVersion::CURRENT is V9 and a skewed pair fails every yubaba->kamaji call at connect with HandshakeRefused while still reporting active with NRestarts=0.")
+//!
+//! @yah:ticket(R605-B26, "No kamaji that exists anywhere is built with the microvm feature, so the entire microVM track is dead code on every node")
+//! @yah:status(review)
+//! @yah:at(2026-09-10T09:09:12Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R605)
+//! @yah:severity(high)
+//! @yah:gotcha("MEASURED BY R605-T15 ON 2026-09-10, off the installed bytes rather than a version number, and it is the real reason nothing downstream of R605-F14 was ever going to work. Neither build recipe passes the `microvm` cargo feature — not the yubaba release script, not hotship's app registry; both pin the same three features. So no published kamaji has the backend compiled in. On a binary built without it, `--microvm-dir` is a FATAL argument: the process aborts before binding its socket, and with the unit's restart limit systemd gives up inside a minute and leaves the node with NO WORKLOAD SUPERVISOR. `--help` advertises the flag either way, because it is parsed unconditionally and rejected later — which is exactly what makes this look like a one-line unit edit right up until the restart.")
+//! @yah:assumes("That enabling the feature is inert on a node without guest artifacts. Grounded in MicroVmRuntime::new refusing to construct when vmlinux or rootfs.ext4 is absent — such a node advertises no microVM backend rather than failing every deploy — but confirm that the constructor is the only path in, and note R605-B26's finding that it ALSO treats an absent VMM binary as fatal.")
+//! @yah:next("LEADER DECISION (R605, session:0befddd7) — ENABLE THE FEATURE IN BOTH RECIPES. T15's courier correctly refused to make this call itself, since it changes what every released kamaji contains. Taking it: the change is additive and inert on a node with no guest artifacts (MicroVmRuntime::new refuses to construct without vmlinux/rootfs.ext4, so such a node advertises no microVM backend rather than failing deploys), and without it the entire microVM track — F8, F14, F16, F22, F23, T24, S6, T7 — is dead code no matter what else lands. R605-F14 has already proven the guest side boots and runs a job end to end on real hardware; this is the one line standing between that and it being reachable in production.")
+//! @yah:next("DO NOT SHIP A KAMAJI BUILT FROM THIS TREE TODAY — change the recipes, do not roll the result. R605-F22 is live and holds several hundred uncommitted lines of mid-refactor microVM networking; a build from the current tree would carry a peer's half-finished work onto a fleet node. Sequence, from T15's handoff: (1) this ticket flips the feature in both recipes, (2) R605-F22 lands, (3) build, (4) ship, (5) THEN the kamaji.service --microvm-dir unit edit, (6) verify by the kamaji startup JOURNAL LINE, not by GET /health — see R605-B27 for why health cannot answer this. Also fold in R605-B26's sibling finding before shipping: the VMM path in the config builder is hardcoded to /usr/bin/firecracker and firecracker on us-west-003 lives under /usr/local/bin, which the runtime constructor treats as fatal exactly like a missing kernel.")
+//! @yah:handoff("DONE — `microvm` is now in the kamaji feature list at every build site in the tree. THREE, not the two the ticket named: scripts/publish-yubaba-release.sh (the cross-build-guarded call, plus the header comment at the top of the file that documents the same list and would otherwise have drifted immediately), scripts/hotship.sh's app_spec row for kamaji, and .github/workflows/release.yml's \"Build kamaji (static musl)\" step. All three now pass containerd-integration,native-exec,bundle-serving,microvm. The workflow is workflow_dispatch-only and the account is billing-stopped so it builds nothing today — I updated it anyway because three build sites that must agree and one left behind is exactly the drift the change is about, and it is free to keep correct while it is dead. Each site carries a comment naming the other two.")
+//! @yah:handoff("THE @yah:assumes IS CONFIRMED BUT ITS REASONING WAS WRONG, and the difference matters operationally. Confirmed: with the feature compiled in and no --microvm-dir, ServerCtx.microvm is None (kamaji-bin/src/server.rs:870 and :896 initialise it None), every use site is an `if let Some` (:1457 List merge, :2265 deploy dispatch, :4048, :4999), and the only behavioural difference from a feature-off binary is one tracing::debug line at main.rs:809 plus a BETTER refusal message on a microvm-marked deploy — server.rs:2290 says \"microVM backend not configured — start kamaji with --microvm-dir, and check that the node has a guest kernel + rootfs and that the service user can open /dev/kvm\" where the feature-off build says only \"kamaji built without the microvm feature\". Nothing calls BackendAvailability::probe at kamaji-bin startup, so enabling the feature does not add a /dev/kvm open on boot either. WRONG PART: the inertness does NOT come from MicroVmRuntime::new refusing to construct. On a node that DOES pass --microvm-dir without artifacts, kamaji does not \"advertise no microVM backend\" — main.rs:801 propagates that refusal with `?` and the process FAILS TO START, which its own comment at main.rs:754-759 states as deliberate (\"that refusal is fatal here rather than a warning ... Failing to start puts the error where the misconfiguration is\"). The inertness comes from the FLAG being absent, not the constructor refusing. The @yah:gotcha at oss/kamaji/crates/kamaji/src/microvm.rs:93 carries the same wrong framing (\"a node with the wrong filename advertises no microVM backend rather than failing every build\") and is stale post-F8-wiring; left in place because that file is R605-F22's live working set.")
+//! @yah:handoff("THERE IS A SECOND PATH IN, AND IT IS THE SUPPORTED ONE — this is the discovered finding of the pass and it changes step 5 of the sequence. kamaji-bin/src/main.rs:150 reads KAMAJI_MICROVM_DIR as the fallback for --microvm-dir, so the env var is a full second entry point to the same fatal-at-startup code. That is not an edge case: app/yah/cli/resources/kamaji.service's own header says extra options belong in a drop-in as `Environment=`, NEVER as a second ExecStart, because a drop-in that re-declares ExecStart silently drops every flag the base unit gains afterwards and a roll does not fix it — measured on us-south-001 2026-09-06 (R858-T4), and named there as half of the 37-hour 2026-09-03 mesh outage. So the eventual us-west-003 change is a drop-in carrying Environment=KAMAJI_MICROVM_DIR=/var/lib/yah/kamaji/microvm, not the ExecStart edit R605-T15 and R605-T24 were both written around. That same unit header already states the general rule I measured independently on the deployed binary (\"kamaji bails at startup when handed a flag whose cargo feature is absent, so a unit carrying --bundle-cache-dir would refuse to start on any kamaji built without bundle-serving\") — the microVM case was that rule coming true, not a new class of bug. I extended that header with the microVM specifics: the env var name, the three fatal-at-startup preconditions, and the check to run first.")
+//! @yah:handoff("R605-T15's FINDING 3 IS ALREADY FIXED IN-TREE and needs no further action. @Ashguard:libra took the seam handed to them and replaced the hardcoded vmm_bin with kamaji::microvm::find_vmm() (oss/kamaji/crates/kamaji/src/microvm.rs:1716) — PATH first so an operator can override by placing one earlier, then /usr/local/bin, /usr/bin, /opt/firecracker/bin, failing with the list of what it searched. Their doc comment records the reason correctly (Firecracker ships no Debian package, so every install on this fleet is a tarball into /usr/local/bin). Uncommitted at time of writing, in their working set. I re-read the block rather than assuming, and updated the us-west-003 machine file's finding 3 from \"hardcoded and wrong\" to \"fixed in-tree, uncommitted\".")
+//! @yah:handoff("MACHINE FILE CORRECTED, since R605-T15 wrote the now-stale version of finding 2 into it this morning. .yah/infra/machines/us-west-003.toml's finding 2 now reads \"fixed in the recipes, NOT YET IN ANY BINARY\" with all three build sites named, finding 3 now records find_vmm, and the DO NOT ADD block gained the drop-in/Environment= correction above plus an explicit unknown: whether that box already has a drop-in under /etc/systemd/system/kamaji.service.d/ was NOT established. T15 observed only that systemctl show -p ExecStart matched the tracked base unit exactly, which is consistent with no ExecStart-clobbering drop-in but does not prove one is absent, and the box stopped answering ssh before it could be checked. Whoever does step 5 must check that first — it is the precise shape that caused the R858-T4 outage.")
+//! @yah:verify("MEASURED, not argued: enabling `microvm` adds ZERO packages to kamaji-bin's dependency graph. `cargo tree --offline -p kamaji-bin --no-default-features -e normal --prefix none` run twice in oss/kamaji, once with containerd-integration,native-exec,bundle-serving and once with that plus microvm, sorted and diffed: 209 lines each, byte-identical. Mechanism: microvm = [\"dep:kamaji\", \"kamaji/microvm-integration\"] (kamaji-bin/Cargo.toml:77) and microvm-integration = [\"dep:libc\"] (kamaji/Cargo.toml:43), while native-exec already pulls kamaji/native-integration = [\"dep:libc\", \"socket-custody\"] — so libc and the kamaji crate are both already in. This also means Cargo.lock does not change, which is what keeps release.yml's `cross build --locked` valid.")
+//! @yah:verify("Both scripts pass `bash -n`. The hotship change is inside a `case` arm, so I checked the parse rather than trusting it: extracted the real app_spec function from scripts/hotship.sh and ran it — the kamaji row yields exactly seven fields with feats=containerd-integration,native-exec,bundle-serving,microvm, and the neighbouring rows are unchanged. Confirmed the positional contracts my edits depend on: cross-build-guarded.sh documents $4 as the --features list (its header, \"Args (positional)\"), and hotship's build_one does `[ -n \"$feats\" ] && args+=(--features \"$feats\")`. release.yml parses as valid YAML through python3 yaml.safe_load, and the reconstructed run block shows the added lines as shell comments above the unchanged cross build line.")
+//! @yah:verify("NOT VERIFIED, stated rather than glossed: I did not compile anything. Per the ticket's own constraint I did not build and did not ship, so there is no proof from THIS pass that kamaji-bin compiles for x86_64-unknown-linux-musl or aarch64-unknown-linux-musl with the feature on. What is on record from elsewhere: R605-F8's verify line reports `cargo test --workspace --all-features` green in oss/kamaji, and R605-F14 ran the microVM guest e2e on us-west-003 — so the feature has compiled before, on a host target, on an older tree. It has never been cross-compiled for musl by anyone. A compile-check now would also be ambiguous, since oss/kamaji currently carries several hundred uncommitted lines from R605-F22 and a red would not be attributable to this change. First real proof is the build in step 3 of the sequence.")
+//! @yah:gotcha("ONE STALE REFERENCE DELIBERATELY LEFT ALONE. .yah/docs/working/W282-qed-manual-steps.md:37 tells whoever cuts a release by hand to build kamaji with containerd-integration,native-exec,bundle-serving — now wrong by one feature. It is another ticket's @yah:next annotation, not prose, so hand-editing it would be authoring on someone else's ticket; the authoritative source is the script, which is fixed. Whoever owns W282 should refresh that line. Two other hits on the old string are historical records that are correct as history and should NOT be edited: .yah/infra/machines/us-west-015.toml:12 (a darwin-leg analysis) and the R605-T15 handoff recorded on W325.")
+//! @yah:handoff("SCOPE HELD AND NOTHING WAS SHIPPED. No cargo build, no hotship, no node access, no restart — us-west-003 was not touched and was still not answering ssh or HTTP at the end of this pass. Five files changed, all repo-only: scripts/publish-yubaba-release.sh (build call + its header comment), scripts/hotship.sh (app_spec row), .github/workflows/release.yml (the third build site), app/yah/cli/resources/kamaji.service (header comment: the Environment= drop-in spelling for microVM and its three fatal-at-startup preconditions), .yah/infra/machines/us-west-003.toml (findings 2 and 3 corrected, drop-in warning added). No source file was edited — in particular nothing in oss/kamaji, which is R605-F22's live working set.")
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -63,12 +97,28 @@ struct Args {
     /// the tier; `None` leaves tenant-passway deploys refused.
     #[cfg_attr(not(feature = "tenant-passway"), allow(dead_code))]
     tenant_passway_dir: Option<PathBuf>,
+    /// Container range this node addresses workloads out of (R881-T3 / W343),
+    /// e.g. `10.128.0.0/9`. `Some(range)` makes a container whose assigned
+    /// address falls inside it get a real network namespace — bridge, veth,
+    /// address, default route — instead of the empty one runc unshares.
+    /// `None` leaves every container isolated and unreachable, which is what
+    /// every node did before this flag existed.
+    #[cfg_attr(not(feature = "containerd-integration"), allow(dead_code))]
+    container_net: Option<String>,
+    /// Bridge those veths hang off. Only meaningful with `container_net`.
+    #[cfg_attr(not(feature = "containerd-integration"), allow(dead_code))]
+    container_bridge: Option<String>,
     /// Path to `turso-backup-hydrate` (R850-F1). `Some(path)` lets a workload
     /// declaring `yah.durability.tier` be restored before it starts; `None`
     /// makes such a deploy fail loudly rather than come up against an empty
     /// volume. Not feature-gated — the engine lives in the helper process, so
     /// this build carries only the path.
     hydrate_helper: Option<PathBuf>,
+    /// Path to `turso-backup-tail` (R850-F1). The twin of
+    /// [`Args::hydrate_helper`] on the backup side: `Some(path)` keeps a
+    /// declaring workload's state shipped to its store while it runs; `None`
+    /// makes such a deploy fail loudly rather than run with nothing shipping.
+    tail_helper: Option<PathBuf>,
 }
 
 fn parse_args() -> std::result::Result<Args, ParseError> {
@@ -124,6 +174,14 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
     // *declares* a durability tier.
     let mut hydrate_helper: Option<PathBuf> =
         std::env::var_os("KAMAJI_HYDRATE_HELPER").map(PathBuf::from);
+    let mut tail_helper: Option<PathBuf> =
+        std::env::var_os("KAMAJI_TAIL_HELPER").map(PathBuf::from);
+
+    // R881-T3: container networking opt-in, same explicit-opt-in discipline as
+    // the backends above. A supervisor must not start creating bridges and NAT
+    // rules on a node because a variable happened to be inherited.
+    let mut container_net: Option<String> = std::env::var("KAMAJI_CONTAINER_NET").ok();
+    let mut container_bridge: Option<String> = std::env::var("KAMAJI_CONTAINER_BRIDGE").ok();
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -190,6 +248,25 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--hydrate-helper"))?,
                 );
             }
+            "--tail-helper" => {
+                tail_helper = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or(ParseError::MissingValue("--tail-helper"))?,
+                );
+            }
+            "--container-net" => {
+                container_net = Some(
+                    iter.next()
+                        .ok_or(ParseError::MissingValue("--container-net"))?,
+                );
+            }
+            "--container-bridge" => {
+                container_bridge = Some(
+                    iter.next()
+                        .ok_or(ParseError::MissingValue("--container-bridge"))?,
+                );
+            }
             // Bare `--docker` inherits DOCKER_HOST; `--docker-host URL` pins one.
             "--docker" => docker_host = Some(String::new()),
             "--docker-host" => {
@@ -214,6 +291,9 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         microvm_dir,
         tenant_passway_dir,
         hydrate_helper,
+        tail_helper,
+        container_net,
+        container_bridge,
     })
 }
 
@@ -231,7 +311,8 @@ fn print_help() {
     println!(
         "Usage: kamaji [--socket PATH] [--containerd-socket PATH] [--docker | --docker-host URL]\n              \
          [--native-exec-dir PATH] [--microvm-dir PATH]\n              \
-         [--tenant-passway-dir PATH] [--hydrate-helper PATH]\n              \
+         [--tenant-passway-dir PATH] [--hydrate-helper PATH] [--tail-helper PATH]\n              \
+         [--container-net CIDR] [--container-bridge NAME]\n              \
          [--bundle-cache-dir PATH] [--bundle-origin URL] [--bundle-port PORT]"
     );
     println!();
@@ -259,12 +340,28 @@ fn print_help() {
     println!("                                Needs /dev/kvm openable by this user and");
     println!("                                CAP_NET_ADMIN for guest networking (default:");
     println!("                                $KAMAJI_MICROVM_DIR, else such deploys are refused)");
+    println!("      --container-net CIDR      give each container an address out of CIDR on its own");
+    println!("                                network namespace — bridge, veth pair, default route,");
+    println!("                                egress NAT. yubaba allocates the address; this node");
+    println!("                                only wires it. Needs CAP_NET_ADMIN. Without it a");
+    println!("                                container gets the empty namespace runc unshares and is");
+    println!("                                reachable from nothing (default: $KAMAJI_CONTAINER_NET;");
+    println!("                                the fleet's range is 10.128.0.0/9, see W343)");
+    println!("      --container-bridge NAME   bridge those veths hang off (default:");
+    println!("                                $KAMAJI_CONTAINER_BRIDGE, else yah0)");
     println!("      --hydrate-helper PATH     restore a workload's named volume from its declared");
     println!("                                yah.durability.store before starting it, by running");
     println!("                                the turso-backup-hydrate binary at PATH (default:");
     println!("                                $KAMAJI_HYDRATE_HELPER; without one, a workload that");
     println!("                                declares a durability tier is REFUSED rather than");
     println!("                                started against an empty volume)");
+    println!("      --tail-helper PATH        keep a declaring workload's state shipped to its");
+    println!("                                yah.durability.store while it runs, by supervising");
+    println!("                                the turso-backup-tail binary at PATH (default:");
+    println!("                                $KAMAJI_TAIL_HELPER; without one, a workload that");
+    println!("                                declares a durability tier is REFUSED rather than");
+    println!("                                run with nothing shipping its state). A tail that");
+    println!("                                reports it has been FENCED stops its workload.");
     println!("      --tenant-passway-dir PATH  hold one TLS listen socket per enrolled custom");
     println!("                                domain and fork a cold `passway` on the first");
     println!("                                connection, capturing logs under PATH. This is the");
@@ -476,6 +573,30 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
         );
     }
 
+    // ── container networking (R881-T3 / W343) ────────────────────────────────
+    // A malformed range fails startup rather than degrading to "no container
+    // networking": an operator who passed --container-net asked for reachable
+    // workloads, and silently serving unreachable ones is the failure mode this
+    // whole relay exists to remove.
+    #[cfg(feature = "containerd-integration")]
+    if let Some(range) = &args.container_net {
+        let range = kamaji::container_net::Ipv4Cidr::parse(range)
+            .map_err(|e| anyhow::anyhow!("--container-net: {e:#}"))?;
+        let bridge = args
+            .container_bridge
+            .clone()
+            .unwrap_or_else(|| kamaji::container_net::DEFAULT_BRIDGE.to_string());
+        tracing::info!(%range, %bridge, "container networking enabled");
+        ctx = ctx.with_container_net(kamaji::container_net::ContainerNet::new(range, bridge));
+    }
+    #[cfg(not(feature = "containerd-integration"))]
+    if args.container_net.is_some() || args.container_bridge.is_some() {
+        anyhow::bail!(
+            "--container-net / --container-bridge require the kamaji binary be built with \
+             --features containerd-integration"
+        );
+    }
+
     // ── docker / OrbStack backend (R626-F1) ──────────────────────────────────
     // The pond / dev-host counterpart to containerd. Attached only on explicit
     // opt-in; when both are attached, containerd serves Container deploys.
@@ -614,6 +735,32 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
         );
     }
 
+    // ── durability tail (R850-F1) ────────────────────────────────────────────
+    // Same shape and same startup file check as the hydrate helper above. The
+    // two are separate flags rather than one bindir because a node can
+    // legitimately be able to restore and not to stream — a migration target
+    // being prepared is exactly that — and collapsing them makes that state
+    // unexpressible.
+    if let Some(helper) = &args.tail_helper {
+        if !helper.is_file() {
+            anyhow::bail!(
+                "--tail-helper {} is not a file; point it at the turso-backup-tail binary",
+                helper.display()
+            );
+        }
+        tracing::info!(
+            helper = %helper.display(),
+            "durability tail armed; workloads declaring yah.durability.tier will have their \
+             state shipped while they run, and will be STOPPED if their tail is fenced"
+        );
+        ctx = ctx.with_tail_helper(helper.clone());
+    } else {
+        tracing::debug!(
+            "no --tail-helper; a workload declaring yah.durability.tier will be refused rather \
+             than run with nothing shipping its state"
+        );
+    }
+
     // ── microVM backend (R605-F8 / W325 §5) ──────────────────────────────────
     // For workloads that must not share the host kernel — a build placed next
     // to a raft voter. Explicit opt-in like the others, but the flag alone is
@@ -631,11 +778,40 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 anyhow::anyhow!("creating microVM state dir {}: {e}", state_dir.display())
             })?;
             let cfg = kamaji::microvm::MicroVmConfig {
-                vmm_bin: PathBuf::from("/usr/bin/firecracker"),
+                // Located, not assumed. R605-F22: this was
+                // `/usr/bin/firecracker`, and Firecracker ships no Debian
+                // package — every install on this fleet is a tarball into
+                // /usr/local/bin, so the constant was wrong on the only node
+                // that has guest artifacts staged. `MicroVmRuntime::new`
+                // refuses an absent vmm_bin, so kamaji would not have started.
+                vmm_bin: kamaji::microvm::find_vmm()?,
                 kernel_image: dir.join("vmlinux"),
                 rootfs_image: dir.join("rootfs.ext4"),
+                // R605-F23: present iff the operator staged one, with no second
+                // flag to forget. A node without it boots guests that can run
+                // programs but not compile them, which is exactly what the
+                // minimal busybox rootfs meant before this existed.
+                toolchain_image: Some(dir.join(kamaji::microvm::TOOLCHAIN_IMAGE_FILE))
+                    .filter(|p| p.exists()),
                 state_dir,
-                network: Some(kamaji::microvm::GuestNetwork::default()),
+                // Discovered from the host's routing table, not assumed.
+                // R605-F22: this was `GuestNetwork::default()`, whose uplink was
+                // the literal `eth0` — a name Debian has not used since
+                // predictable interface naming, so the MASQUERADE rule named a
+                // device that does not exist and every networked guest deploy
+                // failed. A node with no default route gets no guest network at
+                // all rather than a broken one; it can still run air-gapped
+                // jobs, which is the honest description of what it can do.
+                network: match kamaji::microvm::GuestNetwork::discover() {
+                    Ok(net) => {
+                        tracing::info!(uplink = %net.uplink, "microVM guest networking");
+                        Some(net)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "microVM guests will be air-gapped");
+                        None
+                    }
+                },
                 max_guest_memory_mb: microvm_memory_cap_mb(),
                 max_guest_vcpus: std::thread::available_parallelism()
                     .map(|n| n.get() as u32)

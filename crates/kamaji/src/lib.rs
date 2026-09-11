@@ -127,6 +127,13 @@ pub mod socket_custody;
 #[cfg(feature = "testing")]
 pub mod fake;
 
+/// Per-workload container networking (R881-T3 / W343): the bridge, veth pair
+/// and routed `/24` that give a namespaced workload an address something else
+/// can dial. Unconditional and dependency-free — the address plan is shared
+/// with yubaba, which allocates from it, and the module is pure apart from one
+/// `apply` function, so a build that cannot run `ip` can still reason about it.
+pub mod container_net;
+
 /// Listen-port allocation (R844-F2): the one contract the local (camp) and
 /// remote (kamaji) supervisors both answer through, so a workload that runs
 /// both ways does not learn its port from two mechanisms that can disagree.
@@ -401,6 +408,43 @@ pub fn name_anonymous_ports(ports: &[u16]) -> BTreeMap<String, u16> {
 /// number-as-string (`[{ name = "8080", port = 9090 }, 8080]` — rejected by
 /// `validate::shape`, but the binary wire is not validated) resolves the same
 /// way on every node instead of by iteration order.
+/// Refuse a spec carrying [`WorkloadSpec::files`] on a backend that does not
+/// materialize them (R870-F23).
+///
+/// Only [`Backend::Native`] writes them today. Every other backend must call
+/// this rather than accept the spec and ignore the field: the workload the
+/// field exists for reads its *entire* routing table out of such a file, so a
+/// backend that silently skips it starts a process against whatever happened
+/// to be at that path — nothing, or the previous deploy's table. That comes up
+/// healthy and routes wrongly, which is strictly worse than not starting.
+///
+/// The correct fix for any backend that acquires a real customer here is to
+/// implement the write (a container backend would inject them as a mount or a
+/// pre-exec write), not to relax this.
+pub fn reject_unmaterializable_files(
+    spec: &workload_spec::WorkloadSpec,
+    backend: Backend,
+) -> anyhow::Result<()> {
+    if spec.files.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<String> = spec
+        .files
+        .iter()
+        .map(|f| f.path.display().to_string())
+        .collect();
+    anyhow::bail!(
+        "workload {} declares {} spec file(s) ({}) but the {backend:?} backend does not \
+         materialize them. Only the native backend writes WorkloadSpec::files today; a workload \
+         that reads its config from one of these paths would start against a stale or absent \
+         file and route wrongly while reporting healthy. Deploy it on the native backend, or \
+         implement materialization for {backend:?}",
+        spec.name,
+        paths.len(),
+        paths.join(", "),
+    )
+}
+
 pub fn declared_port_names(mesh: &workload_spec::MeshExpose) -> BTreeMap<String, u16> {
     if mesh.ports.iter().all(|p| p.name.is_none()) {
         return name_anonymous_ports(&mesh.numbers());

@@ -91,18 +91,27 @@ pub fn plan(spec: &WorkloadSpec) -> Result<HydratePlan, String> {
         return Ok(HydratePlan::NotDeclared);
     };
 
-    // `validate::shape` already enforces exactly one named volume for a
+    // `validate::shape` already enforces exactly one named-or-bind volume for a
     // bytes-shipping tier, but a spec reaching kamaji has crossed a wire and
     // this decides where bytes get written, so it is re-derived rather than
     // assumed.
-    let mut named = spec.volumes.iter().filter_map(|v| match &v.source {
-        VolumeSource::Named { name } => Some(name.as_str()),
-        _ => None,
+    //
+    // R858-F17: a **bind** resolves to its own `host_path`, and it is not an
+    // afterthought — headscale is the first real consumer of this whole path
+    // and it is a native-exec appliance whose state lives at
+    // `/var/lib/yah-cloud/headscale/`, with no named volume and no prospect of
+    // one. A named-only rule would have excluded exactly the workload whose
+    // loss took this camp's mesh down for 37 hours. Tmpfs is excluded on
+    // purpose: it is the declaration that the data does not survive.
+    let mut roots = spec.volumes.iter().filter_map(|v| match &v.source {
+        VolumeSource::Named { name } => Some(PathBuf::from(VOLUME_ROOT).join(name)),
+        VolumeSource::Bind { host_path } => Some(host_path.clone()),
+        VolumeSource::Tmpfs { .. } => None,
     });
-    let (Some(volume), None) = (named.next(), named.next()) else {
+    let (Some(volume_root), None) = (roots.next(), roots.next()) else {
         return Err(format!(
-            "workload {} declares yah.durability.tier = \"{}\" but not exactly one named \
-             volume; its subjects are relative to one and there is no way to pick",
+            "workload {} declares yah.durability.tier = \"{}\" but not exactly one \
+             named-or-bind volume; its subjects are relative to one and there is no way to pick",
             spec.name, d.tier
         ));
     };
@@ -115,7 +124,7 @@ pub fn plan(spec: &WorkloadSpec) -> Result<HydratePlan, String> {
         .ok_or_else(|| format!("workload {}: yah.durability.store {store:?} is not s3://<bucket>/<prefix>", spec.name))?;
 
     Ok(HydratePlan::Declared(HydrateArgs {
-        volume_root: PathBuf::from(VOLUME_ROOT).join(volume),
+        volume_root,
         subjects: d.subjects.clone(),
         tier: d.tier,
         bucket,
@@ -166,13 +175,7 @@ pub async fn run(
         HydratePlan::Declared(args) => args,
     };
     let Some(helper) = helper else {
-        return Err(format!(
-            "workload {} declares yah.durability.tier = \"{}\" but this kamaji has no hydrate \
-             helper configured — start it with --hydrate-helper PATH (or set \
-             KAMAJI_HYDRATE_HELPER). Starting without one would bring the workload up against \
-             an empty volume, which looks exactly like a healthy first boot",
-            spec.name, args.tier
-        ));
+        return Err(no_helper(spec, &args));
     };
 
     let output = tokio::process::Command::new(helper)
@@ -207,13 +210,37 @@ pub async fn run(
     ))
 }
 
+/// Whether this node could hydrate `spec` if asked, without touching anything.
+///
+/// R850-F1 backup half: split out of [`run`] so the deploy path can check both
+/// halves' preconditions together, before either does any work. `run` keeps its
+/// own copy of the check because it is public and a caller that skipped this
+/// must still be refused.
+pub fn preflight(helper: Option<&std::path::Path>, spec: &WorkloadSpec) -> Result<(), String> {
+    match plan(spec)? {
+        HydratePlan::NotDeclared => Ok(()),
+        HydratePlan::Declared(args) if helper.is_none() => Err(no_helper(spec, &args)),
+        HydratePlan::Declared(_) => Ok(()),
+    }
+}
+
+fn no_helper(spec: &WorkloadSpec, args: &HydrateArgs) -> String {
+    format!(
+        "workload {} declares yah.durability.tier = \"{}\" but this kamaji has no hydrate \
+         helper configured — start it with --hydrate-helper PATH (or set \
+         KAMAJI_HYDRATE_HELPER). Starting without one would bring the workload up against an \
+         empty volume, which looks exactly like a healthy first boot",
+        spec.name, args.tier
+    )
+}
+
 /// Label recorded in the ownership claim.
 ///
 /// Diagnostic only — the epoch is what fences, and two acquires under the same
 /// label are still two takeovers (see `turso_backup::claim::ClaimRecord`). So a
 /// missing node id degrades the 3am experience rather than the safety property,
 /// and is not worth refusing a deploy over.
-fn owner_label() -> String {
+pub(crate) fn owner_label() -> String {
     for key in ["KAMAJI_NODE_ID", "HOSTNAME"] {
         if let Ok(v) = std::env::var(key) {
             let token = v.split_whitespace().next().unwrap_or("");
@@ -325,6 +352,66 @@ mod tests {
     /// The prefix is what scopes one workload inside a shared bucket. Defaulting
     /// it to the root would put two workloads' ownership claims on one key, so
     /// placing the second would fence out the first.
+    /// R858-F17: headscale's shape. A native-exec appliance keeps its state at
+    /// a bind path and has no named volume, so a named-only rule excluded
+    /// exactly the workload whose loss took this camp's mesh down for 37 hours.
+    /// A bind resolves to its own host_path, NOT under `VOLUME_ROOT`.
+    #[test]
+    fn a_bind_volume_resolves_to_its_own_host_path() {
+        let spec = spec_with(
+            DECLARED,
+            vec![workload_spec::VolumeMount {
+                source: VolumeSource::Bind {
+                    host_path: "/var/lib/yah-cloud/headscale".into(),
+                },
+                target: "/var/lib/headscale".into(),
+                read_only: false,
+            }],
+        );
+        let HydratePlan::Declared(args) = plan(&spec).unwrap() else {
+            panic!("a bind-backed declaration must plan");
+        };
+        assert_eq!(
+            args.volume_root,
+            PathBuf::from("/var/lib/yah-cloud/headscale"),
+            "a bind must not be rehomed under the named-volume root"
+        );
+    }
+
+    /// A tmpfs is the declaration that the data does not survive the process,
+    /// so it must not become the root a durable restore writes into.
+    #[test]
+    fn a_tmpfs_is_not_a_candidate_volume_root() {
+        let spec = spec_with(
+            DECLARED,
+            vec![workload_spec::VolumeMount {
+                source: VolumeSource::Tmpfs { size_mb: 64 },
+                target: "/scratch".into(),
+                read_only: false,
+            }],
+        );
+        assert!(plan(&spec).is_err(), "a tmpfs-only spec has nowhere durable to restore into");
+    }
+
+    /// One named AND one bind is still ambiguous — the widening added a second
+    /// kind of candidate, not permission to guess between two.
+    #[test]
+    fn a_named_and_a_bind_together_are_still_refused() {
+        let spec = spec_with(
+            DECLARED,
+            vec![
+                named("acct-data"),
+                workload_spec::VolumeMount {
+                    source: VolumeSource::Bind { host_path: "/srv/acct".into() },
+                    target: "/srv".into(),
+                    read_only: false,
+                },
+            ],
+        );
+        let err = plan(&spec).expect_err("two candidate roots must refuse");
+        assert!(err.contains("named-or-bind"), "got: {err}");
+    }
+
     #[test]
     fn a_store_url_without_a_prefix_is_refused() {
         for bad in ["s3://yah-backups", "s3://yah-backups/", "yah-backups/acct", "s3:///acct"] {
@@ -339,14 +426,14 @@ mod tests {
     #[test]
     fn subjects_relative_to_no_volume_or_two_volumes_are_refused() {
         let err = plan(&spec_with(DECLARED, vec![])).unwrap_err();
-        assert!(err.contains("exactly one named volume"), "{err}");
+        assert!(err.contains("exactly one \n             named-or-bind volume") || err.contains("named-or-bind"), "{err}");
 
         let err = plan(&spec_with(
             DECLARED,
             vec![named("accounts"), named("sessions")],
         ))
         .unwrap_err();
-        assert!(err.contains("exactly one named volume"), "{err}");
+        assert!(err.contains("named-or-bind"), "{err}");
     }
 
     /// A malformed declaration is a refusal, not a shrug — `tier = "streem"`

@@ -602,6 +602,9 @@ impl Kamaji for DockerRuntime {
         workload_spec::admission::check(spec)
             .map_err(|e| anyhow!("workload {} not admitted: {e}", spec.name))?;
 
+        // R870-F23: spec-carried config files this backend does not write.
+        crate::reject_unmaterializable_files(spec, crate::Backend::Docker)?;
+
         // R844-F21: a name-only port asks this backend to allocate, and it
         // cannot — see `crate::reject_unresolved_ports`. `yah.docker.publish`
         // is the only host port this backend ever opens, and it is an explicit
@@ -1353,6 +1356,7 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 

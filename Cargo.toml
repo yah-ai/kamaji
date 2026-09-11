@@ -7,13 +7,18 @@ members = [
     "crates/procctl",
     "crates/kamaji-containerd-core",
     "crates/kamaji",
+    # R605-F14: `/sbin/init` inside the microVM guest. Homed here rather than in
+    # a separate repo because it is the other half of the `MicroVmJob` contract
+    # in crates/kamaji/src/microvm.rs — the two must be reviewable in one diff
+    # even though they ship as separate artifacts.
+    "crates/kamaji-guest-init",
     "crates/kamaji-bin",
     "crates/cheers-mock",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.36"
+version = "0.8.37"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

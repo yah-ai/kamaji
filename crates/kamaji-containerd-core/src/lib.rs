@@ -1135,15 +1135,23 @@ pub fn build_oci_spec_with(
         serde_json::json!({ "destination": "/tmp",   "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev","mode=1777"] }),
     ];
 
-    // R590-B7: DNS for host-networked workloads. Sharing the host netns gives
-    // the container IP egress, but raw runc (unlike docker/containerd-CRI) does
-    // not synthesize /etc/resolv.conf, and workload images typically ship none —
-    // so name resolution fails (a build's `git clone github.com` dies before the
-    // first packet). Bind-mount the host resolver read-only. Only under host
-    // networking: an isolated netns has no upstream resolver to inherit, and the
-    // bind is skipped when the host has no /etc/resolv.conf (runc would refuse a
-    // mount with a missing source).
-    if spec.wants_host_network() && std::path::Path::new("/etc/resolv.conf").exists() {
+    // R590-B7: DNS for a workload that has IP egress. Raw runc (unlike
+    // docker/containerd-CRI) does not synthesize /etc/resolv.conf, and workload
+    // images typically ship none — so name resolution fails (a build's `git
+    // clone github.com` dies before the first packet). Bind-mount the host
+    // resolver read-only. Skipped when the host has no /etc/resolv.conf, since
+    // runc refuses a mount with a missing source.
+    //
+    // R881-T3 widened the condition from `wants_host_network()` alone. The old
+    // comment said an isolated netns "has no upstream resolver to inherit",
+    // which was true only because an isolated netns had no route at all: a
+    // workload joining a namespace kamaji wired (`join_netns`) has a default
+    // route and egress NAT, so the host's resolver is exactly as reachable from
+    // inside it as from the host. Without this, such a workload gets an address
+    // and IP egress and still cannot resolve a name — which reads as a
+    // networking bug and is a missing file.
+    let has_ip_egress = spec.wants_host_network() || pod.join_netns.is_some();
+    if has_ip_egress && std::path::Path::new("/etc/resolv.conf").exists() {
         mounts.push(serde_json::json!({
             "destination": "/etc/resolv.conf", "type": "bind", "source": "/etc/resolv.conf",
             "options": ["rbind","ro","nosuid","nodev"]
@@ -1425,6 +1433,7 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 
@@ -1799,6 +1808,46 @@ mod tests {
         assert!(
             network_ns(&oci).is_none(),
             "host networking must not gain a network namespace from join_netns"
+        );
+    }
+
+    /// R881-T3: a workload joining a namespace kamaji wired has a default route
+    /// and egress NAT, so the host resolver is as reachable from inside it as
+    /// from the host — and without this bind it gets an address, gets IP egress,
+    /// and still cannot resolve a name. A workload that unshares an *empty*
+    /// namespace must still not get the file: there is no route to the resolver
+    /// there, and a resolv.conf pointing at an unreachable nameserver turns an
+    /// instant failure into a DNS timeout on every lookup.
+    #[test]
+    fn a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not() {
+        fn binds_resolver(oci: &serde_json::Value) -> bool {
+            oci["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["destination"] == "/etc/resolv.conf")
+        }
+        let spec = test_spec("acct");
+        assert!(
+            !binds_resolver(&build_oci_spec_with(
+                &spec,
+                &[],
+                None,
+                &PodOptions::default()
+            )),
+            "an empty namespace has no route to a resolver"
+        );
+        // Host-dependent by construction — the production condition is "the host
+        // has a resolv.conf to bind", since runc refuses a mount with a missing
+        // source. Asserting the condition rather than the outcome keeps this
+        // honest on a machine that has no /etc/resolv.conf.
+        let pod = PodOptions {
+            join_netns: Some("/var/run/netns/acct".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            binds_resolver(&build_oci_spec_with(&spec, &[], None, &pod)),
+            std::path::Path::new("/etc/resolv.conf").exists()
         );
     }
 

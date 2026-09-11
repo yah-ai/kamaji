@@ -1,0 +1,29 @@
+[package]
+name = "kamaji-guest-init"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PID 1 for a kamaji microVM guest — reads the job document off the scratch disk, stages the mounts, runs the argv, halts the VM."
+
+# `/sbin/init` in the guest rootfs. The binary name is not the install name: the
+# kernel looks for /sbin/init, and the image build puts this there.
+#
+# A guest init is a static binary or it is nothing — the rootfs it lives in has
+# no dynamic loader and no libc.so. That is a *target* property, not a manifest
+# one: `x86_64-unknown-linux-musl` links statically by default, and
+# guest/build-guest-image.sh builds nothing else. No `[profile]` here on purpose,
+# since cargo ignores profiles in a non-root workspace manifest and the
+# alternative — editing oss/kamaji/Cargo.toml's shared profile — would change
+# how every other kamaji crate is compiled to shrink this one binary.
+[[bin]]
+name = "kamaji-guest-init"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

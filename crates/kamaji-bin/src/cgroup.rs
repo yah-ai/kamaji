@@ -18,6 +18,47 @@
 //! `/sys/fs/cgroup`. The module therefore compiles everywhere; on non-Linux
 //! hosts (and under tests) the writes target whatever root path the caller
 //! supplies — typically a tempdir.
+//!
+//! @yah:ticket(R885-T2, "Add pids.max — nothing bounds a fork bomb today")
+//! @yah:at(2026-09-10T07:29:37Z)
+//! @yah:status(open)
+//! @yah:phase(P2)
+//! @yah:parent(R885)
+//! @yah:next("Tier: Cleric. Small and mechanical once R885-B1 has a live call site to hang it on.")
+//! @yah:next("REQUIRED_CONTROLLERS at cgroup.rs:35 is &[\"cpu\", \"memory\"] — pids is not even enabled on cgroup.subtree_control, so this is an enable plus a write, not just a write. Verified absent tree-wide: the only \"pids\" hit outside cgroup.rs is prose about process IDs at kamaji/src/docker.rs:168.")
+//! @yah:next("CARRY THE VALUE AS AN ANNOTATION, not a ResourceLimits field. WorkloadSpec crosses a postcard wire where every field is mandatory and always encoded; kamaji-proto/src/version.rs:63 states the rule three times, and V2/V4/V5/V6/V7/V8 were each a bump for exactly one added field. Follow the yah.placement.memory-request-mb precedent. Pick a defensible default rather than leaving it unset — an absent limit is the current behaviour and closes nothing.")
+//! @yah:verify("rg -n \"pids\" oss/kamaji/crates/kamaji-bin/src/cgroup.rs — REQUIRED_CONTROLLERS contains it and pids.max is written in create_workload.")
+//! @yah:verify("On a Linux node: cat /sys/fs/cgroup/<workload-leaf>/pids.max returns the configured bound, and a deliberate fork bomb inside a test workload is capped rather than taking the node.")
+//! @yah:depends_on(R885-B1)
+//!
+//! @yah:ticket(R885-F3, "OOM classification: an OOM-kill is currently indistinguishable from a crash")
+//! @yah:at(2026-09-10T07:30:00Z)
+//! @yah:status(open)
+//! @yah:phase(P2)
+//! @yah:parent(R885)
+//! @yah:next("Tier: Warrior — the read path is easy, but reporting the distinction upward may cross the wire (see gotcha).")
+//! @yah:next("THE DRIVER HAS NO READ PATH AT ALL. cgroup.rs only ever writes; there is no reader outside its own tests. memory.events oom_kill is the only counter separating an OOM from an ordinary signal, and nothing reads it — the restart loop sees Signaled(SIGKILL) via translate_wait_status and treats it as ordinary failure.")
+//! @yah:next("THIS HAS A SCAR ALREADY: R590-B10 is a forge workload SIGKILLed by a 256 MB ceiling during a rusty-v8 checkout, diagnosed the slow way and stopgapped by raising the ceiling to 32 GiB. That 32 GiB stopgap is in turn what R605-T10 is about. A one-line oom_kill read would have collapsed that diagnosis.")
+//! @yah:next("COLLECT THE REST WHILE THE READ PATH EXISTS — they are free once there is one: memory.peak, cpu.stat throttling counters, pids.current. Surface them as workload telemetry. PSI is optional and not required by this ticket.")
+//! @yah:verify("rg -rn \"memory\\.events|memory\\.peak|cpu\\.stat|pids\\.current\" --type rust — returns real read sites, not doc comments.")
+//! @yah:verify("On a Linux node: deploy a workload with a memory.max it will exceed; kamaji reports a state that names the OOM, distinct from the state a plain SIGKILL produces.")
+//! @yah:gotcha("CHECK THE WIRE COST BEFORE DESIGNING THE REPORT. Surfacing an OOM distinction to yubaba may need a new WorkloadState shape, and WorkloadState crosses the postcard UDS where every field is mandatory — kamaji-proto/src/version.rs:63, currently V8. See whether an existing field or the annotations map can carry it before spending a ProtocolVersion bump. If a bump is genuinely needed, batch it with anything else under R885 that needs one rather than paying twice.")
+//! @yah:depends_on(R885-B1)
+//! @yah:gotcha("R885-T6 IS NOW A CERTAIN V9 BUMP (operator decided 2026-09-10 to delete ephemeral_storage_mb from ResourceLimits). If this ticket also needs a wire change to report the OOM distinction upward, check R885-T6 status first and batch both into one ProtocolVersion bump instead of paying two.")
+//!
+//! @yah:ticket(R885-B4, "Add a generation level and a safe teardown — redeploy races rmdir against mkdir, and EBUSY has no recovery")
+//! @yah:at(2026-09-10T07:30:22Z)
+//! @yah:status(open)
+//! @yah:phase(P2)
+//! @yah:parent(R885)
+//! @yah:next("Tier: Warrior — teardown correctness and a race, on Linux-only paths the camp Mac cannot exercise.")
+//! @yah:next("THE HIERARCHY IS TWO LEVELS AND ENFORCED FLAT: <slice_root>/native/<workload-id>/. validate_id at cgroup.rs:174 forbids a slash in the id, so the flatness is deliberate, not incidental. A rolling replacement of svc-a therefore puts outgoing and incoming processes in the SAME directory and races teardown rmdir against the new mkdir. Fix: extend to <workload-id>/<generation>/ and relax validate_id for exactly that one level.")
+//! @yah:next("TEARDOWN IS A BARE remove_dir (cgroup.rs:113) whose own doc at :109-112 pushes the reap-before-rmdir obligation onto callers that do not exist. There is no cgroup.procs read-back, no cgroup.kill, no freeze-and-sweep. A workload that double-forked leaves rmdir failing EBUSY with no recovery path. Correct order: cgroup.kill -> reap -> read final counters (pairs with R885-F3) -> rmdir.")
+//! @yah:next("The concept is already in this codebase on the other side: kamaji-containerd-core/src/lib.rs:665-666 reasons about cgroup-wide kill reaching every process in a task cgroup. Only the native side lacks it. cgroup.kill appears nowhere under oss/kamaji today.")
+//! @yah:verify("rg -rn \"cgroup\\.kill\" oss/kamaji — a real write site in destroy_workload, ordered before the rmdir.")
+//! @yah:verify("Unit test: a workload cgroup with a live double-forked descendant is torn down cleanly rather than leaving EBUSY.")
+//! @yah:verify("On a Linux node: redeploy the same workload id twice in quick succession; both generations get distinct leaves and the first is fully removed.")
+//! @yah:depends_on(R885-B1)
 
 use std::fs;
 use std::io;

@@ -784,6 +784,10 @@ impl Kamaji for ContainerdRuntime {
         // to appear in the service record.
         crate::reject_unresolved_ports(&spec.name, &spec.expose.mesh, crate::Backend::Containerd)?;
 
+        // R870-F23: same shape, for spec-carried config files this backend
+        // does not write. See `crate::reject_unmaterializable_files`.
+        crate::reject_unmaterializable_files(spec, crate::Backend::Containerd)?;
+
         // Host networking is a privileged escape hatch — it drops network
         // isolation so the container binds host ports directly. Guard it to the
         // infra tier so an ordinary tenant workload cannot request it (bind
@@ -1324,6 +1328,7 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 

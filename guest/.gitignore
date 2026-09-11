@@ -1,0 +1,4 @@
+# build-guest-image.sh's output: a 44 MB vmlinux, a 30 MB rootfs.ext4, and the
+# kernel and busybox source trees it builds them from. All of it is reproducible
+# from this directory's checked-in inputs, which is the point of the script.
+out/

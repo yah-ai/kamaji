@@ -115,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         },
         labels: Default::default(),
         annotations: Default::default(),
+        files: Vec::new(),
     };
 
     let runtime = Arc::new(NativeRuntime::new(&state_dir));

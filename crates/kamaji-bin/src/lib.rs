@@ -51,6 +51,9 @@ pub mod native;
 pub mod pidfd;
 pub mod probe;
 pub mod server;
+/// R850-F1: supervise the declared backup while a stateful workload runs, and
+/// stop that workload when its tail reports another node owns the state.
+pub mod tail;
 
 pub use audit::{
     AuditRecord, CheersForwarder, DeniedSampler, ForwarderConfig, ForwarderHandle, JsonlWriter,

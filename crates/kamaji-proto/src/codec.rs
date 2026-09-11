@@ -623,6 +623,7 @@ mod tests {
                 m.insert("yah.created-by".into(), "agent:claude".into());
                 m
             },
+            files: Vec::new(),
         }
     }
 

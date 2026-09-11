@@ -562,6 +562,62 @@ pub struct NodeCapabilities {
     /// without a second round trip is the difference between one probe and a
     /// protocol.
     pub native_exec_dir: Option<String>,
+    /// Whether this Kamaji has the microVM backend attached, and — if not —
+    /// why (R605-T27, `ProtocolVersion::V9`).
+    ///
+    /// Before this field the only honest remote answer to "did this node
+    /// attach the microVM backend" was the kamaji startup journal line: `GET
+    /// /health` returns a fixed body with nothing per-backend, and the sibling
+    /// wire carried no capability query at all for this backend (unlike
+    /// `native_exec`, which R858-T4 already covers here).
+    pub microvm: MicroVmHealth,
+}
+
+/// Live microVM-backend health, folded into [`NodeCapabilities`] (R605-T27).
+///
+/// Two questions, not one, because they fail for unrelated reasons with
+/// unrelated fixes: was this node even *configured* for the backend
+/// (`--microvm-dir`, at process start), and — if so — can it *currently* get a
+/// VM out of the kernel (`/dev/kvm`, which an operator can break live by
+/// changing device permissions or group membership without restarting
+/// anything). Collapsing them into one bool would answer "no" without saying
+/// which of those two very different remediations applies.
+///
+/// Deliberately does NOT cover "backend configured but missing guest
+/// kernel/rootfs/VMM binary" as a *distinguishable live state* — it can't,
+/// because `kamaji::microvm::MicroVmRuntime::new` (the `kamaji` crate; not a
+/// dependency of this one) refuses to construct when those are missing, and
+/// that refusal is FATAL to the whole process at boot (deliberately — see
+/// its doc comment). A running Kamaji that answers this message at all was
+/// therefore either never asked to attach the backend (`attached: false`) or
+/// attached it successfully (`attached: true`); the missing-artifact case
+/// never reaches a live `/health`-adjacent surface to report on, only the
+/// startup journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MicroVmHealth {
+    /// `true` iff this Kamaji was started with `--microvm-dir` pointing at a
+    /// guest kernel + rootfs + VMM binary that all existed at boot (the only
+    /// way the backend can be attached — a misconfigured `--microvm-dir`
+    /// fails the whole process rather than leaving it running unattached).
+    /// `false` on a node that was never asked to attach the backend, or on a
+    /// build compiled without the `microvm` cargo feature.
+    pub attached: bool,
+    /// Live re-probe of `/dev/kvm` taken for THIS reply — not cached from
+    /// attach time. Mirrors `kamaji::microvm::MicroVmRuntime::health`, which
+    /// is deliberately uncached for the same reason: device permissions
+    /// and group membership are exactly what an operator changes on a running
+    /// node, and a cached `true` would keep reporting healthy right through
+    /// the change that broke it. The cost is one `/dev/kvm` open+close per
+    /// call, not connect-and-timeout like the containerd/docker probes — cheap
+    /// enough to pay at `/health` frequency. `None` when `attached` is false;
+    /// there is nothing to probe.
+    pub kvm_ok: Option<bool>,
+    /// Why `kvm_ok` is `false`, when it is: distinguishes "no `/dev/kvm` on
+    /// this host" from "exists but this process can't open it (group
+    /// membership)" from other OS errors, because each has a different fix —
+    /// see `kamaji::probe::probe_microvm` (not a dependency of this crate).
+    /// `None` when `kvm_ok` is `true` or `attached` is `false`.
+    pub detail: Option<String>,
 }
 
 impl KamajiToYubaba {
@@ -656,6 +712,11 @@ mod reply_correlation_tests {
                 capabilities: NodeCapabilities {
                     native_exec: true,
                     native_exec_dir: Some("/var/lib/yah/kamaji/native".into()),
+                    microvm: MicroVmHealth {
+                        attached: false,
+                        kvm_ok: None,
+                        detail: None,
+                    },
                 },
             },
         ];
