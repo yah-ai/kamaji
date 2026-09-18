@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::process::Command;
@@ -203,6 +203,11 @@ pub struct DockerRuntime {
     /// "inherit from environment", which picks up OrbStack's socket on macOS
     /// and the system socket on Linux.
     docker_host: String,
+    /// This node's local `yah-scryer` ingestion socket, when one is configured
+    /// (R893-B17). A container has its own mount namespace, so this backend
+    /// must bind the socket in as well as name it — see
+    /// [`crate::observe::Collector::guest_bind`].
+    collector: crate::observe::Collector,
 }
 
 impl DockerRuntime {
@@ -210,6 +215,7 @@ impl DockerRuntime {
     pub fn new() -> Self {
         Self {
             docker_host: String::new(),
+            collector: crate::observe::Collector::disabled(),
         }
     }
 
@@ -217,7 +223,22 @@ impl DockerRuntime {
     pub fn with_host(docker_host: impl Into<String>) -> Self {
         Self {
             docker_host: docker_host.into(),
+            collector: crate::observe::Collector::disabled(),
         }
+    }
+
+    /// Point this backend's containers at the node's local collector
+    /// (R893-B17).
+    ///
+    /// Only meaningful when the docker daemon shares a filesystem with this
+    /// kamaji: the bind source is resolved by the *daemon*, so on a remote or
+    /// VM-backed daemon (OrbStack, colima, `DOCKER_HOST` over TCP) the host
+    /// path this names does not exist on the side that mounts it. That is the
+    /// same topology limit the `shared_dir` upgrade-sock mount already has, and
+    /// it is why this is opt-in per node rather than derived.
+    pub fn with_collector(mut self, collector: crate::observe::Collector) -> Self {
+        self.collector = collector;
+        self
     }
 
     fn cmd(&self) -> Command {
@@ -394,6 +415,7 @@ impl DockerRuntime {
         mesh: &MeshAssignment,
         image: &str,
         name: &str,
+        collector: &crate::observe::Collector,
     ) -> Result<Vec<String>> {
         let ident = &spec.expose.mesh.identity;
         let mut args: Vec<String> = vec![
@@ -504,13 +526,42 @@ impl DockerRuntime {
             args.push(format!("{k}={v}"));
         }
 
+        // R893-B17: the local collector. Two halves that must move together —
+        // the env names the path the workload will connect to, and the bind is
+        // what makes that path exist inside this container's own mount
+        // namespace. Read-write, because `connect(2)` on an AF_UNIX socket
+        // needs write permission on the inode.
+        if let Some((host, guest)) = collector.guest_bind() {
+            args.push("-v".into());
+            args.push(format!("{host}:{guest}"));
+        }
+        for (k, v) in collector.env_for(spec, crate::observe::MountNs::Own) {
+            args.push("--env".into());
+            args.push(format!("{k}={v}"));
+        }
+
         // Literal env vars from the spec. Last, so a spec-level value overrides
         // both the mesh IP and the port contract — `docker run` takes the final
         // `--env` for a repeated name.
         for e in &spec.env {
-            if let workload_spec::EnvValue::Literal { value } = &e.value {
-                args.push("--env".into());
-                args.push(format!("{}={}", e.name, value));
+            match &e.value {
+                workload_spec::EnvValue::Literal { value } => {
+                    args.push("--env".into());
+                    args.push(format!("{}={}", e.name, value));
+                }
+                workload_spec::EnvValue::FromSecret { secret, .. } => bail!(
+                    "workload {}: env {} carries an unresolved FromSecret({secret}) — yubaba \
+                     must resolve before Deploy; the guest would run without it",
+                    spec.name,
+                    e.name
+                ),
+                workload_spec::EnvValue::FromMesh { ident, .. } => bail!(
+                    "workload {}: env {} carries an unresolved FromMesh({}) — yubaba must \
+                     resolve before Deploy; the guest would run without it",
+                    spec.name,
+                    e.name,
+                    ident.0
+                ),
             }
         }
 
@@ -638,7 +689,7 @@ impl Kamaji for DockerRuntime {
             self.ensure_network(net).await?;
         }
 
-        let args = Self::run_args(spec, mesh, &image, &name)?;
+        let args = Self::run_args(spec, mesh, &image, &name, &self.collector)?;
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let run = self
             .cmd()
@@ -677,6 +728,7 @@ impl Kamaji for DockerRuntime {
             container_id,
             mesh_ip: mesh.mesh_ip,
             task_pid,
+            hydrate: None,
             ports: Default::default(),
         })
     }
@@ -1009,12 +1061,20 @@ fn map_docker_state(state: &DockerState, restart_count: u32) -> WorkloadStatus {
         "paused" | "removing" => WorkloadStatus::Stopping,
         "exited" if state.exit_code == 0 => WorkloadStatus::Stopped,
         "exited" => WorkloadStatus::Failed {
+            oom_killed: false,
             reason: format!("exited with code {}", state.exit_code),
         },
         "dead" => WorkloadStatus::Failed {
+            // R885-T6: always `false` on this backend, and that is a gap rather
+            // than a fact. Docker's own `State` carries an `OOMKilled` bool that
+            // `DockerState` does not parse, so this path genuinely cannot tell —
+            // `false` means "not known to be an OOM", never "known not to be".
+            // Wiring it is a contained follow-on: add the field, map it here.
+            oom_killed: false,
             reason: "container is dead".into(),
         },
         other => WorkloadStatus::Failed {
+            oom_killed: false,
             reason: format!("unknown docker status: {other}"),
         },
     }
@@ -1312,7 +1372,6 @@ mod tests {
     fn test_spec(name: &str) -> WorkloadSpec {
         use workload_spec::*;
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             image: ImageRef {
                 registry: "docker.io".into(),
@@ -1334,7 +1393,10 @@ mod tests {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -1355,19 +1417,54 @@ mod tests {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
     }
 
     fn render(spec: &WorkloadSpec) -> Vec<String> {
+        render_with(spec, &crate::observe::Collector::disabled())
+    }
+
+    fn render_with(spec: &WorkloadSpec, collector: &crate::observe::Collector) -> Vec<String> {
         DockerRuntime::run_args(
             spec,
             &MeshAssignment::inlined("127.0.0.1".parse().unwrap()),
             "alpine:latest",
             &spec.expose.mesh.identity.0,
+            collector,
         )
         .expect("render")
+    }
+
+    /// R893-B17. A container has its own mount namespace, so BOTH halves have
+    /// to be rendered: the env names the in-container path, and the `-v` bind
+    /// is what makes that path exist. Either one alone leaves the workload
+    /// connecting to nothing.
+    #[test]
+    fn the_collector_contract_renders_as_a_bind_plus_the_guest_path() {
+        let spec = test_spec("inner-door");
+        let args = render_with(
+            &spec,
+            &crate::observe::Collector::at("/run/yah/scryer.sock"),
+        );
+        assert!(
+            flag_values(&args, "-v").contains(&"/run/yah/scryer.sock:/run/yah/scryer.sock"),
+            "the host socket must be bind-mounted in; got {args:?}"
+        );
+        let envs = flag_values(&args, "--env");
+        assert!(envs.contains(&"YAH_SERVICE_IDENT=inner-door"), "got {envs:?}");
+        assert!(
+            envs.contains(&format!("YAH_SCRYER_SOCKET={}", crate::observe::GUEST_SOCKET_PATH).as_str()),
+            "a container must read the GUEST path, never the host one; got {envs:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_without_a_collector_renders_neither_half() {
+        let args = render(&test_spec("inner-door"));
+        assert!(!args.iter().any(|a| a.contains("scryer")), "got {args:?}");
     }
 
     /// Value following the (first) occurrence of `flag` in the argv.
@@ -1467,6 +1564,71 @@ mod tests {
         assert_eq!(last_port, Some(&"PORT=9999"), "{env:?}");
     }
 
+    /// R876-B17: a non-literal env value must REFUSE the render, matching the
+    /// other four admission-path sites, not silently drop the variable.
+    #[test]
+    fn run_args_refuses_unresolved_from_secret_env() {
+        let mut spec = test_spec("web");
+        spec.env = vec![workload_spec::EnvVar {
+            name: "CREDENTIAL".into(),
+            value: workload_spec::EnvValue::FromSecret {
+                secret: "sentinel-secret".into(),
+                key: "sentinel-key".into(),
+            },
+        }];
+        let err = DockerRuntime::run_args(
+            &spec,
+            &MeshAssignment::inlined("127.0.0.1".parse().unwrap()),
+            "alpine:latest",
+            &spec.expose.mesh.identity.0,
+            &crate::observe::Collector::disabled(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CREDENTIAL"), "error must name the variable: {err}");
+        assert!(err.contains("FromSecret"), "error must name the shape: {err}");
+    }
+
+    /// R876-B17: same refusal for an unresolved `FromMesh` reference.
+    #[test]
+    fn run_args_refuses_unresolved_from_mesh_env() {
+        let mut spec = test_spec("web");
+        spec.env = vec![workload_spec::EnvVar {
+            name: "PEER_ADDR".into(),
+            value: workload_spec::EnvValue::FromMesh {
+                ident: MeshIdent("sentinel-peer".into()),
+                kind: workload_spec::MeshLookup::Url,
+            },
+        }];
+        let err = DockerRuntime::run_args(
+            &spec,
+            &MeshAssignment::inlined("127.0.0.1".parse().unwrap()),
+            "alpine:latest",
+            &spec.expose.mesh.identity.0,
+            &crate::observe::Collector::disabled(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("PEER_ADDR"), "error must name the variable: {err}");
+        assert!(err.contains("FromMesh"), "error must name the shape: {err}");
+    }
+
+    /// Non-vacuity for the two tests above: a spec carrying only `Literal` env
+    /// must still render and still carry its value.
+    #[test]
+    fn run_args_still_succeeds_with_only_literal_env() {
+        let mut spec = test_spec("web");
+        spec.env = vec![workload_spec::EnvVar {
+            name: "PLAIN".into(),
+            value: workload_spec::EnvValue::Literal {
+                value: "plain-value".into(),
+            },
+        }];
+        let args = render(&spec);
+        let env = flag_values(&args, "--env");
+        assert!(env.contains(&"PLAIN=plain-value"), "{env:?}");
+    }
+
     #[test]
     fn published_ports_render_in_declaration_order() {
         let mut spec = test_spec("minio");
@@ -1496,6 +1658,7 @@ mod tests {
             &MeshAssignment::inlined("127.0.0.1".parse().unwrap()),
             "alpine:latest",
             "minio",
+            &crate::observe::Collector::disabled(),
         )
         .unwrap_err()
         .to_string();
@@ -1541,6 +1704,7 @@ mod tests {
                 },
                 target: "/data".into(),
                 read_only: false,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Named {
@@ -1548,11 +1712,13 @@ mod tests {
                 },
                 target: "/assets".into(),
                 read_only: true,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Tmpfs { size_mb: 64 },
                 target: "/scratch".into(),
                 read_only: false,
+                from_secret_mount: false,
             },
         ];
         let args = render(&spec);

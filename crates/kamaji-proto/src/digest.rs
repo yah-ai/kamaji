@@ -23,30 +23,35 @@
 //!
 //! ## What equality does and does not promise
 //!
-//! The digest is SHA-256 over the postcard encoding of the `Workload`, under a
-//! domain-separation prefix. Postcard is positional, so the encoding is a pure
-//! function of the value for every spec whose maps are *ordered* — which is the
-//! case for [`workload_spec::TenantPasswayWorkload`], whose only map is a
-//! `BTreeMap`.
+//! The digest is SHA-256 over the **canonical JSON** encoding of the `Workload`
+//! ([`crate::tolerant::canonical_json`]), under a domain-separation prefix. Every
+//! object key is sorted at every depth, so the encoding is a pure function of the
+//! value — including for a `Workload::Container`, whose
+//! [`workload_spec::WorkloadSpec`] carries `labels` and `annotations` as
+//! `HashMap`s.
 //!
-//! It is **not** the case for a `Workload::Container`: [`workload_spec::WorkloadSpec`]
-//! carries `labels` and `annotations` as `HashMap`s, whose iteration order is
-//! randomized per process. Two processes holding an identical container spec can
-//! therefore compute different digests.
-//!
-//! That asymmetry is safe, and it is why the digest is usable anyway. The two
-//! failure directions are not equal:
+//! **That is a change, and it strengthens the promise.** The basis used to be the
+//! postcard encoding, which is positional and therefore canonical only for a spec
+//! whose maps are *ordered* — true of [`workload_spec::TenantPasswayWorkload`]
+//! (a `BTreeMap`), false of a container spec, whose `HashMap` iteration order is
+//! randomized per process. Two processes holding an identical container spec
+//! could compute different digests, and this doc used to argue that away as a
+//! safe asymmetry:
 //!
 //! - a spurious **mismatch** costs one redeploy — exactly the behaviour a caller
-//!   without digests has on every sweep, so it can only ever be an improvement;
+//!   without digests has on every sweep, so it could only ever be an improvement;
 //! - a spurious **match** would leave a changed spec undeployed, and that is the
-//!   one this cannot produce: equal digests mean equal encodings up to a SHA-256
-//!   collision.
+//!   one it could not produce.
 //!
-//! So `Some(d) == Some(d)` is a sound "nothing changed" for an ordered-map spec,
-//! and merely a best-effort optimisation for a `HashMap`-carrying one. Callers
-//! that need the guarantee should say which specs they rely on it for, as
-//! `yubaba::tenant_passway` does.
+//! The argument was sound; it is now moot. `Some(d) == Some(d)` is a sound
+//! "nothing changed" for every spec shape, not just the ordered-map ones, so a
+//! caller no longer has to say which specs it relies on it for.
+//!
+//! R896-F2 moved the basis because the wire moved (see [`crate::tolerant`]), and
+//! sorting was free once the encoding went through `serde_json::Value`. The
+//! domain prefix went `v1` → `v2` with it: every recorded digest is invalidated,
+//! which reads on a node as **redeploy everything once**, the safe direction, and
+//! is exactly the bump this prefix exists to make possible.
 //!
 //! `None` — an unencodable spec, or an entry from a kamaji that never recorded
 //! one (a restart, another backend, a pre-V5 peer) — compares unequal to
@@ -64,7 +69,7 @@ pub type SpecDigest = [u8; 32];
 /// the scheme a version to bump if the basis (postcard-of-`Workload`) is ever
 /// replaced — a changed prefix invalidates every recorded digest, which reads on
 /// a node as "redeploy everything once", the safe direction.
-const DIGEST_DOMAIN: &[u8] = b"kamaji-proto/spec-digest/v1\0";
+const DIGEST_DOMAIN: &[u8] = b"kamaji-proto/spec-digest/v2\0";
 
 /// Digest `spec` for [`WorkloadEntry::spec_digest`] comparison.
 ///
@@ -78,7 +83,7 @@ const DIGEST_DOMAIN: &[u8] = b"kamaji-proto/spec-digest/v1\0";
 ///
 /// [`WorkloadEntry::spec_digest`]: crate::WorkloadEntry::spec_digest
 pub fn spec_digest(spec: &Workload) -> Option<SpecDigest> {
-    let encoded = postcard::to_stdvec(spec).ok()?;
+    let encoded = crate::tolerant::canonical_json(spec).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN);
     hasher.update(&encoded);
@@ -93,7 +98,6 @@ mod tests {
 
     fn passway(domain: &str, listen: &str) -> Workload {
         Workload::TenantPassway(TenantPasswayWorkload {
-            schema_version: Default::default(),
             domain: domain.to_string(),
             listen: listen.to_string(),
             upstreams: vec!["127.0.0.1:8080".to_string()],
@@ -101,6 +105,7 @@ mod tests {
             idle_ttl: None,
             command: None,
             env: BTreeMap::new(),
+            discover: None,
         })
     }
 
@@ -150,7 +155,47 @@ mod tests {
         // SHA-256 of the postcard bytes must NOT equal what we return, or the
         // version half of the prefix buys nothing.
         let spec = passway("a.example", "127.0.0.1:8443");
-        let bare: SpecDigest = Sha256::digest(postcard::to_stdvec(&spec).unwrap()).into();
+        let bare: SpecDigest =
+            Sha256::digest(crate::tolerant::canonical_json(&spec).unwrap()).into();
         assert_ne!(bare, spec_digest(&spec).unwrap());
+    }
+
+    /// The property the basis change bought: a container spec's digest no longer
+    /// depends on `HashMap` iteration order. Building the same annotations in two
+    /// different insertion orders must land on the same bytes.
+    #[test]
+    fn a_container_spec_digests_independently_of_map_order() {
+        use workload_spec::{ImageRef, TierTag, WorkloadSpec};
+
+        let base = || {
+            WorkloadSpec::for_forge(
+                "b3",
+                ImageRef {
+                    registry: "ghcr.io".into(),
+                    repository: "yah/forge".into(),
+                    tag: "v1".into(),
+                    digest: "sha256:abc123".into(),
+                },
+                TierTag("private".into()),
+                vec![8080],
+            )
+        };
+
+        let keys = ["yah.exec", "yah.sandbox", "yah.forge", "zulu"];
+        let mut forward = base();
+        for key in keys {
+            forward.annotations.insert(key.into(), "v".into());
+        }
+        let mut reverse = base();
+        for key in keys.iter().rev() {
+            reverse.annotations.insert((*key).into(), "v".into());
+        }
+
+        assert_eq!(
+            spec_digest(&Workload::container(forward)).unwrap(),
+            spec_digest(&Workload::container(reverse)).unwrap(),
+            "canonical encoding must sort map keys — this is the guarantee the \
+             postcard basis could not make for a HashMap-carrying spec"
+        );
     }
 }

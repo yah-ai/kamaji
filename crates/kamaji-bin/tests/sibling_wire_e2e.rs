@@ -46,7 +46,7 @@ use tokio::sync::oneshot;
 use workload_spec::{
     BackoffPolicy, EnvValue, EnvVar, ExposeSpec, HealthProbe, Healthcheck, ImageRef,
     LifecycleArchetype, MeshExpose, MeshIdent, MeshLookup, Millis, OperatorExpose, PublicExpose,
-    PublicTls, ResourceLimits, RestartPolicy, SchemaVersion, SecretMount, SecretRef, SecretTarget,
+    PublicTls, ResourceLimits, RestartPolicy, SecretMount, SecretRef, SecretTarget,
     StopPolicy, TierTag, VolumeMount, VolumeSource, WorkloadSpec,
 };
 
@@ -54,13 +54,19 @@ use workload_spec::{
 /// can prove the nested `ImageRef` decoded correctly on its side of the wire.
 const TEST_DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
+/// One `turso-backup-hydrate` output line, in the shape that helper actually
+/// prints (`oss/turso-backup/src/bin/hydrate.rs::outcome_to_json`). The
+/// scripted backend returns it on the deploy reply so the client leg of R850-T4
+/// is pinned against a real line rather than a placeholder — the far consumer
+/// parses `restored[].{subject,bytes,seconds}` by name.
+const HYDRATE_LINE: &str = r#"{"outcome":"hydrated","epoch":7,"subjects":1,"bytes":4096,"seconds":1.5,"restored":[{"subject":"main","source":{"snapshot":3},"bytes":4096,"seconds":1.5}]}"#;
+
 /// A full container spec: nested `ImageRef`, three `EnvValue` kinds, both
 /// secret shapes, all three volume sources, a healthcheck, and a full expose
 /// block. The payload that stresses the most nested enums across the UDS.
 fn full_container_spec() -> WorkloadSpec {
     use std::collections::HashMap;
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: "noisetable-api".into(),
         image: ImageRef {
             registry: "ghcr.io".into(),
@@ -124,6 +130,7 @@ fn full_container_spec() -> WorkloadSpec {
                 },
                 target: PathBuf::from("/data"),
                 read_only: false,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Bind {
@@ -131,17 +138,22 @@ fn full_container_spec() -> WorkloadSpec {
                 },
                 target: PathBuf::from("/config"),
                 read_only: true,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Tmpfs { size_mb: 128 },
                 target: PathBuf::from("/tmp"),
                 read_only: false,
+                from_secret_mount: false,
             },
         ],
         resources: ResourceLimits {
             memory_mb: 512,
             cpu_millis: 1024,
-            ephemeral_storage_mb: 256,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![MeshIdent("noisetable-db.pdx".into())],
         requires: vec![],
@@ -189,6 +201,7 @@ fn full_container_spec() -> WorkloadSpec {
             }),
         },
         labels: HashMap::new(),
+        durability: None,
         annotations: HashMap::new(),
         files: Vec::new(),
     }
@@ -329,6 +342,19 @@ async fn accepted_deploy_appears_in_list_against_scripted_backend() {
     assert_eq!(result.container_id, spec.name);
     assert_eq!(result.mesh_ip, mesh.mesh_ip);
 
+    // R850-T4: and it carries the hydrate-on-place measurement the server put
+    // on the reply, byte-for-byte. Byte-for-byte is the assertion that matters:
+    // the consumer (`yah-cloud`'s `RecoveryRecord::from_helper_json`) parses
+    // this line with serde, so anything this leg re-encodes, trims or
+    // re-serializes is a journal record that silently fails to parse on the
+    // far side of a real restore — the one moment there is no second chance to
+    // take the measurement.
+    assert_eq!(
+        result.hydrate.as_deref(),
+        Some(HYDRATE_LINE),
+        "the deploy reply's hydrate line must survive the wire unmodified"
+    );
+
     // The workload now appears in List.
     let entries = client.list().await.expect("list");
     assert_eq!(
@@ -452,9 +478,10 @@ async fn scripted_backend(listener: UnixListener) {
                         named_ports: Default::default(),
                         spec_digest: None,
                     });
-                    KamajiToYubaba::Ack {
+                    KamajiToYubaba::DeployAck {
                         request_id,
-                        kind: AckKind::Deploy,
+                        id: id.clone(),
+                        hydrate: Some(HYDRATE_LINE.to_string()),
                     }
                 }
                 other => KamajiToYubaba::Error {

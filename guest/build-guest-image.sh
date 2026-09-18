@@ -344,11 +344,20 @@ EOF
 	say "assembling rootfs.ext4 (${used_kb}K of content, ${size_mb}M image)"
 	rm -f "$OUT/rootfs.ext4"
 	truncate -s "${size_mb}M" "$OUT/rootfs.ext4"
-	# No journal: the image is attached read-only and never recovered, so a
-	# journal is 4 MB of an artifact that gets copied to every build node.
+	# WITH a journal, as of R605-F33, reversing the `-O ^has_journal` this used to
+	# carry. That flag was justified by "the image is attached read-only and never
+	# recovered", and that premise is now false for half of its uses: a
+	# service-shaped guest boots a private writable copy of this image
+	# (`RootDisk::provision`) and the init keeps it as the real root rather than
+	# overlaying it, so it IS written, and a guest that panics or is torn down
+	# mid-write resets without a clean unmount. Nothing in the guest or on the
+	# host runs e2fsck, so without a journal that filesystem is simply damaged and
+	# the service's state is gone. 4 MB against a 30 MB image, and jobs — which
+	# still mount it read-only from a clean, never-written node image — pay only
+	# the size.
 	# Unprivileged by construction — `mkfs.ext4 -d` needs no loop mount, which is
 	# the same reason kamaji can build the scratch disk without root.
-	mkfs.ext4 -q -F -O ^has_journal -d "$staging" "$OUT/rootfs.ext4"
+	mkfs.ext4 -q -F -d "$staging" "$OUT/rootfs.ext4"
 	# Provenance sidecar, read and logged by MicroVmRuntime::new at kamaji
 	# startup so a running node says which rootfs it boots guests from without
 	# anyone having to ssh in and hash 30 MB. The toolchain volume gets the same

@@ -86,17 +86,34 @@
 //! @yah:cleanup("Drain is not wired for microVM workloads -- a Drain returns DrainAck{accepted:false}, teardown is via Stop. Same deliberate gap the bundle backend has for the same reason (the runtime single-owns the process, so registering a pidfd DrainableHandle would double-own it and race the supervisor's reaper). Also: a leaked TAP from a crashed kamaji holds its slot until restart; create_tap deletes-then-creates so it self-heals on reuse, but nothing sweeps them.")
 //! @yah:handoff("IN REVIEW: the microVM backend and its annotation dispatch are built, wired end to end from a pipeline step down to the VMM launch, and unit-tested across five crates. It has never booted a guest and cannot until R605-F14 and R605-T15 land -- see the gotcha. Sign-off here is on the software, not on a working isolated build.")
 //! @yah:verify("PRECISION ON THE PROBE COUNT above: 2 new probe:: tests run on this macOS host (absent_kvm_device_is_unavailable_not_a_panic, microvm_is_unavailable_off_linux_without_touching_the_filesystem) plus availability_require_routes_per_backend extended to route Backend::MicroVm. A third, unopenable_kvm_device_names_the_group_fix, is cfg(target_os = linux) and has NOT run anywhere -- it reproduces W325 section 4's exists-but-EACCES case, which is the fleet's actual state, so run it on the first Linux node that gets this build.")
+//!
+//! @yah:relay(R895, "One workload data plane: merge kamaji's two netns vocabularies onto the W343 model")
+//! @yah:at(2026-09-11T22:25:56Z)
+//! @yah:status(handoff)
+//! @yah:assignee(agent:user-custom-char-gul2)
+//! @yah:next("Operator call (2026-09-11, chat session:d6fc1d54, from the yubaba/kamaji architecture review): kamaji carries two netns vocabularies — MeshAssignment.netns_name (yubaba-assigned WireGuard netns, consumed by socket_custody, jit, containerd, sibling) and container_net::netns_name(workload) (the W343 bridge/veth routed model, derived node-locally) — with two address schemes riding along (100.64/10 raft-pool mesh IPs vs 10.128.x/24 per-node routed subnets). A workload's address and namespace have two possible owners depending on path. Converge on W343's routed model as the one data plane; the pre-workload-spec compose generation is the same track's legacy tail.")
+//! @arch:see(.yah/docs/working/W343-per-workload-mesh-addressing.md)
+//! @yah:gotcha("BOARD DATA-LOSS FAILURE MODE, hit live on 2026-09-13 during this relay — a deletion ticket whose @yah: annotation is homed in the file it deletes ERASES ITSELF, silently. R895-T2's annotation lived at oss/yubaba/crates/cloud/src/compose.rs:39; the ticket's own job was to delete compose.rs; the moment the courier did, `board.show R895-T2` began returning \"not found\", the ticket vanished from this relay's child list, and every board.update against it failed. Six gotchas and a verify entry recording a nine-node live-fleet sweep went with it (recovered here only because the leader still held them in context). Nothing warned at filing time, at claim time, or at deletion time. Two consequences worth generalising: (1) when filing a ticket whose work is a DELETION, home its annotation somewhere that survives the deletion — the crate root, or the module that loses the `mod` line; (2) before deleting any file, grep it for `@yah:` and re-home what you find, including blocks belonging to OTHER tickets, which would otherwise be removed from the board with no trace and no notification to their owners.")
+//! @yah:handoff("RELAY STATE at leader wind-down (Ashguard:blade, session:7ca0970b, 2026-09-13, 281k fill / 149 calls). The relay's own acceptance criteria are MET: kamaji's two netns vocabularies are converged onto W343's routed model, and the pre-workload-spec compose generation — the legacy tail named in the operator's original note — is deleted. R895-F1 (review): MeshAssignment.netns_name deleted from both structs, ProtocolVersion V12 added, socket custody repointed so container_net's namespace has ONE owner and the name flows down from the site that creates it. R895-T2 (review): cloud::compose and cloud::mesh_service deleted along with the shipped `yah cloud service deploy` verb and the POST /compose route, with W206's tenant-isolation policy transplanted into W343 and container_net's module docs before its only executable encoding was removed. Both await OPERATOR sign-off; neither was self-archived. R895-F3 (open) is the remaining child — it implements the tenant policy the transplant documents, is now unblocked since its depends_on R895-T2 reached review, and is deliberately NOT started: it is a Wizard-tier design question (per-tenant bridge vs filter rules inside the node's /24) that deserves a fresh context, not the tail of a spent one.")
+//! @yah:handoff("FIVE TICKETS FILED FROM DISCOVERED WORK, none of it folded in silently and none of it authored by this relay. R895-F3 — implement the tenant network isolation W206 requires, which R895-T2's deletion left with no enforcer anywhere (WorkloadSpec.tenant is now declarative-only); carries the undecided design fork. R900-B1 — a stale yah_fleet_metrics::WorkloadEntry literal missing `health` at crates/yah/cloud-admin/src/lib.rs:1557, red-lighting the ROOT workspace check camp-wide. R901 (+B1/B2/B3) — three verification instruments that lie in this camp, each of which fails in the safe-looking direction and two of which were hit by multiple independent sessions in one afternoon; together they are the mechanism behind this relay's ~50-minute camp-wide red build. R902-B1 — an unowned uncommitted E0382 at app/yah/desktop/src/agent.rs:6364 red-lighting the DESKTOP check. R903 — 34 persistent, load-independent raft leader-election failures in the yubaba workspace, measured at two load levels and attributed away from this relay four ways. NOTE THE COMPOUND RISK the last three describe together: with R900-B1 red on the root check and R902-B1 red on desktop, an agent in this camp currently has no clean root or desktop build to measure a regression against, and R901's traps make a clean-looking negative result the least trustworthy kind. That combination is the condition under which the next real break goes unnoticed.")
 
 pub mod inlined;
 pub mod probe;
 
-#[cfg(feature = "sibling")]
+/// Sibling-shape client (postcard over AF_UNIX). `unix` as well as the feature:
+/// the transport *is* a Unix domain socket, so there is no Windows shape of this
+/// module to compile (R918-T1). Callers that want the sibling client on a
+/// non-unix host need a different transport, not a cfg.
+#[cfg(all(unix, feature = "sibling"))]
 pub mod sibling;
 
 pub use inlined::Inlined;
 pub use probe::{BackendAvailability, BackendProbe};
 
-#[cfg(feature = "containerd-integration")]
+/// containerd gRPC backend — talks to containerd over its AF_UNIX control
+/// socket and drives a [`socket_custody`] custodian, so it carries the same
+/// `unix` gate they do (R918-T1).
+#[cfg(all(unix, feature = "containerd-integration"))]
 pub mod containerd;
 
 #[cfg(feature = "docker-integration")]
@@ -110,18 +127,35 @@ pub mod native;
 #[cfg(feature = "microvm-integration")]
 pub mod microvm;
 
+/// The restart loop both process-supervising backends share (R605-F31).
+///
+/// Gated on the union of the two features rather than on either: it is the
+/// state machine `native` has always run, lifted out so `microvm` can run a
+/// service-shaped guest through the *same* one instead of growing a second
+/// copy that drifts.
+#[cfg(any(feature = "native-integration", feature = "microvm-integration"))]
+pub(crate) mod supervise;
+
 /// On-demand ("serverless") JIT lifecycle (R599-F6): kamaji holds a workload's
 /// listen socket via the [`socket_custody`] custodian, forks the serve runtime
 /// on the first connection (systemd-style socket activation), and reaps it after
 /// an idle TTL. Built on the native fork+exec machinery, so gated on the same
 /// `native-integration` feature (which pulls in `socket-custody`).
-#[cfg(feature = "native-integration")]
+///
+/// `unix` as well: the whole mechanism is fd inheritance across `fork` +
+/// `dup2`, which has no Windows spelling (R918-T1).
+#[cfg(all(unix, feature = "native-integration"))]
 pub mod jit;
 
 /// Socket-custodian primitive (R599-F9): kamaji binds+holds a workload's listen
 /// socket and hands the fd to the workload process over its pingora upgrade
 /// socket. Shared core under R599-F6 (JIT) and R600-F9 (cert-rotation).
-#[cfg(feature = "socket-custody")]
+///
+/// `unix` as well as the feature: the handoff is `SCM_RIGHTS` over AF_UNIX
+/// (R918-T1). The `nix` dependency it needs is declared under
+/// `[target.'cfg(unix)'.dependencies]` for the same reason, so enabling
+/// `socket-custody` on a non-unix target is a no-op rather than a build break.
+#[cfg(all(unix, feature = "socket-custody"))]
 pub mod socket_custody;
 
 #[cfg(feature = "testing")]
@@ -140,6 +174,28 @@ pub mod container_net;
 /// Unconditional — a supervisor that cannot say what port it gave a workload is
 /// not a shape any build should be able to select.
 pub mod ports;
+
+/// cgroup v2 driver for the native backend (R406-T4, re-homed here by R885-B1).
+/// Unconditional and dependency-free — pure `std::fs` writes into the subtree
+/// systemd delegates to kamaji — and unconditional for the same reason `ports`
+/// is: it moved here from `kamaji-bin`, which depends on this crate, so leaving
+/// it behind a feature would put it back out of reach of the live path that
+/// R885-B1 exists to connect it to. `kamaji-bin` re-exports it.
+pub mod cgroup;
+
+/// Capability boundary for the two workload fork paths (R885-B9) — the other
+/// half of W344's "capability policy and resource policy are separate axes".
+/// Unconditional for the same reason [`cgroup`] is: it is a property of every
+/// workload kamaji forks, not of a backend, and a build that could select it
+/// away would be a build whose workloads silently keep kamaji's ambient set.
+pub mod sandbox;
+
+/// The deploy-time observability contract (R893-B17): `YAH_SERVICE_IDENT` +
+/// `YAH_SCRYER_SOCKET`, the pair `yah-log` and passway's span exporter both
+/// need before either emits anything at all. Unconditional for the same reason
+/// [`ports`] is — it is a property of every workload kamaji starts, not of a
+/// backend, and the whole point is that the answer cannot differ between them.
+pub mod observe;
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -190,6 +246,35 @@ pub enum Backend {
     MicroVm,
 }
 
+impl Backend {
+    /// Whether this backend writes out [`workload_spec::WorkloadSpec::files`]
+    /// before the workload starts (R870-F27).
+    ///
+    /// One fact, in one place, because the two halves of it live far apart: a
+    /// backend that writes must actually do so on its deploy path, and a
+    /// backend that does not must refuse such a spec via
+    /// [`reject_unmaterializable_files`]. Encoding it as a predicate here is
+    /// what makes the third state — a backend that neither writes nor
+    /// refuses, and therefore starts a workload against a file that is not
+    /// there — impossible to reach by forgetting a call.
+    ///
+    /// - [`Native`](Backend::Native) — `native::materialize_files`, on every
+    ///   spawn and every respawn.
+    /// - [`Containerd`](Backend::Containerd) — staged per container
+    ///   generation and bind-mounted read-only
+    ///   (`kamaji_containerd_core::stage_spec_files`).
+    /// - [`Docker`](Backend::Docker) / [`MicroVm`](Backend::MicroVm) — not
+    ///   yet. Docker would need `docker cp` before start or a `-v` per file;
+    ///   a microVM needs the bytes inside a guest rootfs image it builds, so
+    ///   its write belongs to the rootfs assembly step rather than to deploy.
+    pub fn materializes_files(self) -> bool {
+        match self {
+            Backend::Native | Backend::Containerd => true,
+            Backend::Docker | Backend::MicroVm => false,
+        }
+    }
+}
+
 /// Reported when a workload requests a backend that this Kamaji instance
 /// has not initialized. Carries a human-readable install hint so the camp /
 /// desktop can surface "install Docker Desktop" rather than just a generic
@@ -225,7 +310,6 @@ pub struct MeshAssignment {
     pub wg_private_key: String,
     pub wg_listen_port: u16,
     pub peers: Vec<WireguardPeer>,
-    pub netns_name: Option<String>,
 }
 
 impl MeshAssignment {
@@ -237,7 +321,6 @@ impl MeshAssignment {
             wg_private_key: String::new(),
             wg_listen_port: 0,
             peers: Vec::new(),
-            netns_name: None,
         }
     }
 
@@ -267,6 +350,21 @@ pub struct DeployResult {
     pub container_id: String,
     pub mesh_ip: Ipv4Addr,
     pub task_pid: u32,
+    /// The hydrate-on-place measurement kamaji took in front of this deploy
+    /// (R850-T4) — `turso-backup-hydrate`'s own JSON line, verbatim and
+    /// unparsed — or `None` when no restore happened.
+    ///
+    /// `None` from every backend in this crate, and that is structural rather
+    /// than unimplemented: hydrate-on-place runs in the `kamaji-bin` daemon,
+    /// on the deploy-dispatch path ahead of any backend, so the only impl that
+    /// can ever carry a measurement is [`sibling`], which reads it off the
+    /// wire. An inlined backend never restored anything to report.
+    ///
+    /// It is a `String` because kamaji does not interpret the helper's output.
+    /// The consumer that does — `yah-cloud`'s `RecoveryRecord::from_helper_json`
+    /// — parses the helper's own field names, so re-typing it here would create
+    /// a second vocabulary free to drift from both ends.
+    pub hydrate: Option<String>,
     /// Port(s) the supervisor **actually bound** for this workload, keyed by
     /// **port name** (R844-F2 introduced the field; R844-F15 named it).
     ///
@@ -409,23 +507,25 @@ pub fn name_anonymous_ports(ports: &[u16]) -> BTreeMap<String, u16> {
 /// `validate::shape`, but the binary wire is not validated) resolves the same
 /// way on every node instead of by iteration order.
 /// Refuse a spec carrying [`WorkloadSpec::files`] on a backend that does not
-/// materialize them (R870-F23).
+/// materialize them (R870-F23, narrowed by R870-F27).
 ///
-/// Only [`Backend::Native`] writes them today. Every other backend must call
-/// this rather than accept the spec and ignore the field: the workload the
-/// field exists for reads its *entire* routing table out of such a file, so a
-/// backend that silently skips it starts a process against whatever happened
-/// to be at that path — nothing, or the previous deploy's table. That comes up
-/// healthy and routes wrongly, which is strictly worse than not starting.
+/// [`Backend::materializes_files`] is the single fact this reads; see it for
+/// which backends write and which refuse. A backend
+/// that cannot write must call this rather than accept the spec and ignore
+/// the field: the workload the field exists for reads its *entire* routing
+/// table out of such a file, so a backend that silently skips it starts a
+/// process against whatever happened to be at that path — nothing, or the
+/// previous deploy's table. That comes up healthy and routes wrongly, which
+/// is strictly worse than not starting.
 ///
 /// The correct fix for any backend that acquires a real customer here is to
-/// implement the write (a container backend would inject them as a mount or a
-/// pre-exec write), not to relax this.
+/// implement the write, not to relax this — which is exactly what R870-F27
+/// did for containerd, and what the remaining two would copy.
 pub fn reject_unmaterializable_files(
     spec: &workload_spec::WorkloadSpec,
     backend: Backend,
 ) -> anyhow::Result<()> {
-    if spec.files.is_empty() {
+    if spec.files.is_empty() || backend.materializes_files() {
         return Ok(());
     }
     let paths: Vec<String> = spec
@@ -435,10 +535,10 @@ pub fn reject_unmaterializable_files(
         .collect();
     anyhow::bail!(
         "workload {} declares {} spec file(s) ({}) but the {backend:?} backend does not \
-         materialize them. Only the native backend writes WorkloadSpec::files today; a workload \
-         that reads its config from one of these paths would start against a stale or absent \
-         file and route wrongly while reporting healthy. Deploy it on the native backend, or \
-         implement materialization for {backend:?}",
+         materialize them. The native and containerd backends write WorkloadSpec::files; a \
+         workload that reads its config from one of these paths would start against a stale or \
+         absent file and route wrongly while reporting healthy. Deploy it on one of those two, \
+         or implement materialization for {backend:?}",
         spec.name,
         paths.len(),
         paths.join(", "),
@@ -464,6 +564,41 @@ pub fn declared_port_names(mesh: &workload_spec::MeshExpose) -> BTreeMap<String,
         }
     }
     out
+}
+
+/// The deployment environment a container backend owes every workload it
+/// starts: `YAH_MESH_IP`, the address the workload was placed at, and the
+/// `PORT` / `PORT_<NAME>` contract (R844-T13) for its declared mesh ports.
+///
+/// One function because two backends used to spell it (R908-T1). This crate's
+/// containerd backend injected both; kamaji-bin's — the one fleet nodes run —
+/// injected neither, so a host-networked workload there had no way to learn
+/// which address to bind, and `.yah/infra/workloads/yah-cloud-admin.toml` typed
+/// its node's mesh IP into its own spec instead.
+///
+/// A container gets its own network namespace (or the host's), so the declared
+/// `expose.mesh.ports` *is* the bound port — there is nothing to allocate.
+/// Naming them through [`declared_port_names`] anyway is what makes a workload
+/// read the same variable on a container as on the native backend, where the
+/// number really was allocated.
+///
+/// Port variables yield to a name the spec's own env already declares: this
+/// layer is applied *after* the spec's literal env, so injecting unconditionally
+/// would override an explicit operator value instead of yielding to it.
+/// `YAH_MESH_IP` does not yield — it reports where the supervisor put the
+/// workload, which is not the spec's to restate.
+pub fn deploy_contract_env(
+    spec: &workload_spec::WorkloadSpec,
+    mesh_ip: std::net::Ipv4Addr,
+) -> Vec<String> {
+    let mut env = vec![format!("YAH_MESH_IP={mesh_ip}")];
+    let spec_names: Vec<&str> = spec.env.iter().map(|e| e.name.as_str()).collect();
+    for (k, v) in ports::port_env(&declared_port_names(&spec.expose.mesh)) {
+        if !spec_names.contains(&k.as_str()) {
+            env.push(format!("{k}={v}"));
+        }
+    }
+    env
 }
 
 /// The [`ports::PortSpec`] set a workload's declared mesh exposure asks for
@@ -593,6 +728,22 @@ pub enum WorkloadStatus {
     },
     Failed {
         reason: String,
+        /// Whether the kernel's OOM killer was involved in this failure —
+        /// R885-F3's classification, carried out to the wire by R885-T6.
+        ///
+        /// A plain `bool` rather than the richer `cgroup::ExitClass` because
+        /// this is the one bit that has a consumer outside the node: it becomes
+        /// [`kamaji_proto::WorkloadState::OomKilled`] at the UDS boundary. The
+        /// full four-way classification stays in `reason`, which is where an
+        /// operator reads it.
+        ///
+        /// `false` is the honest default for every backend that cannot tell —
+        /// only the native backend reads `memory.events`. It means "not known
+        /// to be an OOM", never "known not to be one", which is the same
+        /// direction `ExitClass` takes an unreadable counter: inventing an OOM
+        /// on a degraded host is the expensive error, because it sends an
+        /// operator to raise a ceiling that was never the problem.
+        oom_killed: bool,
     },
 }
 
@@ -840,7 +991,17 @@ mod tests {
         }
         .is_terminal());
         assert!(WorkloadStatus::Failed {
-            reason: "boom".into()
+            reason: "boom".into(),
+            oom_killed: false,
+        }
+        .is_terminal());
+        // R885-T6: an OOM kill is a *refinement* of Failed, not a peer of it.
+        // If this ever stops being terminal, a workload the kernel killed for
+        // exceeding its ceiling would look to the supervisor like something
+        // still worth waiting on.
+        assert!(WorkloadStatus::Failed {
+            reason: "OOM-killed".into(),
+            oom_killed: true,
         }
         .is_terminal());
     }

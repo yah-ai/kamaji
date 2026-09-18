@@ -34,13 +34,13 @@ docker-integration = []
 # supervision path for mesofact-dev). Host binaries only — no image pull.
 # Pulls in socket-custody: the native backend is the first consumer (R599-F6
 # JIT + R600 cert-rotation both drive the kamaji-held listen socket).
-native-integration = ["dep:libc", "socket-custody"]
+native-integration = ["socket-custody"]
 
 # Firecracker microVM backend (R605-F8 / W325 §5). Shells out to the VMM,
-# e2fsprogs and iproute2, so it adds no Rust deps beyond libc for the teardown
-# signal — the cost of this backend is the node's guest kernel + rootfs, not
-# the dependency graph.
-microvm-integration = ["dep:libc"]
+# e2fsprogs and iproute2, so it adds no Rust deps at all (its teardown signal
+# goes through libc, which is now an unconditional dep — see below) — the cost of
+# this backend is the node's guest kernel + rootfs, not the dependency graph.
+microvm-integration = []
 
 # Socket-custodian primitive (R599-F9): kamaji binds+holds a workload's listen
 # socket (optionally in a mesh netns) and hands the fd to the workload process
@@ -72,29 +72,48 @@ tracing = "0.1"
 # `workload_spec::admission`. Not optional — deciding what is allowed to run
 # is kamaji's job description, and a build that could silently omit the
 # admission gate is a build an operator cannot tell apart from one that has it.
-workload-spec = { package = "yah-workload-spec", version = "0.8.37", features = ["admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.40", features = ["admission-verify"] }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.37", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.40", default-features = false }
 
-# SIGTERM for the native backend's graceful stop (optional — native-integration).
-libc = { version = "0.2", optional = true }
+# SIGTERM for the native backend's graceful stop, and the `SIGKILL` sweep that
+# is `cgroup.rs`'s pre-5.14 fallback for `cgroup.kill` (R885-B4).
+#
+# NOT optional, as of R885-B4. `cgroup.rs` is unconditional — it compiles with no
+# features at all, because the crate graph forced the driver to live here rather
+# than in `kamaji-bin` (R885-B1) — so a teardown that can signal a pid cannot be
+# gated behind a backend feature without giving a featureless build a silently
+# weaker one. The cost is nil: tokio already depends on libc unconditionally on
+# every unix target, so this adds no crate to the graph and no build time.
+libc = "0.2"
 
+# Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
+kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.40" }
+
+# R918-T1 — the yah CLI reaches this crate for `ports::port_env` alone, so the
+# crate has to resolve on a Windows target even though every supervisor backend
+# in it is Unix-only. `nix` does not build off unix at all, so it lives here
+# rather than in `[dependencies]`: enabling `socket-custody` on a non-unix
+# target then activates a dependency that simply is not there, and the module it
+# gates is `#[cfg(all(unix, ...))]` to match. The feature stays selectable
+# workspace-wide (crates/yah/workspace-hack pins it) without forcing every
+# consumer of `ports` onto a Unix host.
+[target.'cfg(unix)'.dependencies]
 # Socket-custodian fd-handoff + netns entry (optional — socket-custody feature).
 # Pinned to 0.29 (matches kamaji-bin) so the SCM_RIGHTS sendmsg mirrors the
 # exact shape pingora 0.8.1's transfer_fd uses — see socket_custody.rs.
 nix = { version = "0.29", optional = true, features = ["socket", "sched", "uio"] }
 
-# Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
-kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.37" }
-
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "signal"] }
+
+[target.'cfg(unix)'.dev-dependencies]
 # Receiver side of the zero-downtime E2E test mirrors pingora's Fds::get_from_sock.
 nix = { version = "0.29", features = ["socket", "uio"] }
 

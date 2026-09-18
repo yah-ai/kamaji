@@ -293,13 +293,16 @@ mod tests {
             source: workload_spec::VolumeSource::Named { name: "acct-data".into() },
             target: "/data".into(),
             read_only: false,
+            from_secret_mount: false,
         }];
-        spec.annotations.insert("yah.durability.tier".into(), "stream".into());
-        spec.annotations.insert("yah.durability.engine".into(), "turso".into());
-        spec.annotations
-            .insert("yah.durability.store".into(), "s3://backups/acct".into());
-        spec.annotations
-            .insert("yah.durability.subjects".into(), "accounts.db,sessions.db".into());
+        spec.durability = Some(workload_spec::Durability {
+            tier: workload_spec::DurabilityTier::Stream,
+            engine: Some(workload_spec::DurabilityEngine::Turso),
+            store: Some("s3://backups/acct".into()),
+            subjects: vec!["accounts.db".into(), "sessions.db".into()],
+            rpo_seconds: None,
+            state_mb: None,
+        });
         spec
     }
 

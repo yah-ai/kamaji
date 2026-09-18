@@ -361,6 +361,7 @@ impl Kamaji for FakeRuntime {
             container_id,
             mesh_ip,
             task_pid: 1, // fake PID
+            hydrate: None,
             ports: crate::declared_port_names(&spec.expose.mesh),
         })
     }
@@ -449,6 +450,7 @@ impl Kamaji for FakeRuntime {
             container_id,
             mesh_ip,
             task_pid: 1,
+            hydrate: None,
             ports: crate::declared_port_names(&spec.expose.mesh),
         })
     }
@@ -505,12 +507,11 @@ mod tests {
     use tokio_stream::StreamExt as _;
     use workload_spec::{
         ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits,
-        RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+        RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
     };
 
     fn test_spec(name: &str) -> WorkloadSpec {
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
@@ -532,7 +533,10 @@ mod tests {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -553,6 +557,7 @@ mod tests {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }

@@ -168,6 +168,25 @@ pub enum WorkloadState {
     Exited,
     /// Process exited with failure (non-zero status or signal).
     Failed,
+    /// Process died because the kernel's OOM killer was involved — it exceeded
+    /// the `memory.max` R885-B1 put on the live path, rather than crashing
+    /// (R885-F3 / R885-T6).
+    ///
+    /// A **refinement of [`Self::Failed`]**, not a peer of it: every consumer
+    /// that treats `Failed` as "this workload is down and it is not coming back
+    /// on its own" must treat this identically. The only thing it adds is *why*,
+    /// and the why is the whole point — an OOM sends an operator to raise a
+    /// ceiling, a crash sends them to read a stack trace, and until this variant
+    /// existed both arrived here as the same byte. R590-B10 is the standing
+    /// scar: a forge workload SIGKILLed against a 256 MB ceiling, diagnosed by
+    /// disk forensics because the wire could not carry this distinction.
+    ///
+    /// Appended **last** on purpose: postcard encodes the discriminant as a
+    /// varint, so adding at the end leaves `Pending`..`Failed` on 0..5 and the
+    /// only frame an unbumped peer cannot read is one that actually carries
+    /// this state. That is exactly what the [`crate::ProtocolVersion`] bump to
+    /// `V11` exists to refuse.
+    OomKilled,
 }
 
 /// Compact snapshot of one workload — returned in
@@ -221,30 +240,21 @@ pub struct WorkloadEntry {
     /// names the supervisor's allocator assigned, so a peer resolving a service
     /// asks for `wss` instead.
     ///
-    /// **A new field here is a version bump, not a compatible addition, and it
-    /// must always be encoded.** This frame is *postcard* — positional, with no
-    /// field names on the wire — so `#[serde(default)]` cannot fill a missing
-    /// field and `skip_serializing_if` is actively wrong: omitting the bytes
-    /// produces a frame that even a *same-version* decoder cannot parse, since
-    /// it reads the next field's bytes out of this one's position. That is not
-    /// hypothetical — adding this field with `skip_serializing_if` is what made
+    /// Adding this field cost **V6**, because until V13 this struct was
+    /// *postcard* — positional, with no field names on the wire — so
+    /// `#[serde(default)]` could not fill a missing field and
+    /// `skip_serializing_if` was actively wrong: adding this field with it made
     /// `sibling_wire_e2e::accepted_deploy_appears_in_list_against_scripted_backend`
     /// and `docker_backend_e2e::deploy_list_stop_through_kamaji_against_live_docker`
-    /// fail with `PeerClosed` on the `List` round-trip, mid-R844-F15. The
-    /// mechanism is the same one [`crate::ProtocolVersion`] documents for V4 and
-    /// V5; the bump for this field is **V6**.
+    /// fail with `PeerClosed` on the `List` round-trip, mid-R844-F15.
     ///
-    /// So there is no "peer that predates this field" case to handle: the
-    /// handshake refuses a mismatched version outright, which is exactly why
-    /// the bump exists. Both this and [`Self::ports`] are always populated by a
-    /// version-matched peer, and they describe the same ports — `ports` is the
+    /// **Since V13 that reasoning no longer applies to this struct.**
+    /// `WorkloadList.entries` rides the name-keyed envelope ([`crate::tolerant`]),
+    /// so a field added here with a default equal to the pre-field behaviour
+    /// crosses a skew without a bump — and `#[serde(default)]` now does exactly
+    /// what it says. It still holds for every struct the envelope does NOT wrap.
+    /// Both this and [`Self::ports`] describe the same ports — `ports` is the
     /// anonymous view R844-F2 shipped, kept for callers that only want numbers.
-    ///
-    /// (The *other* wire this data crosses — yubaba's `GET /service-records` —
-    /// is JSON over HTTP between independently-versioned binaries across a
-    /// mixed fleet, and there the additive-field argument does hold. See
-    /// `yubaba::service_records::ServiceRecordWire::named_ports`. Do not carry
-    /// reasoning from that wire to this one.)
     #[serde(default)]
     pub named_ports: std::collections::BTreeMap<String, u16>,
     /// Digest of the [`Workload`] this workload was deployed with (R852-B4),
@@ -292,6 +302,13 @@ pub struct WorkloadEntry {
 ///   native workload an unassigned address makes it fail to bind
 ///   ("Address not available"), so yubaba sends its own node address here for
 ///   native deploys rather than an allocated per-workload one.
+///
+/// Rides the name-keyed envelope on `Deploy` (V13), so the `#[serde(default)]`s
+/// below are wire policy, not convenience: each one is the "no WireGuard plane"
+/// value, i.e. what a peer that never sent the field already meant, which is
+/// what lets the field be deleted later without a bump. `mesh_ip` has none on
+/// purpose — an assignment without an address is not an assignment.
+/// `tests/tolerant_field_policy.rs` pins that split.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshAssignment {
     /// Mesh-plane IP for this workload. See the type docs for what it means
@@ -300,32 +317,42 @@ pub struct MeshAssignment {
     /// WireGuard private key for the workload's mesh interface. Empty when the
     /// deployment has no WireGuard plane (`has_wireguard()` is false on the
     /// runtime type).
+    #[serde(default)]
     pub wg_private_key: String,
     /// WireGuard listen port. `0` alongside an empty key = no WireGuard.
+    #[serde(default)]
     pub wg_listen_port: u16,
     /// Mesh peers the workload's interface is configured with.
+    #[serde(default)]
     pub peers: Vec<WireguardPeer>,
-    /// Network namespace the workload's listener must be created in, when the
-    /// backend is a socket custodian. `None` = the host namespace.
-    pub netns_name: Option<String>,
 }
 
 /// One WireGuard peer entry in a [`MeshAssignment`]. Wire mirror of
-/// `kamaji::WireguardPeer`.
+/// `kamaji::WireguardPeer`. A peer without a public key is meaningless, so
+/// only the two fields whose absence already means something default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireguardPeer {
     pub public_key: String,
+    #[serde(default)]
     pub endpoint: Option<SocketAddr>,
+    #[serde(default)]
     pub allowed_ips: Vec<IpAddr>,
 }
 
 /// Discriminant for a generic [`KamajiToYubaba::Ack`] — which request the
 /// ack belongs to. Lets Yubaba's dispatch table key on request-kind without
 /// re-parsing the original payload.
+///
+/// There is deliberately **no `Deploy`** here (R850-T4, `ProtocolVersion::V10`).
+/// A deploy answers with [`KamajiToYubaba::DeployAck`] instead, because a deploy
+/// reply now carries something a bare discriminant cannot: the hydrate-on-place
+/// measurement. Keeping a second, measurement-less deploy ack beside it would
+/// mean two shapes for one reply, where the one you got depended on which
+/// backend arm produced it — so the variant is gone rather than retained, and
+/// the compiler names every site that has to move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AckKind {
-    Deploy,
     Stop,
     Probe,
     /// Ack for [`YubabaToKamaji::GracefulUpgrade`] (R600-F9). Appended last to
@@ -368,12 +395,17 @@ pub enum YubabaToKamaji {
     /// from another node and therefore what lets an ingress proxy live
     /// somewhere other than on top of its own backend.
     ///
-    /// Adding this field is a **backward-incompatible** wire change (postcard
-    /// is positional), which is why [`ProtocolVersion::V2`] exists.
+    /// Adding this field was a **backward-incompatible** wire change (postcard
+    /// is positional), which is why [`ProtocolVersion::V2`] exists. Both `spec`
+    /// and `mesh` now ride the name-keyed envelope ([`crate::tolerant`], V13),
+    /// so a field added inside either no longer shifts the frame — but adding a
+    /// *sibling* field to this variant still does.
     Deploy {
         request_id: RequestId,
         id: WorkloadId,
+        #[serde(with = "crate::tolerant")]
         spec: Workload,
+        #[serde(with = "crate::tolerant")]
         mesh: Option<MeshAssignment>,
     },
     /// Stop a workload — SIGTERM-with-grace floor; backend hides specifics.
@@ -405,6 +437,7 @@ pub enum YubabaToKamaji {
     GracefulUpgrade {
         request_id: RequestId,
         id: WorkloadId,
+        #[serde(with = "crate::tolerant")]
         spec: Workload,
     },
     /// Poll the progress of an **asynchronous** deploy (R330-F33).
@@ -435,6 +468,29 @@ pub enum YubabaToKamaji {
     /// the caller is expected to read as "capability unknown" and treat
     /// permissively; see `yubaba`'s `NativeExecCapability`.
     Capabilities { request_id: RequestId },
+    /// Ask what [`Workload`] `id` is currently supervised with (R870-B24).
+    ///
+    /// The read half of [`Self::Deploy`]. [`Self::List`] answers *which*
+    /// workloads are running and in what state, and
+    /// [`WorkloadEntry::spec_digest`] answers *whether* one still matches a
+    /// spec the caller already holds — but neither can answer anything about a
+    /// spec the caller does **not** hold, which is exactly the position of
+    /// something about to replace a workload somebody else deployed. `Deploy`
+    /// is a full replace (the backends tear the predecessor down first), so
+    /// every field the outgoing spec omits is a field the running workload
+    /// loses. Reading the spec back first is what lets a caller refuse instead
+    /// of discovering that afterwards.
+    ///
+    /// Appended last to keep the postcard variant indices of the pre-existing
+    /// variants wire-stable — the same treatment [`Self::GracefulUpgrade`],
+    /// [`Self::DeployStatus`] and [`Self::Capabilities`] had, so this needs no
+    /// [`ProtocolVersion`] bump. An older Kamaji that does not know the variant
+    /// fails the frame, and a caller must read that as **unknown**, never as
+    /// "this workload carries nothing worth preserving".
+    Describe {
+        request_id: RequestId,
+        id: WorkloadId,
+    },
 }
 
 /// Kamaji → Yubaba message variants.
@@ -508,6 +564,10 @@ pub enum KamajiToYubaba {
     /// Response to [`YubabaToKamaji::List`].
     WorkloadList {
         request_id: RequestId,
+        /// Wrapped whole rather than per entry: one blob per reply costs one
+        /// length prefix instead of `N`, and the tolerance is identical — the
+        /// field names are inside either way.
+        #[serde(with = "crate::tolerant")]
         entries: Vec<WorkloadEntry>,
     },
     /// Response to [`YubabaToKamaji::DeployStatus`] (R330-F33).
@@ -533,18 +593,74 @@ pub enum KamajiToYubaba {
     /// variants wire-stable.
     CapabilitiesReport {
         request_id: RequestId,
+        #[serde(with = "crate::tolerant")]
         capabilities: NodeCapabilities,
+    },
+    /// Response to [`YubabaToKamaji::Describe`] (R870-B24).
+    ///
+    /// `spec` is `None` when Kamaji has **no record** for `id` — it was never
+    /// admitted by this Kamaji process, or the process restarted and the
+    /// in-memory record went with it (same lifetime as
+    /// [`WorkloadEntry::spec_digest`], and for the same reason). That is
+    /// deliberately a `None` rather than an [`Self::Error`]: a caller guarding
+    /// a destructive redeploy has to tell "Kamaji answered, and it holds
+    /// nothing" apart from "the call failed", and an error frame collapses
+    /// both into one shape. Neither answer licenses replacing a workload
+    /// blind, but only one of them is worth retrying.
+    ///
+    /// Appended last to keep the postcard variant indices of the pre-existing
+    /// variants wire-stable.
+    WorkloadDescription {
+        request_id: RequestId,
+        id: WorkloadId,
+        #[serde(with = "crate::tolerant")]
+        spec: Option<Workload>,
+    },
+    /// Response to [`YubabaToKamaji::Deploy`] (R850-T4) — the only one. It
+    /// replaces the former `Ack { kind: AckKind::Deploy }` and means exactly
+    /// what that meant: admitted, for a bundle; started, for a container.
+    ///
+    /// `hydrate` is the JSON line `turso-backup-hydrate` printed when
+    /// hydrate-on-place restored this workload's volume before the backend
+    /// started it (`kamaji-bin`'s `hydrate::run`), verbatim and unparsed.
+    /// `None` — the overwhelmingly common case — means no restore happened:
+    /// the spec declares no durability tier, or the volume was already
+    /// populated. It is a `String` rather than a typed measurement on purpose:
+    /// kamaji does not interpret the helper's output, and the consumer that
+    /// does (`yah-cloud`'s `RecoveryRecord::from_helper_json`) is keyed off the
+    /// helper's own field names, so a re-typed copy here would be a second
+    /// vocabulary free to drift from both.
+    ///
+    /// The line carries **no attribution** — no workload name, no node — and
+    /// that is not an omission to fix here. The helper does not know either,
+    /// and kamaji only knows the [`WorkloadId`] it was handed. The node's name
+    /// is known on yubaba's side of the deploy, which is where the journal
+    /// record is assembled.
+    ///
+    /// Appended last to keep the postcard variant indices of the pre-existing
+    /// variants wire-stable — but note that removing `AckKind::Deploy`
+    /// renumbered [`AckKind`], so this one DOES ride a
+    /// [`ProtocolVersion`](crate::version::ProtocolVersion) bump (V10) unlike
+    /// the appended variants before it.
+    DeployAck {
+        request_id: RequestId,
+        id: WorkloadId,
+        hydrate: Option<String>,
     },
 }
 
 /// What one Kamaji can actually dispatch to (R858-T4).
 ///
 /// Deliberately a *struct* rather than a set of booleans on the message, so a
-/// later backend is a field here instead of a fourth reply variant — but note
-/// that adding a field IS a wire break (postcard is positional; see
-/// [`ProtocolVersion`]'s V2/V4/V5/V6 notes), so it costs a version bump. That
-/// is the right price: a scheduler silently reading a capability it did not
-/// actually receive is how the 37-hour outage happened.
+/// later backend is a field here instead of a fourth reply variant. Since V13
+/// it rides the name-keyed envelope ([`crate::tolerant`]), so an added field no
+/// longer shifts the frame — **but a capability is exactly the field whose
+/// absence must not be silently defaulted**: a scheduler reading a capability
+/// it did not actually receive is how the 37-hour outage happened. So
+/// `native_exec` and `microvm` carry no `#[serde(default)]`, a peer that lacks
+/// either fails the decode loudly, and a new capability either gets a default
+/// that genuinely means "cannot" or costs a [`ProtocolVersion`] bump.
+/// `tests/tolerant_field_policy.rs` pins which fields are which.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilities {
     /// Whether this Kamaji can fork+exec a native (non-container) workload —
@@ -561,6 +677,7 @@ pub struct NodeCapabilities {
     /// always "and is the binary I need sitting in it?", and answering that
     /// without a second round trip is the difference between one probe and a
     /// protocol.
+    #[serde(default)]
     pub native_exec_dir: Option<String>,
     /// Whether this Kamaji has the microVM backend attached, and — if not —
     /// why (R605-T27, `ProtocolVersion::V9`).
@@ -643,7 +760,9 @@ impl KamajiToYubaba {
             | Self::DrainCompleted { request_id, .. }
             | Self::WorkloadList { request_id, .. }
             | Self::DeployStatusResult { request_id, .. }
-            | Self::CapabilitiesReport { request_id, .. } => Some(*request_id),
+            | Self::CapabilitiesReport { request_id, .. }
+            | Self::WorkloadDescription { request_id, .. }
+            | Self::DeployAck { request_id, .. } => Some(*request_id),
             Self::Error { request_id, .. } => *request_id,
             Self::Welcome { .. } | Self::WorkloadStarted { .. } | Self::WorkloadExited { .. } => {
                 None
@@ -673,7 +792,16 @@ mod reply_correlation_tests {
         let replies = [
             KamajiToYubaba::Ack {
                 request_id: rid(),
-                kind: AckKind::Deploy,
+                kind: AckKind::Stop,
+            },
+            // R850-T4: a deploy reply that carries a hydrate measurement is
+            // still a reply. Classifying it as a push would park the deployer
+            // on its oneshot — the R746-B11 failure — on every deploy, not
+            // just a hydrating one, since this is now the ONLY deploy reply.
+            KamajiToYubaba::DeployAck {
+                request_id: rid(),
+                id: id(),
+                hydrate: Some(r#"{"outcome":"hydrated","restored":[]}"#.into()),
             },
             KamajiToYubaba::Error {
                 request_id: Some(rid()),
@@ -718,6 +846,16 @@ mod reply_correlation_tests {
                         detail: None,
                     },
                 },
+            },
+            // R870-B24: a `None` spec is still an ANSWER to a request, so it
+            // correlates like any other reply. Classifying it as a push would
+            // park the guard's caller on its oneshot forever — the R746-B11
+            // failure, on the one call whose whole job is to run before a
+            // destructive deploy.
+            KamajiToYubaba::WorkloadDescription {
+                request_id: rid(),
+                id: id(),
+                spec: None,
             },
         ];
         for reply in replies {

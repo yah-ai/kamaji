@@ -46,8 +46,15 @@
 //!
 //! ## Netns custody
 //!
-//! On a fleet node the workload listens inside a WireGuard netns
-//! (`MeshAssignment.netns_name`). A socket's netns is fixed at `socket()` time,
+//! On a fleet node a workload may listen inside the network namespace
+//! [`crate::container_net`] built for it — the W343 bridge + veth + routed
+//! `/24`. That namespace has exactly one owner: the deploy path that created it
+//! names it and hands the path down to [`SocketCustodian::bind_and_hold`]
+//! (R895-F1). Custody never derives a namespace name itself, because a derived
+//! name is indistinguishable from the name of a namespace that was never
+//! created, and binding into one of those fails at runtime. WireGuard is
+//! node-to-node under W343 and never enters a per-workload namespace, so there
+//! is no mesh netns here to speak of. A socket's netns is fixed at `socket()` time,
 //! so once kamaji creates the listener **inside** that netns the fd works in
 //! the workload regardless of the workload's own netns — no co-resident
 //! "pause" container is required (contrast R600-F7 option B). But the netns
@@ -198,6 +205,11 @@ struct HeldSockets {
     /// host-network / inlined workloads.
     #[cfg(target_os = "linux")]
     _netns: Option<OwnedFd>,
+    /// Path of that namespace, so a later generation of the same workload can
+    /// be started **inside the namespace its held socket lives in** without
+    /// re-deriving the name (R895-F1). The custodian is what keeps the
+    /// namespace alive, so it is the honest place to ask which one it is.
+    netns: Option<PathBuf>,
 }
 
 /// Owns the listening sockets for the workloads kamaji is custodian for, keyed
@@ -263,6 +275,7 @@ impl SocketCustodian {
                 binds: Vec::new(),
                 #[cfg(target_os = "linux")]
                 _netns: None,
+                netns: None,
             });
         if entry.binds.iter().any(|(b, _)| b == bind_addr) {
             return Err(io::Error::other(format!(
@@ -274,12 +287,26 @@ impl SocketCustodian {
         if entry._netns.is_none() {
             entry._netns = netns_fd;
         }
+        if entry.netns.is_none() {
+            entry.netns = netns_path.map(Path::to_path_buf);
+        }
         Ok(())
     }
 
     /// True if the custodian is currently holding any socket for `ident`.
     pub fn holds(&self, ident: &str) -> bool {
         self.held.lock().unwrap().contains_key(ident)
+    }
+
+    /// The namespace `ident`'s held socket was bound in, or `None` when it was
+    /// bound in the host namespace (or nothing is held for `ident`).
+    ///
+    /// This is how a *later* generation of a custody workload learns which
+    /// namespace to join without deriving a second name for it (R895-F1): the
+    /// namespace was created and named on the deploy path, handed here at
+    /// [`bind_and_hold`](Self::bind_and_hold), and the custodian holds it open.
+    pub fn held_netns(&self, ident: &str) -> Option<PathBuf> {
+        self.held.lock().unwrap().get(ident)?.netns.clone()
     }
 
     /// Hand every held listener for `ident` to a workload process waiting on
@@ -337,10 +364,10 @@ impl SocketCustodian {
     }
 }
 
-/// Path to a named network namespace under the `ip netns` convention.
-pub fn netns_path(name: &str) -> PathBuf {
-    Path::new("/var/run/netns").join(name)
-}
+// R895-F1: the `/var/run/netns/<name>` path helper that used to live here is
+// gone. `container_net::netns_path` is the one owner of that convention, beside
+// the `ip netns add` that creates the namespace — two spellings of one path was
+// how custody came to bind in a namespace nothing had created.
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -440,6 +467,22 @@ mod tests {
         cust.release("ingress");
         assert!(!cust.holds("ingress"));
         // Idempotent.
+        cust.release("ingress");
+    }
+
+    /// R895-F1 — the host-namespace arm of [`SocketCustodian::held_netns`]. A
+    /// workload bound in the host netns must report `None`, not a plausible
+    /// `/var/run/netns/<ident>` that nothing created: a later generation reads
+    /// this to decide which namespace to join, and a fabricated answer there is
+    /// a `setns` into a path that does not exist. The `Some` arm needs a real
+    /// namespace and lives in `tests/socket_custody_netns_linux.rs`.
+    #[test]
+    fn a_host_bound_listener_reports_no_netns() {
+        let cust = SocketCustodian::new();
+        cust.bind_and_hold("ingress", "127.0.0.1:0", None).unwrap();
+        assert!(cust.holds("ingress"));
+        assert_eq!(cust.held_netns("ingress"), None);
+        assert_eq!(cust.held_netns("never-deployed"), None);
         cust.release("ingress");
     }
 

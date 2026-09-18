@@ -3,9 +3,20 @@
 //!
 //! Scope:
 //!
-//! - **fork+exec + supervise** via `tokio::process` (the R406 cgroup subtree +
-//!   pidfd hardening layers in when this backend graduates to fleet hosts;
-//!   desktop/CI supervision needs lifecycle, not isolation).
+//! - **fork+exec + supervise** via `tokio::process`.
+//! - **cgroup v2 confinement** (R885-B1): each workload gets its own leaf inside
+//!   the subtree systemd delegates to kamaji, carrying the spec's `memory.max`
+//!   and its CPU **request** as a `cpu.weight` — plus a `cpu.max` quota only if
+//!   the spec declares one (R885-B5; a request is not a ceiling). The child
+//!   joins the leaf in the post-fork/pre-exec window, so the workload binary
+//!   never executes outside its boundary. See [`crate::cgroup`]
+//!   for where the leaf goes and why. On a host with no delegated subtree
+//!   (macOS, a dev box, a container) this degrades to the old unbounded fork —
+//!   loudly, via a `warn!` naming the reason, not silently.
+//!   **Capability and filesystem policy are a separate axis and are NOT closed
+//!   here** — W344 §"Audit residue" says so in as many words ("piece 1 below
+//!   only closes the second"). A native workload still inherits kamaji's ambient
+//!   capability set; see R885-B9.
 //! - **`spec.entrypoint` + `spec.command`** concatenate to the argv, exactly
 //!   container semantics (ENTRYPOINT vector + CMD args; CMD alone is the
 //!   program). `spec.image` is identity metadata only — nothing is pulled.
@@ -101,8 +112,9 @@
 //! @arch:see(.yah/docs/working/W344-native-workloads-run-unbounded.md)
 //!
 //! @yah:ticket(R885-B1, "Wire CgroupV2 + spawn_native onto NativeRuntime, resolving the delegated cgroup root at runtime")
-//! @yah:at(2026-09-10T07:29:18Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-09-11T07:07:44Z)
 //! @yah:phase(P1)
 //! @yah:parent(R885)
 //! @yah:next("Tier: Warrior. This is the only ticket in R885 with a live blast radius: it changes what already-running fleet workloads do. Everything else under R885 is additive and should land behind it.")
@@ -114,6 +126,86 @@
 //! @yah:verify("On a Linux fleet node with a deployed native workload: systemctl show kamaji.service -p ControlGroup; cat /proc/<workload-pid>/cgroup — the workload must sit in its OWN leaf INSIDE the delegated subtree, not in 0::/yubaba.slice/kamaji.service/native (which is what us-west-001 shows today, recorded at oss/yubaba/crates/cloud/src/config.rs:292).")
 //! @yah:verify("cat /sys/fs/cgroup/<that-leaf>/memory.max — a real number, not the inherited parent value.")
 //! @yah:gotcha("R406 children T4 and T5 both reached review having never been reachable from a running binary, and sat there ~2 months (cgroup.rs last changed 2026-07-17, kamaji-bin/src/native.rs 2026-07-12, neither dirty). The tests passed the whole time. That is why this ticket must NOT be accepted on a test count.")
+//! @yah:handoff("LANDED AND PROVEN ON HARDWARE. Native workloads are confined to per-workload cgroup v2 leaves inside the subtree systemd actually delegates. Measured on us-east-001 2026-09-11 by @Ashguard:coffee (session:91597c1e), who shipped this tree to that node mid-session: ControlGroup=/yubaba.slice/kamaji.service; four workload pids each in 0::/yubaba.slice/kamaji.service/<ident> (yah-marketing, noisetable, yah-marketing-feed, yah-marketing-revalidate); each leaf memory.max=134217728 and cpu.max=25600 100000 — real values, not the inherited `max`. Every acceptance reading in the ticket is satisfied on a live node, not merely by a test.")
+//! @yah:handoff("THE TRACED CALL CHAIN, which the ticket required be stated explicitly. (1) yubaba sends YubabaToKamaji::Deploy{Workload::Container} over the UDS. (2) kamaji-bin/src/server.rs:1783 deploy_container -> :2051 deploy_container_inner -> :2143 deploy_container_backend. (3) :2150 `if spec.wants_native_exec()` -> :2298 deploy_native_exec. (4) :2316 `native.deploy_workload(spec, &mesh)` on ctx.native, an Arc<kamaji::native::NativeRuntime> built at kamaji-bin/src/main.rs:686 from --native-exec-dir (and at server.rs:612 for the inlined shape). (5) kamaji/src/native.rs `impl Kamaji for NativeRuntime::deploy_workload` -> `self.cgroup.create_workload(&ident.0, &spec.resources)` -> kamaji/src/cgroup.rs CgroupV2::create_workload: mkdir the leaf, write cpu.max + memory.max. (6) spawn_child(..., cgroup.as_ref()) -> cmd.as_std_mut().pre_exec(hook) -> cmd.spawn(). The hook opens <leaf>/cgroup.procs and writes getpid(). (7) teardown_workload reaps the child, then destroy_workload rmdirs the leaf.")
+//! @yah:handoff("THE DRIVER HAD TO MOVE CRATES, and this is the structural finding the ticket did not anticipate. kamaji-bin DEPENDS ON kamaji, so a driver homed in kamaji-bin was permanently unreachable from kamaji::native::NativeRuntime — the crate graph, not an oversight, is why R406-T4/T5 could never have been wired where they sat. oss/kamaji/crates/kamaji-bin/src/cgroup.rs is DELETED; the driver is now oss/kamaji/crates/kamaji/src/cgroup.rs, unconditional (pure std::fs, no new deps). kamaji-bin re-exports it (`pub use kamaji::cgroup;` + the named re-export in lib.rs) so kamaji_bin::CgroupV2 still resolves. `kamaji` became a NON-OPTIONAL dep of kamaji-bin: every `dep:kamaji` came out of the feature list, the `kamaji/<feature>` entries stayed. With default-features off that links nothing kamaji-bin did not already link.")
+//! @yah:handoff("THE PATH RESOLUTION, which is the half with the live blast radius. CgroupV2::delegated() reads /proc/self/cgroup, takes the `0::` (unified) line, and joins it onto /sys/fs/cgroup. If the basename is the DELEGATE_SUBGROUP (`native`) the delegated ROOT is the PARENT — so leaves are SIBLINGS of native/, not children. That is not a guess: DelegateSubgroup= exists to satisfy cgroup v2's no-internal-process rule (a cgroup holding member processes may not enable controllers for its children), so kamaji's threads live in native/ precisely to leave kamaji.service/ process-free and able to carry cpu+memory in cgroup.subtree_control. Confirmed live: the controllers enabled fine and the leaves got real numbers. DEFAULT_SLICE_ROOT is retained but demoted to a documented dev/non-systemd fallback and is no longer used to build the production path — its doc comment now says so explicitly.")
+//! @yah:handoff("SELF-ATTACH, NOT PARENT-ATTACH, and this is the one design call I made against the brief's letter — flagging it loudly. The brief said to call kamaji-bin's `spawn` (fork + parent-attaches + sync-pipe + execvpe). I did not, and kamaji-bin/src/native.rs is still dead. Reason: that function returns a raw NativeChild{pid,pidfd,stdout/stderr pipe fds}, while the LIVE path is built end-to-end on tokio::process::Child — supervise()'s Exit type, the spec-retaining restart loop, stop_child's SIGTERM/grace/SIGKILL, drain_reaper's SIGQUIT graceful-upgrade path, the <state_dir>/<ident>/{stdout,stderr}.log capture and stream_logs that replays it. Swapping the spawner rewrites all of that on the exact path the ticket exists to make SAFER, on a Mac, untestably. Instead the boundary operations moved into the live path's OWN post-fork/pre-exec window: cmd.as_std_mut().pre_exec(...), the identical kernel window pre_exec_in_child occupied (kamaji/src/jit.rs already uses the same idiom). The child writes its own pid to <leaf>/cgroup.procs before exec, so there is NO window in which workload code runs outside the boundary — and no sync pipe is needed, because nothing runs between fork and the write. The hook is allocation-free (CString built pre-fork, itoa into a stack buffer, open/write/close only).")
+//! @yah:handoff("WHAT I DELIBERATELY DID NOT DO, grounded in the design doc rather than in scope-trimming: landlock and the capability drop. W344 §'Audit residue worth keeping' says it outright — 'Capability policy and resource policy are separate axes and piece 1 below only closes the second', naming ambient capability inheritance as the live instance. Two independent live reasons confirm it: (a) kamaji.service's own comment documents that native workloads inherit AmbientCapabilities and that this is how a sub-1024 bind works, and R858-T5's cleanup note records that whether passway-demux (TLS_PORT=443) is native-exec is UNRESOLVED — a blanket drop could take a door down; (b) derive_landlock builds its allow-list from spec.volumes Bind mounts only, and a native forge workload writes to /var/lib/yah/qed which appears on no spec as a volume. FILED AS R885-B9 with both refusals, the measurement that must come first, and the mechanical note that the hook to extend is the pre_exec one this ticket added.")
+//! @yah:handoff("THE TWO UNIT-FILE CORRECTIONS (app/yah/cli/resources/kamaji.service). (1) The backwards delegation comment is rewritten: Delegate=yes delegates FROM systemd TO the service, and the replacement explains what DelegateSubgroup= is actually for (the no-internal-process rule) with an ASCII diagram of where leaves land, because that was the fact whose absence caused the original bug. (2) ReadWritePaths=/sys/fs/cgroup narrowed to /sys/fs/cgroup/yubaba.slice. NOT narrowed the last level to .../kamaji.service: under ProtectSystem=strict a ReadWritePaths entry that does not exist fails the whole mount namespace with 226/NAMESPACE — the trap this same file already records twice for yah/qed — and I could not establish from a Mac whether the service cgroup is materialised before the namespace is built. The slice is created when the first unit in it starts, so it is reliably present. Narrowing the last level is a safe follow-up for someone who can watch a node reboot.")
+//! @yah:handoff("DISCOVERED AND FIXED, beyond the three things the ticket named: (a) the crate-boundary blocker above — the reason this had never been wirable, not merely unwired; (b) kamaji/src/native.rs's module header still claimed the R406 layers 'land when this backend graduates to fleet hosts', a statement W344 had already disproved — rewritten to describe what the module now does and to name R885-B9 for what it still does not; (c) graceful_upgrade_workload needed a decision the brief did not raise — the replacement joins the OUTGOING generation's leaf rather than a fresh one, because during a pingora handoff both processes serve the same listener and are one workload with one ceiling. Per-generation leaves are R885-B4 and need that ticket's teardown ordering; a comment at the site says so.")
+//! @yah:handoff("THE `native` LEAF STILL EXISTS AND IS NOT THE BUG — write this down before anyone greps for it. @Ashguard:coffee's live reading found a `native` leaf alongside the four workload leaves, holding kamaji ITSELF (pid 650851, memory.max=max). That is correct: DelegateSubgroup=native put kamaji there at unit start. But `.../kamaji.service/native` is ALSO the exact string W344 records as the symptom of the pre-B1 bug, so the path alone proves nothing. THE DISCRIMINATOR IS WHOSE PID IS IN IT: a WORKLOAD pid there is the bug; the KAMAJI pid there with workloads in ident-named siblings is the fix working. Documented at both sites (cgroup.rs module doc, kamaji.service comment). I declined to rename the subgroup for clarity — the name lives in the unit file (shipped by provisioning) and in DELEGATE_SUBGROUP (shipped with the binary), and those upgrade separately; a node taking a new binary before a new unit would resolve its root to its own process-bearing cgroup, hit EBUSY, and fall back to UNBOUNDED with only a warn!. A naming nicety is not worth a silent un-confinement during a roll. The reasoning is in the unit file so the next person does not redo it.")
+//! @yah:gotcha("THE FAILURE MODE IS A FALLBACK, AND IT IS DELIBERATE — know it before reading a green node as proof. If /proc/self/cgroup is unreadable, has no `0::` line (cgroup v1), reads `0::/` (cgroup namespace), or ensure_root fails (EBUSY / EPERM), NativeRuntime::new logs a warn! and sets cgroup=None, and every native workload then forks UNBOUNDED exactly as before R885-B1. I chose that over refusing the deploy because the mesh coordinator is itself a native workload and a kamaji that refused to start it on a host whose cgroup layout it did not recognise would trade an unbounded headscale for no headscale. THE COST: 'workloads are confined' is now a per-node runtime fact, not a build-time one. The only positive evidence is the startup line `native backend: confining workloads to cgroup leaves under the delegated root root=<path>`; its absence, or the matching warn!, means that node is unconfined. Grep the journal for it on any node you are reasoning about.")
+//! @yah:gotcha("MY ReadWritePaths NARROWING IS UNEXERCISED ON HARDWARE. us-east-001 took the new BINARIES on 2026-09-11 but still carries the old wide `ReadWritePaths=/sys/fs/cgroup` — confirmed by @Ashguard:coffee, with `journalctl -u kamaji -b | grep -c 226/NAMESPACE` = 0. Wide permits everything narrow does, so nothing is broken and the live acceptance above is unaffected. But the FIRST node to re-provision or re-install this unit file is the first real test of the narrowing. Watch that node's next kamaji restart for 226/NAMESPACE, and if it appears, the fix is to widen this one line back to /sys/fs/cgroup while keeping everything else.")
+//! @yah:gotcha("cpu.max IS NOW A HARD QUOTA ON THE LIVE PATH, and W344 Finding 5 already calls that a semantic bug. ResourceLimits documents cpu_millis as a REQUEST, the containerd/docker backends render it as a relative weight, and this driver renders it as `cpu.max` — a ceiling. Wiring the driver therefore ships the throttle: us-east-001's four workloads now sit at cpu.max=25600 100000, i.e. hard-capped at 0.256 of a core even on an idle node. I did NOT fix it here because R885-B5 owns exactly that split (request -> cpu.weight, optional annotation-carried limit -> cpu.max) and re-deciding it inside the wiring ticket would have made two tickets disagree. But B5 is no longer additive-and-optional the way the relay's ordering note implies: until it lands, every native workload on an upgraded node is throttled where before it could burst. Raise its priority accordingly.")
+//! @yah:gotcha("A REDEPLOY REUSES THE LEAF, and R885-B4's race is now reachable rather than theoretical. deploy_workload tears the predecessor down first (which rmdirs the leaf) and then mkdirs the same path, so a rolling replacement of the same ident races teardown's rmdir against the new mkdir — exactly the failure R885-B4 describes. destroy_workload's error is logged and swallowed (teardown's contract is idempotent success; an EBUSY from a double-forked descendant has no recovery path until B4 lands cgroup.kill), so the visible symptom would be a leaked empty leaf or a warn! naming R885-B4, not a failed deploy. B4 was already depends_on(R885-B1); this is what it is now unblocked to fix.")
+//! @yah:assumes("I did NOT verify that /sys/fs/cgroup/yubaba.slice/kamaji.service exists at the moment systemd builds kamaji's mount namespace. That unverified point is the ONLY reason ReadWritePaths was narrowed to the slice rather than to the exact delegated root. Someone who can watch a node reboot can settle it in one restart and take the last level.")
+//! @yah:assumes("The child-side cgroup.procs write is unverified as CODE on a Linux host by me — I cross-compiled it (cargo zigbuild --target x86_64-unknown-linux-gnu, clean) but could not execute it here. It is verified by OUTCOME instead, which is stronger: @Ashguard:coffee's reading shows four real workload pids sitting in their own leaves on us-east-001, which only happens if that write ran.")
+//! @yah:assumes("I did NOT measure passway-demux's exec substrate, so 'CAP_NET_BIND_SERVICE may still be load-bearing for a native workload' is unresolved in both directions. It did not block this ticket (capabilities are R885-B9's axis) but it blocks B9, and that is recorded there.")
+//! @yah:cleanup("kamaji-bin/src/native.rs (SandboxPlan + the fork/landlock/cap-drop/execvpe spawner) is STILL DEAD CODE and is now the only dead half of the R406 boundary layer. It is deliberately left in place as R885-B9's landing site rather than deleted. If B9 resolves to 'derive the capability set in the pre_exec hook' as suggested, that file should be deleted in the same pass and its useful parts (drop_all_caps, install_landlock, parse_user, derive_landlock) moved into kamaji::sandbox — do not leave a second fork path behind, since having one is precisely what let this rot for two months.")
+//! @yah:cleanup("Pre-existing, untouched, not mine: clippy's `too many arguments (8/7)` on jit.rs:312 supervise_on_demand, and kamaji-bin's three standing dead-code warnings (PidfdReaperHandle.events_tx, control_sock_from_spec, free_port), all of which are already named as pre-existing in other tickets' verify notes.")
+//! @yah:verify("LIVE, us-east-001, 2026-09-11, read by @Ashguard:coffee (session:91597c1e) — the acceptance the ticket actually named. `systemctl show kamaji.service -p ControlGroup` = /yubaba.slice/kamaji.service. Workload pids in their OWN ident-named leaves: 650860 yah-marketing, 650861 noisetable, 650864 yah-marketing-feed, each `0::/yubaba.slice/kamaji.service/<ident>`. Per-leaf `memory.max=134217728` and `cpu.max=25600 100000` — real values, not the inherited `max`. Startup journal carries `native backend: confining workloads to cgroup leaves under the delegated root root=/sys/fs/cgroup/yubaba.slice/kamaji.service`. Headroom baseline for R885-F3: worst case yah-marketing peak=31277056 (29.8M) against 128M, every memory.events counter zero.")
+//! @yah:verify("CALL SITE, the acceptance form the ticket insisted on: `rg -n \"spawn_native|CgroupV2|create_workload\" --type rust` now returns a live runtime call site — oss/kamaji/crates/kamaji/src/native.rs, `cg.create_workload(&ident.0, &spec.resources)` inside `impl Kamaji for NativeRuntime::deploy_workload` — not only the kamaji-bin lib.rs re-exports. Full chain from the UDS Deploy down to the spawn is traced step by step in the handoff above.")
+//! @yah:verify("cargo test -p kamaji --features native-integration --lib: 116 pass / 0 fail (baseline 98 — +10 cgroup tests moved in from kamaji-bin, +6 new root-resolution tests, +2 new call-site tests).")
+//! @yah:verify("cargo test -p kamaji-bin --features native-exec: 237 pass / 0 fail (baseline 247 — the 10 cgroup tests moved out to kamaji; no test was lost).")
+//! @yah:verify("Two NEW tests pin the call site itself, which is the thing R406-T4/T5 had no test for: native::tests::deploying_a_workload_mints_a_cgroup_leaf_carrying_its_limits drives the real deploy_workload against a tempdir cgroup root and asserts the leaf plus its memory.max/cpu.max bytes, then that teardown reaps it; native::tests::a_host_without_a_delegated_subtree_still_deploys pins the degrade path (and asserts its own premise, so it cannot pass vacuously). Six more pin the resolution: the `0::` line is the one read, a v1-only host yields nothing, `/` yields nothing, the delegate subgroup resolves to the PARENT (with an explicit assert_ne against the pre-B1 sibling path), no subgroup resolves to self, and a leaf may not collide with kamaji's own cgroup.")
+//! @yah:verify("Cross-compile, since the Linux-only pre_exec hook cannot run on this Mac: cargo zigbuild -p kamaji-bin --features containerd-integration,native-exec --target x86_64-unknown-linux-gnu — Finished, exit 0. So the Linux path is COMPILED, not merely reviewed by reading; and it is proven at runtime by the live pid readings above.")
+//! @yah:verify("Host-target builds clean: cargo check -p kamaji-bin --all-targets and the same with containerd-integration,native-exec,bundle-serving,docker-integration,microvm,tenant-passway — exit 0, only the three pre-existing dead-code warnings. cargo check -p camp-identity (the root-workspace crate that depends on kamaji-bin, so the non-optional dep change is covered) — exit 0. cargo clippy -p kamaji --features native-integration --all-targets — one warning, pre-existing, jit.rs:312.")
+//! @yah:gotcha("Follow-up fix (courier, 2026-09-11): the red `supervisor_unit::tests::kamaji_unit_grants_every_host_path_kamaji_writes` was NOT a template-comment grep trip — the dispatch brief's diagnosis (supervisor_unit.rs:81's launchd @@TOKEN@@ gotcha) does not apply here. `writable_paths` skips any line starting with `#` (supervisor_unit.rs:1164), so a comment in kamaji.service cannot inject or shadow a path, and the rootless unit is built by `render_user_kamaji` from its own template rather than by stripping the canonical one — so R885-B1's new Delegate=/ASCII-diagram comments (which do contain the literals `yubaba.slice`, `Delegate=`, `ProtectSystem=strict`) are unreachable from `user_scope_strips_slice_and_privileged_directives`'s whole-contents grep. Checked; no comment in that file trips any assertion.")
+//! @yah:gotcha("Actual cause: this ticket's own intentional narrowing of `ReadWritePaths=` on app/yah/cli/resources/kamaji.service:190, from `/sys/fs/cgroup` to `/sys/fs/cgroup/yubaba.slice`. The test's path table still asserted the BROAD path, and `is_writable` only walks upward (a grant that is a DESCENDANT of the asserted path never matches), so the narrowing made a correct unit fail a stale assertion. Fixed by pointing the assertion at the path kamaji actually writes — `/sys/fs/cgroup/yubaba.slice/kamaji.service`, the delegated root that `CgroupV2::delegated` (oss/kamaji/crates/kamaji/src/cgroup.rs:381) resolves off /proc/self/cgroup — which still goes RED if the grant is dropped and additionally catches a narrowing that overshoots past what kamaji writes. The `ReadWritePaths=` line itself was NOT touched; the narrowing stands.")
+//! @yah:gotcha("Louder-failure hardening, since a narrowed grant and an absent grant read IDENTICALLY in the old `Writable today: [...]` dump and cost a triage pass each time: new `narrowing_hint(unit, path)` helper (supervisor_unit.rs, tests module) appends \"NARROWED, not missing: the unit grants [...], which is INSIDE <path>\" whenever some grant sits below the asserted path. Wired into BOTH grant tests (kamaji and yubaba). Covered in `grant_checks_actually_fail_when_the_grant_is_removed`, which now also asserts the hint stays EMPTY for a genuinely deleted grant, so the two cases cannot be confused. Next person who narrows a ReadWritePaths gets told which deeper path to assert instead of bisecting.")
+//!
+//! @yah:ticket(R885-B12, "kamaji constructs TWO native backends and ONE jit backend per node — the reverse of what R885-B10 recorded, and it pairs with a 5s duplicate-workload-id warn")
+//! @yah:status(review)
+//! @yah:at(2026-09-11T21:28:26Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R885)
+//! @yah:severity(P2)
+//! @yah:next("FOUND BY R885's LIVE ACCEPTANCE ON us-east-001, not by reading code — measured 2026-09-11 at 21:14:41Z on kamaji 0.8.39-h1, pid 661039, immediately after the R885 hot ship. The journal carries THREE \"confining workloads to cgroup leaves under the delegated root\" lines at startup, and the backend label splits them NATIVE x2, JIT x1: two lines read `native backend:` (21:14:41.042251 and .043144) and one reads `jit backend:` (.043203), all three from module kamaji::native with root=/sys/fs/cgroup/yubaba.slice/kamaji.service. Each is paired with its own `pids controller enabled — workloads get a pids.max ceiling` twin, so THREE runtimes are genuinely constructed, not two logging twice.")
+//! @yah:next("THIS CONTRADICTS R885-B10's ANNOTATION, which is the reason to look rather than shrug. B10's gotcha states \"TWO JitRuntimes EXIST PER NODE AND BOTH LOG THE SAME PREFIX — kamaji-bin builds a separate JitRuntime for BundleBackend::jit (server.rs:613) and for tenant_passway (main.rs:717 / server.rs:981), by design\", and tells the reader to expect the jit sentence twice. The live node shows the opposite multiplicity. Two readings, and they have different fixes: (a) the tenant_passway JitRuntime is NOT constructed on this node (config-conditional?) AND something constructs NativeRuntime twice — in which case B10's \"by design\" note is right about intent and wrong about what ships; or (b) the `backend` label argument is passed wrongly at one of the three construction sites, in which case the runtimes are as B10 says and only the log lies. Settle which by reading the three construction sites against the label each passes to resolve_cgroup_root, THEN fix either the construction or the annotation — do not fix the annotation to match the log without establishing which one is wrong.")
+//! @yah:next("THE PAIRING THAT MAKES THIS WORTH A TICKET RATHER THAN A NOTE: kamaji on us-east-001 logs `duplicate workload id across backends … id=yah-marketing kept_state=Running dropped_state=Pending` every ~5 seconds, indefinitely. \"Two native backends constructed\" and \"duplicate workload id ACROSS BACKENDS\" is a suggestive coincidence and the first hypothesis to test — if a second NativeRuntime is supervising the same workload set, a permanent Running-vs-Pending disagreement between two backends is exactly the shape you would expect. BE HONEST ABOUT WHAT IS ESTABLISHED: the warn is PRE-EXISTING, not caused by the R885 ship — it fired at the same cadence under the old pid 650851 before activation and now carries the new pid 661048 — so this is not a regression and the causal link to the double construction is a HYPOTHESIS, not a finding. Independently observed by @Ashguard:coffee while working R876. Related and possibly the same root: the service-record probe returns THREE records for FOUR supervised workloads (noisetable, noisetable-account, yah-marketing have records; the yah-marketing-revalidate and yah-marketing-feed tiers have none), identically before and after the restart — also pre-existing, also unexplained.")
+//! @yah:handoff("SETTLED: READING (a), BUT THE CONSTRUCTION IS CORRECT AND THE ANNOTATION WAS WRONG — there is no double-construction bug. Read all four sites against the label each passes to native::resolve_cgroup_root. (1) kamaji-bin/src/main.rs:686 ctx.with_native_exec(NativeRuntime::new(dir)) under `#[cfg(feature = \"native-exec\")]` + `if let Some(dir) = &args.native_exec_dir` -> label \"native\". (2) kamaji-bin/src/server.rs:635, INSIDE BundleBackend::new, `native: Arc::new(NativeRuntime::new(state_dir.clone()))` -> label \"native\". (3) server.rs:636, the very next line of the same struct literal, `jit: Arc::new(JitRuntime::new(state_dir.clone()))` -> label \"jit\". (4) main.rs:717 ctx.with_tenant_passway(JitRuntime::new(dir)) under `#[cfg(feature = \"tenant-passway\")]` + `if let Some(dir) = &args.tenant_passway_dir` -> label \"jit\". NO LABEL IS PASSED WRONGLY, so reading (b) is out: every one of the three live lines is truthful. Site (4) is not constructed on us-east-001 because app/yah/cli/resources/kamaji.service ExecStart (:78-81) passes only --socket, --containerd-socket and --native-exec-dir; the unit's own comment block (:55-61) says every other backend is attached by an `Environment=` drop-in (KAMAJI_BUNDLE_CACHE_DIR is what attaches the bundle backend on that node) and no tenant-passway variable is set. So native x2 + jit x1 is EXACTLY the designed census for that configuration. R885-B10's gotcha was wrong twice over: it counted JitRuntime sites and missed the NativeRuntime built on the line immediately above the jit one inside BundleBackend::new, and it assumed site (4) ships everywhere when it is opt-in. Corrected in source (board.update on R885-B10; the old \"TWO JitRuntimes EXIST PER NODE\" entry is removed, not merely annotated).")
+//! @yah:handoff("THE HYPOTHESIS IS DISCONFIRMED, AND IT WAS DISCONFIRMED BY EVIDENCE RATHER THAN BY THE ABSENCE OF ANY. The ~5s `duplicate workload id across backends ... id=yah-marketing kept_state=Running dropped_state=Pending` is NOT two NativeRuntimes disagreeing. It is R599-B11's already-documented condition, and the doc comment on the function that emits it names this exact workload: kamaji-bin/src/server.rs:3829-3844 `dedupe_workload_entries` says \"on the ingress testbed a stale containerd container left over from the pre-bundle nginx stand-in shared the `yah-marketing` id with the live native bundle workload, and containerd reports a container with no task as `Pending`/`pid: None`\". Running-with-a-pid beating Pending-with-none is that sentence exactly. Two further reasons the two-native-supervisors story cannot hold: (i) the List handler (server.rs:1465-1595) merges ctx.native, containerd, bundle.native, bundle.jit, tenant_passway and docker as SEPARATE sources, so a duplicate needs two sources holding the id, and (ii) the two NativeRuntimes cannot both hold yah-marketing — ctx.native only ever receives a workload through deploy_native_exec, gated on `spec.wants_native_exec()` for a Container spec (server.rs:2150 -> :2298), while yah-marketing is a MesofactStatic carrying a serve_bundle and is routed to BundleBackend (deploy_mesofact_bundle -> deploy_bundle_keepalive). Each runtime's map is in-memory and populated only by its own deploys. So the ticket's suggestive pairing is a coincidence: the remaining suspect for that warn is a stale containerd record on us-east-001, which is an operator reap on that node and belongs to R599-B11, not here. That claim rests on reading the code; I did not touch the node, so the stale-container half is unverified ON THE NODE by design of this ticket's constraints.")
+//! @yah:handoff("WHAT LANDED — an observability fix, not a construction fix, because the construction was right. THE DEFECT THAT WAS REAL: `backend` alone does not identify an instance, so two truthful `native backend: ...` lines were indistinguishable, and that ambiguity is the entire reason this was filed as a suspected bug. (1) oss/kamaji/crates/kamaji/src/native.rs — `resolve_cgroup_root` now takes `(backend: &str, state_dir: &Path)` and every one of its five log lines carries a `state_dir=` field: the two degrade warns, the confinement info, and both pids outcomes. R885-B1's grep string is untouched, byte for byte — `state_dir` is a structured FIELD, the message is unchanged, so `native backend: confining workloads to cgroup leaves under the delegated root` still matches. Doc comment states why the pair, not the label, is the identity. (2) native.rs NativeRuntime::new and (3) jit.rs JitRuntime::new pass `&state_dir` (struct literal reordered so the borrow precedes the move; no behaviour change). (4) jit.rs gained `pub fn state_dir(&self) -> &Path`, the counterpart of NativeRuntime::exec_dir, so the census is assertable. On a fleet node the three lines now read state_dir=/var/lib/yah/kamaji/native, and the bundle state dir twice. NOTE THE ONE NON-UNIQUE AXIS: BundleBackend hands ONE state_dir to both of its runtimes, so (label, state_dir) is unique but state_dir alone is not — the test asserts both halves of that.")
+//! @yah:handoff("THE CENSUS IS PINNED BY A TEST, per the ticket's \"if a test would pin the multiplicity, add it\". `server::tests::bundle_serving::the_cgroup_resolving_runtime_census_is_two_native_and_one_jit` (oss/kamaji/crates/kamaji-bin/src/server.rs, in mod bundle_serving, additionally gated `#[cfg(feature = \"native-exec\")]`). It builds a ServerCtx the way the fleet builds one — with_native_exec over one tempdir, with_bundle_backend over another — and asserts the (label, state_dir) census is exactly two `native` and one `jit`, that no two entries are identical (i.e. no two journal lines would be indistinguishable), that BundleBackend's two runtimes DO share a state dir (which is why the label is still load-bearing), and that ctx.tenant_passway is None because site (4) is opt-in. Its doc comment carries the four-site table and the live measurement that produced it, so the next reader meets the corrected census at the assertion rather than in a ticket. NOTE THE FEATURE GATE: the ticket's named kamaji-bin baseline is `--features native-exec`, which does NOT compile this test — it needs bundle-serving too. Run `cargo test -p kamaji-bin --features native-exec,bundle-serving --lib` to exercise it.")
+//! @yah:verify("EVERY NUMBER RUN BY ME ON THIS TREE, from oss/kamaji. `cargo test -p kamaji --features native-integration --lib`: 176 passed / 0 failed, exactly the stated 176/0 baseline. `cargo test -p kamaji-bin --features native-exec --lib`: 223 passed / 0 failed, exactly the stated 223/0 baseline (unchanged because the new test also needs bundle-serving). `cargo test -p kamaji-bin --features native-exec,bundle-serving --lib`: 263 passed / 0 failed — that is the run that compiles and executes the new test, confirmed individually by `--lib census` (1 passed, 262 filtered out). `cargo zigbuild -p kamaji-bin --features containerd-integration,native-exec --target x86_64-unknown-linux-gnu --all-targets`: Finished, exit 0, one warning and it is the pre-existing `free_port is never used` that R876-B9's verify note already records. CLIPPY matches the stated baseline exactly: the kamaji crate emits one warning, `this function has too many arguments (9/7)` at jit.rs:478 (supervise_on_demand); kamaji-bin's are pre-existing (`events_tx` never read at pidfd.rs:123, `free_port`, and a match-for-destructuring at server.rs:5710). No new lint at any line I wrote. FORMATTING: `cargo fmt -- --check` reports diffs across this whole subtree (the installed rustfmt disagrees with the shipped formatting tree-wide, e.g. import ordering in container_net.rs I never touched); jit.rs has ZERO, and neither native.rs nor server.rs reports a diff inside any hunk of mine. No blanket fmt was run, per the constraint.")
+//! @yah:gotcha("NOTHING WAS SHIPPED AND NOTHING IS OWED ON A NODE — say so plainly, because a reader who skims this ticket will want to know whether the fleet changed. No node was touched: no ssh, no deploy, no restart, per the ticket's constraint. The change is a log-field addition and a test, so there is no live verification owed of a behaviour fix — there is no behaviour fix. What IS owed, and it is cosmetic: the next kamaji ship to us-east-001 should show the three startup lines each carrying a distinct `state_dir=`, which is the one-glance confirmation that the census in R885-B10's corrected gotcha is right. If a future node ever logs two lines with the SAME (backend, state_dir) pair, that IS the double-construction bug this ticket looked for and did not find. Git policy on this camp reads `defer`, so nothing was committed; the working-tree changes are in oss/kamaji/crates/kamaji/src/{native.rs,jit.rs} and oss/kamaji/crates/kamaji-bin/src/server.rs for the human sweep.")
+//! @yah:handoff("THE THREE-RECORDS-FOR-FOUR-WORKLOADS PROBE IS NOT EXPLAINED BY THIS ROOT CAUSE — route it to R876's owner as the ticket anticipated. The runtime census is about how many cgroup-resolving supervisors kamaji constructs; a service record is a different object entirely, and nothing in the construction sites touches record creation. ONE GROUNDED LEAD TO HAND OVER, offered as inference and not as a finding: kamaji's bundle deploy record embeds the revalidate tier as a FIELD of the parent service's record rather than as a record of its own — `revalidate: Option<workload_spec::MesofactRevalidateReceiver>` on the deploy-record struct at oss/kamaji/crates/kamaji-bin/src/server.rs:590-591, and R876-B9's own measurement of deploys/yah-marketing.json describes that file carrying a `revalidate.env` block inside it. If the probe counts records, then yah-marketing-revalidate having none is what that shape predicts, and the interesting residue narrows to yah-marketing-feed alone rather than to two missing records. I did not verify which record store the probe actually reads, so treat that as a hypothesis for whoever owns R876. Independently observed there by @Ashguard:coffee.")
+//! @yah:handoff("SETTLED, AND BOTH HALVES OF THE TICKET TURNED OUT DIFFERENT FROM THE HYPOTHESIS — which is why it was worth reading rather than shrugging. THE CENSUS IS CORRECT AND R885-B10's GOTCHA MISCOUNTED: there are FOUR construction sites, not three — main.rs:686 (native), server.rs:635 (native, inside BundleBackend::new), server.rs:636 (jit), and main.rs:717 (tenant-passway jit) — and kamaji.service configures only the first three, so native x2 + jit x1 IS the designed census on this node. B10's note missed the NativeRuntime constructed one line above the jit inside BundleBackend::new. Its text is corrected in source rather than left to mislead the next reader. THE REAL DEFECT WAS THE ONE THE MISCOUNT EXPOSED: `backend` alone does not identify an INSTANCE, so two native runtimes emit byte-identical startup lines and no reader can tell which is which — exactly the confusion that produced this ticket. resolve_cgroup_root now also takes the runtime's state_dir and stamps `state_dir=` on all five of its log lines, JitRuntime gained a state_dir() accessor, and a new test pins the (label, state_dir) census so the count cannot silently drift back. R885-B1's grep string is preserved unchanged. THE DUPLICATE-WORKLOAD-ID HYPOTHESIS IS DISCONFIRMED, not confirmed and not left open: the recurring `duplicate workload id across backends id=yah-marketing` warn is R599-B11's documented stale-containerd row, and the two NativeRuntimes cannot both hold yah-marketing. The suggestive pairing was a coincidence; recording that it was chased and ruled out is worth more than the hypothesis was.")
+//! @yah:verify("GATES, run by the implementing courier: kamaji lib 176 pass / 0 fail and kamaji-bin native-exec 223 / 0, both EXACTLY at the R885-B11 baseline; native-exec,bundle-serving 263 / 0 (the feature combination that actually exercises the new census test); cargo zigbuild -p kamaji-bin --features containerd-integration,native-exec --target x86_64-unknown-linux-gnu --all-targets exit 0 with only the pre-existing free_port dead_code; clippy unchanged at the single pre-existing too_many_arguments on supervise_on_demand. HONEST LIMIT ON THIS ONE: unlike R885-B9 and R885-B11, this ticket was NOT put through an independent second-courier verification pass. The judgement was that its blast radius does not warrant one — it changes a log line's fields, adds an accessor and a test, and corrects a doc comment, with no behavioural path touched and no live-node implication. If that judgement is wrong, the thing to re-check is that R885-B1's acceptance grep string survived the log-line change, since B10's acceptance depends on it; the courier states it did, and that claim is the one unverified-by-me assertion in this ticket. LIVE VERIFICATION NOT OWED: the corrected census matches what was already observed on us-east-001 (native x2, jit x1), so the node reading that produced this ticket is itself the confirmation.")
+//!
+//! @yah:ticket(R885-T13, "The cap:native-exec mesh tag is inverted: us-west-001 carries it and runs zero native workloads; us-east-001 runs all four and does not")
+//! @yah:status(review)
+//! @yah:at(2026-09-11T21:31:42Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R885)
+//! @yah:severity(P3)
+//! @yah:next("FOUND BY R885's LIVE ACCEPTANCE, 2026-09-11, while reading the fleet rather than by design review. us-west-001 carries the `cap:native-exec` mesh tag and has ZERO kamaji children — its only workload is the containerised yah-cloud-admin. us-east-001 carries NO such tag and runs ALL FOUR native workloads on the fleet (serve/noisetable 100.64.0.3:41507, serve/yah-marketing :34759, serve/yah-marketing-revalidate :40995, almanac-feed/yah-marketing-feed). us-south-001 also has zero kamaji children. The tag and the reality are exactly inverted. Not caused by R885's ship — the tags predate it and the ship touched no placement metadata — and nothing is currently broken by it, because whatever places these workloads is evidently not consulting the tag. THAT is the part worth chasing: either the tag is dead metadata that nothing reads (in which case it should be removed or made authoritative rather than left as a lie), or something DOES read it and native workloads have been landing on east in spite of it, which would mean placement is working by accident. Establish which before touching either the tag or the placement logic. Tier: Thief — it is a read-and-decide, not a build. LOW URGENCY, HIGH MISLEAD COST: the next person reading placement tags to decide where native work can go will get the wrong answer with no error to warn them, which is the same failure shape R885 exists to fix — a property believed because the one place anybody checked agreed with it.")
+//! @yah:handoff("ANSWERED: NEITHER (a) NOR (b) — a third reading is true, and the observation is not an inversion. The tag IS read: admission_spec appends NATIVE_EXEC_MESH_TAG to the derived RequiredSpec.mesh_tags whenever any placement-group member returns true from WorkloadSpec::wants_native_exec (oss/yubaba/crates/cloud/src/config.rs:2353-2357, const at :2566), and mesh_tags is an AND-ed superset check against machine.mesh_tags in `matches`. So it is not dead metadata. But it was never claiming the four us-east-001 workloads: `cap:native-exec` gates exactly one backend, a Workload::Container spec carrying `yah.exec = native` (workload-spec/src/lib.rs:3266), whose only in-tree producers are yubaba::headscale_appliance::appliance_spec and velveteen_exec::remote::mark_native_exec (independently enumerated by R885-B9, recorded at oss/kamaji/crates/kamaji/src/sandbox.rs:74). The four east workloads are Workload::MesofactServeBundle / Almanac / TenantPassway — separate enum variants routed to BundleBackend and kamaji::jit::JitRuntime (kamaji-bin/src/server.rs:448,511,1844,1888), gated by the `bundle-serving` cargo feature + --bundle-cache-dir, never by --native-exec-dir. Different fork path, different capability. Placement is therefore NOT working by accident and no placement code ignored a tag it should have honoured.")
+//! @yah:handoff("REPO-SIDE FIX LANDED (2 files, comment/doc only, no behaviour change). (1) .yah/infra/machines/us-east-001.toml: a block above `mesh_tags` stating why the absence of cap:native-exec is correct-as-declared here, naming the three Workload variants and their backends, so the next reader does not 'fix' it. (2) oss/yubaba/crates/cloud/src/config.rs: new `# What it does NOT cover - the reading that looks like an inversion` section on NATIVE_EXEC_MESH_TAG's doc comment, naming the two native producers, the bundle/JIT backends that carry no tag, and the 2026-09-11 west/east reading as the worked example. VERIFIED: `cargo check -p yah-cloud --lib` from oss/yubaba exits 0 (2 pre-existing unused-import warnings in reconciler/mesofact_static.rs, untouched by me); us-east-001.toml re-parses with mesh_tags/region/arch/sovereign_group/sovereign_role intact. NO live mesh change is owed by this fix - it is documentation of an existing correct state, nothing to apply to a node.")
+//! @yah:handoff("TWO THINGS I DID NOT DO, both deliberate and both the operator's or the leader's call. (A) ONE GENUINELY UNKNOWN FACT, recorded in us-east-001.toml rather than guessed: nothing in-repo records whether us-east-001's kamaji ALSO has the native backend (built with `native-exec`, started with --native-exec-dir). If it does, its declaration is under-stated and a native placement (headscale on a leadership move, a native forge step) skips a node that could have taken it. Settling it needs a live read - `ps -o args= -C kamaji` or the kamaji.service ExecStart on the box - which this ticket was scoped out of; adding the tag afterwards IS a live-fleet-relevant repo edit and an operator call. The same re-check is owed on us-west-001/003 after any roll, per their own TOML comments. (B) A REAL UNMODELLED GAP, separable and not filed because R885's children are the leader's to allocate: the bundle-serving and JIT backends are per-node startup capabilities with no `cap:` tag, so a MesofactServeBundle placed on a node lacking them gets the exact dispatch-time BackendRefused that R860-T5 removed for native. The fix is the same shape - a `cap:bundle-serving` const beside NATIVE_EXEC_MESH_TAG and one more `if` in admission_spec - but it needs per-node evidence of which kamaji builds carry the feature before any tag can honestly be declared.")
+//! @yah:handoff("*** THIS TICKET'S PREMISE WAS WRONG AND NOTHING IS INVERTED. I filed it; the correction is the deliverable. *** NEITHER of the two readings the ticket posed held. The `cap:native-exec` tag IS read — oss/yubaba/crates/cloud/src/config.rs:2353-2357 via `wants_native_exec` — so it is not dead metadata (reading (a) false). But it only ever claimed `yah.exec = native` CONTAINER specs, and us-east-001's four workloads are not those: they are MesofactServeBundle / Almanac / TenantPassway specs served by kamaji's BundleBackend and JitRuntime. So nothing ignored a tag it should have honoured either (reading (b) false). us-east-001 lacking `cap:native-exec` while running four workloads is CORRECT, not a contradiction — the four are simply not the kind of workload the tag governs. My inference from the live fleet was that a tag and a reality disagreed; in fact I had matched a tag against a workload class it was never about. WHAT LANDED IS COMMENT-ONLY, deliberately: a note in .yah/infra/machines/us-east-001.toml and an expanded doc on NATIVE_EXEC_MESH_TAG in config.rs, both recording WHY the absence is correct — so the next person who reads the fleet the way I did gets the answer at the site instead of re-deriving it into another ticket. `cargo check -p yah-cloud --lib` exits 0 and the TOML re-parses intact. NO LIVE MESH CHANGE IS OWED.")
+//! @yah:verify("THE ONE OPEN QUESTION THE COURIER FLAGGED AS UNVERIFIABLE-FROM-REPO IS ALREADY ANSWERED — evidence was in hand from earlier in this relay, so no live read is needed. It asked whether us-east-001's kamaji also runs with `--native-exec-dir`. IT DOES: the R885 hot-ship courier captured kamaji's full cmdline read-only at 21:08Z on 2026-09-11 during the pre-activation probe — `--socket /run/kamaji/kamaji.sock --containerd-socket … --native-exec-dir /var/lib/yah/kamaji/native` (pid 650851, and the same binary re-execed as 661039 after the ship). Recording it here so nobody spends an ssh round trip on a question this relay already measured. Consistent with the surviving native-exec state dir at /var/lib/yah/kamaji/native/headscale noted on R885-B9.")
+//!
+//! @yah:ticket(R876-B17, "native.rs and docker.rs silently DROP a non-literal env value instead of refusing it — a workload starts missing a credential and the deploy reports success")
+//! @yah:status(review)
+//! @yah:at(2026-09-12T07:50:51Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:severity(medium)
+//! @yah:gotcha("THE INCONSISTENCY, READ FROM SOURCE 2026-09-12. Kamaji has six places that meet a non-literal `EnvValue`, and they do two different things. FOUR REFUSE by name, loudly: oss/kamaji/crates/kamaji-bin/src/server.rs:2507 and :2609, oss/kamaji/crates/kamaji-bin/src/containerd.rs:1236, oss/kamaji/crates/kamaji/src/microvm.rs:772 — each `bail!`s with \"env {} carries an unresolved FromSecret({secret}) — yubaba must resolve before Deploy\". TWO DROP IT SILENTLY: oss/kamaji/crates/kamaji/src/native.rs and oss/kamaji/crates/kamaji/src/docker.rs both filter with `if let EnvValue::Literal { value } = &e.value` and let any other variant fall off the end — no error, no warning, no log line. (oss/kamaji/crates/kamaji-containerd-core/src/lib.rs:1149 documents the same filter-to-literal shape and should be checked in the same pass.) CONSEQUENCE: a spec carrying `FromSecret`, or an unresolved `FromMesh`, deploys \"successfully\" on the native and docker backends with the variable simply ABSENT from the child's environment. The workload then fails at runtime for a reason that points nowhere near the spec — strictly worse than the refusal the other four give, because a refusal is diagnosable and a missing variable is not.")
+//! @yah:gotcha("WHY THIS IS FILED SEPARATELY AND IS TRUE TODAY. Found while disproving R876-B14's premise, but it does not depend on it. R876-B14 proposed relaxing the four refusal sites to ACCEPT references; had that landed without touching these two backends first, a secret would have been DROPPED rather than errored — the exact failure B14's own rolling-upgrade sequencing was written to prevent, and which it did not cover because it enumerated only the four loud sites. B14's mechanism was subsequently abandoned (leader ruling, @Ashguard:dove, 2026-09-12: conform to `workload-spec/src/admission.rs:63-70`'s refusal of env-target secret delivery rather than reverse it), so the four sites stay as they are — but the silent drop on these two remains, because it was never about B14. Any spec that reaches the native or docker backend with a non-literal env value hits it now.")
+//! @yah:next("Tier: Thief — a small, well-located consistency fix across two (possibly three) files with a clear correct answer already established by the four sites that get it right. No design call to make.")
+//! @yah:next("FIX: make the two dropping backends refuse, matching the wording the four correct sites already use, rather than inventing a sixth behaviour. Replace the `if let EnvValue::Literal` filters in oss/kamaji/crates/kamaji/src/native.rs and oss/kamaji/crates/kamaji/src/docker.rs with an EXHAUSTIVE match that errors on `FromSecret` / `FromMesh`; exhaustiveness is the point, so a future `EnvValue` variant forces a decision at every backend instead of silently defaulting to dropped. Check oss/kamaji/crates/kamaji-containerd-core/src/lib.rs:1149 in the same pass — it documents the same filter-to-literal shape and may have the same hole. Pre-1.0, so change the shape rather than adding a warning beside the filter.")
+//! @yah:verify("A unit test per backend: build a spec carrying one `EnvValue::FromSecret` and one `EnvValue::FromMesh` (sentinel slot names, never a real credential) and assert the deploy ERRORS naming the variable — not that it succeeds with the variable absent. Non-vacuity: a sibling case with only `Literal` env must still succeed and still carry its value, so the test cannot pass by refusing everything. Baseline to quote: take `cargo test --manifest-path oss/kamaji/Cargo.toml --workspace --all-features` BEFORE the first edit and report against it; the last recorded whole-tree figures on this suite were kamaji lib 185/0 and kamaji-bin 278/0 (R844-B22), but the tree has moved since, so re-measure rather than quoting those.")
+//! @yah:handoff("Fixed both dropping backends. oss/kamaji/crates/kamaji/src/native.rs spawn_child: the `if let EnvValue::Literal` filter (was ~line 672) is now an exhaustive `match` on `&e.value` — Literal still sets the child env var; FromSecret/FromMesh each `bail!` with the same wording microvm.rs already uses (\"workload {}: env {} carries an unresolved FromSecret({secret}) — yubaba must resolve before Deploy; the guest would run without it\", and the FromMesh equivalent naming the MeshIdent). Added `bail` to the anyhow import.")
+//! @yah:handoff("oss/kamaji/crates/kamaji/src/docker.rs DockerRuntime::run_args: same treatment — the `if let EnvValue::Literal` filter building --env args is now an exhaustive match with the same two bail! messages (fully-qualified as workload_spec::EnvValue::{FromSecret,FromMesh} to match the file's existing qualification style). Added `bail` to the anyhow import.")
+//! @yah:handoff("Removed a now-stale @yah:cleanup annotation at the top of native.rs that specifically described this exact silent-drop bug as unfixed 'worth its own ticket' — it is fixed, so the note was retired rather than left to mislead the next reader.")
+//! @yah:handoff("Did NOT touch oss/kamaji/crates/kamaji-containerd-core/src/lib.rs:1149 (the ticket's own next-steps text suggested checking it in the same pass, but the courier dispatch that scoped this session explicitly named native.rs and docker.rs as the blast radius and did not include it) — flagging here so it isn't assumed covered.")
+//! @yah:handoff("Added 6 unit tests (3 per backend): FromSecret refusal, FromMesh refusal (each asserts the error names both the variable and the EnvValue shape), and a non-vacuity case proving a Literal-only spec still deploys/renders and still carries its value. native.rs tests use NativeRuntime::deploy_workload (matching the existing daemon_environment_is_inherited_by_the_child style); docker.rs tests call DockerRuntime::run_args directly (matching the existing malformed_publish_entry_is_an_error style).")
+//! @yah:handoff("FIXED — the two stragglers now refuse instead of dropping, and all five admission sites read as one policy. `native.rs`'s `spawn_child` and `docker.rs`'s `run_args` previously filtered env to `EnvValue::Literal` and silently discarded anything else; both now match `EnvValue` EXHAUSTIVELY and `bail!` on `FromSecret` / `FromMesh`, reusing `microvm.rs`'s existing wording so the sites are recognisably one decision rather than two. A workload that would previously have started quietly missing a credential — surfacing much later as a confusing runtime error inside the workload — now fails loudly at admission. The other four refusal sites (server.rs:2507/:2609, containerd.rs:1236, microvm.rs:772) were confirmed by grep to be untouched and still bailing as before; `validate_spec_for_constable` itself was not modified. DISCOVERED WORK, done in this pass: a stale `@yah:cleanup` note in `native.rs` described this exact bug as unfixed and was retired, since leaving it would have sent the next reader looking for a defect that no longer exists.")
+//! @yah:verify("COUNTS, against a baseline measured properly after a false start the courier caught and corrected itself. `cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji --features native-integration,docker-integration --lib` = **220 passed / 0 failed**, against a true pre-edit baseline of **214 passed / 0 failed**. +6 = exactly the six added tests, three per backend: the refusal itself, and — the half that catches a lazy fix — a literals-only spec still passing unchanged, so the change cannot have been implemented as a blanket rejection. Neither run was flagged by the build-input skew guard. PROCESS NOTE WORTH KEEPING: the courier began editing before taking a baseline, noticed, and recovered correctly — it reverted its OWN hunks with Edit (never `git checkout`/`restore`/`reset`, which on this shared tree would have taken peers' uncommitted work with them), measured, then reapplied. It then discovered its first baseline was meaningless because the default `--lib` invocation does not compile either file (see the gotcha), reverted a second time, and re-measured under the correct feature flags. Both numbers above come from that second, correct measurement.")
+//! @yah:gotcha("WHY THIS BUG SURVIVED, AND THE TRAP FOR THE NEXT PERSON TESTING THESE FILES: **`native.rs` and `docker.rs` are behind feature flags and are NOT compiled by the default test run.** `cargo test -p kamaji --lib` never builds them — `native.rs` needs `--features native-integration` and `docker.rs` needs `--features docker-integration`. So the silent-drop was invisible to the default suite for as long as it existed, and a future change to either file will likewise go unexercised unless the features are passed. The command that actually covers them is `cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji --features native-integration,docker-integration --lib`. A green default `--lib` run says nothing about these two backends.")
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -121,16 +213,17 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
-use workload_spec::{BackoffPolicy, EnvValue, MeshIdent, RestartPolicy, WorkloadSpec};
+use workload_spec::{EnvValue, MeshIdent, WorkloadSpec};
 
+use crate::supervise::{supervise, Completion, Ctrl, Exit, Supervised};
 use crate::{
     Backend, DeployResult, Kamaji, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
     RuntimeHealth, WorkloadState, WorkloadStatus,
@@ -145,29 +238,6 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 /// the old process before the new one has asked for its fds would drop the
 /// listener. Short — the replacement connects as soon as its runtime is up.
 const UPGRADE_SETTLE: Duration = Duration::from_millis(750);
-
-/// Fixed delay before an unconditional (`RestartPolicy::Always`) respawn, so a
-/// binary that exits immediately can't spin the supervisor into a hot loop.
-const ALWAYS_RESTART_DELAY: Duration = Duration::from_secs(1);
-
-/// Control messages from the `NativeRuntime` trait methods to a workload's
-/// supervisor task. The supervisor owns the live `Child`; every lifecycle
-/// operation that touches the process is expressed as one of these so there is
-/// a single owner of the child (the loop that also drives restarts).
-enum Ctrl {
-    /// Stop the child and end supervision (no further restarts).
-    Teardown(oneshot::Sender<()>),
-    /// Stop the current child and immediately re-exec from the retained spec.
-    /// Acks with the new pid (or the spawn error).
-    Restart(oneshot::Sender<Result<u32>>),
-    /// Adopt a pre-spawned replacement as the supervised child (graceful
-    /// upgrade). The supervisor drains + reaps the outgoing process in the
-    /// background (SIGQUIT → grace → SIGKILL).
-    Adopt {
-        replacement: SpawnedChild,
-        ack: oneshot::Sender<()>,
-    },
-}
 
 /// A freshly fork+exec'd child plus the bookkeeping the supervisor and the
 /// registry need to reason about it.
@@ -203,13 +273,18 @@ struct WorkloadHandle {
     ports: std::collections::BTreeMap<String, u16>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    /// This deploy's cgroup pair — workload node plus generation leaf (R885-B1,
+    /// R885-B4) — or `None` on a host with no delegated subtree. Held so a
+    /// graceful upgrade's replacement joins the same ceiling, and so teardown
+    /// can kill and remove the whole workload after the child is reaped.
+    cgroup: Option<crate::cgroup::CgroupHandle>,
     /// The pid of the currently-running child, or `0` when no child is running
     /// (parked between a terminal exit and a control message).
     pid: Arc<AtomicU32>,
     /// Latest lifecycle status, published by the supervisor.
     status: watch::Receiver<WorkloadStatus>,
     /// Control channel to the supervisor task.
-    ctrl: mpsc::Sender<Ctrl>,
+    ctrl: mpsc::Sender<Ctrl<SpawnedChild>>,
     /// The supervisor task; detached on drop.
     #[allow(dead_code)]
     task: JoinHandle<()>,
@@ -230,18 +305,61 @@ pub struct NativeRuntime {
     /// one ledger per state dir is what stops this backend and the bundle
     /// backend handing the same number to two workloads on one node.
     ports: crate::ports::LedgerPorts,
+    /// The cgroup subtree systemd delegated to kamaji, when this host has one
+    /// (R885-B1). `None` on macOS, on a cgroup-v1 host, inside a cgroup
+    /// namespace, or wherever the root is not ours to write — every one of which
+    /// means "fork as before, unbounded".
+    cgroup: Option<crate::cgroup::CgroupV2>,
+    /// This node's local `yah-scryer` ingestion socket, when one is configured
+    /// (R893-B17). A native child shares the host's mount namespace, so the
+    /// host path *is* the child's path — [`crate::observe::MountNs::Host`].
+    /// [`Collector::disabled`](crate::observe::Collector::disabled) is the
+    /// default and injects nothing, exactly as this backend did before.
+    collector: crate::observe::Collector,
 }
 
 impl NativeRuntime {
     /// `state_dir` holds per-workload log captures and the port ledger; created
     /// on demand.
+    ///
+    /// Resolving the cgroup root happens here rather than at first deploy so the
+    /// `warn!` for a host that cannot confine workloads lands at startup, next
+    /// to the other backend-availability lines an operator reads, instead of
+    /// inside the first deploy that silently ran without a ceiling.
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         let state_dir = state_dir.into();
         Self {
             ports: crate::ports::LedgerPorts::open(&state_dir),
-            state_dir,
             workloads: Mutex::new(HashMap::new()),
+            cgroup: resolve_cgroup_root("native", &state_dir),
+            collector: crate::observe::Collector::disabled(),
+            state_dir,
         }
+    }
+
+    /// Point this backend's workloads at the node's local collector
+    /// (R893-B17). Without it every native workload keeps `YAH_SERVICE_IDENT` /
+    /// `YAH_SCRYER_SOCKET` unset and therefore emits neither logs nor spans,
+    /// which is what every node did before that ticket.
+    pub fn with_collector(mut self, collector: crate::observe::Collector) -> Self {
+        self.collector = collector;
+        self
+    }
+
+    /// Same as [`NativeRuntime::new`], but with the cgroup root pointed at an
+    /// explicit directory instead of resolved from `/proc/self/cgroup`.
+    ///
+    /// Test-only, and the reason it exists is R885-B1's own gotcha: R406-T4/T5
+    /// sat in review for two months with green tests because their tests
+    /// exercised the driver directly and nothing exercised the *call site*.
+    /// Pointing the real deploy path at a tempdir is what lets a test assert
+    /// that `deploy_workload` mints a leaf and `teardown_workload` reaps it, on
+    /// every platform rather than only on a Linux node.
+    #[cfg(test)]
+    fn with_cgroup_root(state_dir: impl Into<PathBuf>, cgroup_root: impl Into<PathBuf>) -> Self {
+        let mut rt = Self::new(state_dir);
+        rt.cgroup = Some(crate::cgroup::CgroupV2::new(cgroup_root));
+        rt
     }
 
     /// Where this runtime stages native workloads — the directory kamaji was
@@ -254,6 +372,28 @@ impl NativeRuntime {
     /// and the exercised one from drifting.
     pub fn exec_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Sample a **running** workload's cgroup counters (R885-F3).
+    ///
+    /// The exit-time reading in [`Supervised::settle`] answers "how did this run
+    /// end?"; this answers "how is this run going?", which is the question a
+    /// capacity decision needs and which an exit-time reading can never answer
+    /// for a workload that has not exited. Same counters, same
+    /// not-measured-is-not-zero semantics — see
+    /// [`crate::cgroup::CgroupHandle::read_stats`].
+    ///
+    /// `None` means there is no such workload **or** this host has no delegated
+    /// subtree, which are the same answer to a caller: no measurement is
+    /// available. A workload that exists on a cgroup-capable host returns
+    /// `Some`, whose fields then say individually what was readable.
+    pub async fn workload_telemetry(
+        &self,
+        ident: &MeshIdent,
+    ) -> Option<crate::cgroup::CgroupStats> {
+        let map = self.workloads.lock().await;
+        let cgroup = map.get(&ident.0)?.cgroup.as_ref()?;
+        Some(cgroup.read_stats())
     }
 
     /// Give a number to every port the spec names but does not number
@@ -336,6 +476,86 @@ impl NativeRuntime {
     }
 }
 
+/// Find the cgroup subtree kamaji owns, and enable the controllers on it.
+///
+/// Returns `None` for every "this host cannot confine native workloads" case,
+/// after saying which one it was. Refusing to start workloads instead would
+/// trade an unbounded headscale for no headscale at all, which is the worse
+/// failure — the mesh coordinator is itself a native workload.
+///
+/// `backend` names the caller in every line this logs (`"native"` here,
+/// `"jit"` from [`crate::jit`], R885-B10) because the resolution is per-runtime
+/// and an operator reading a journal has to know *which* fork path a warning
+/// left unconfined. It is a format argument rather than a field so the sentence
+/// an operator greps for — `native backend: confining workloads to cgroup
+/// leaves under the delegated root` — is byte-identical to what R885-B1
+/// shipped and what that ticket's gotcha tells people to look for.
+///
+/// `state_dir` disambiguates *which instance of that backend* is speaking, and
+/// it is load-bearing rather than decorative (R885-B12). `backend` alone is not
+/// unique: a fleet node runs a `--native-exec-dir` [`NativeRuntime`] **and** a
+/// second one inside `BundleBackend`, so `native backend: …` appears twice in
+/// one startup with nothing to tell the two apart — which is exactly how
+/// R885-B12 came to be filed as a suspected double-construction bug. The state
+/// dir *is* each runtime's identity (it owns that runtime's port ledger and log
+/// captures), so two lines sharing one is the real defect worth seeing.
+///
+/// Called once per runtime at startup. [`crate::cgroup::CgroupV2::ensure_root`]
+/// is idempotent, so two runtimes resolving the same delegated root is a second
+/// no-op write to `cgroup.subtree_control`, not a conflict — neither can undo
+/// the other's confinement.
+pub(crate) fn resolve_cgroup_root(
+    backend: &str,
+    state_dir: &Path,
+) -> Option<crate::cgroup::CgroupV2> {
+    let state_dir = state_dir.display();
+    let Some(mut cg) = crate::cgroup::CgroupV2::delegated() else {
+        tracing::warn!(
+            state_dir = %state_dir,
+            "{backend} backend: no delegated cgroup v2 subtree (not Linux, cgroup v1, or a cgroup \
+             namespace) — workloads will run WITHOUT a memory or cpu ceiling"
+        );
+        return None;
+    };
+    if let Err(e) = cg.ensure_root() {
+        // The load-bearing failure here is EBUSY: a root that holds processes
+        // cannot enable controllers for its children (cgroup v2's
+        // no-internal-process rule), which is what happens when kamaji is not
+        // running under `DelegateSubgroup=`.
+        tracing::warn!(
+            root = %cg.root().display(),
+            state_dir = %state_dir,
+            error = %e,
+            "{backend} backend: cannot enable cpu+memory on the delegated cgroup root — workloads \
+             will run WITHOUT a memory or cpu ceiling"
+        );
+        return None;
+    }
+    tracing::info!(
+        root = %cg.root().display(),
+        state_dir = %state_dir,
+        "{backend} backend: confining workloads to cgroup leaves under the delegated root"
+    );
+    // R885-T2: `pids` is best-effort (see cgroup.rs "PIDs: best-effort, not
+    // required") and must not share the branch above — a host that hasn't
+    // delegated `pids` yet still gets the cpu+memory enforcement just logged.
+    if cg.pids_available() {
+        tracing::info!(
+            root = %cg.root().display(),
+            state_dir = %state_dir,
+            "{backend} backend: pids controller enabled — workloads get a pids.max ceiling"
+        );
+    } else {
+        tracing::warn!(
+            root = %cg.root().display(),
+            state_dir = %state_dir,
+            "{backend} backend: pids controller not delegated on this host — cpu+memory ceilings \
+             are enforced but pids.max is NOT; a fork bomb inside a workload is unbounded here"
+        );
+    }
+    Some(cg)
+}
+
 /// Resolve the argv from entrypoint + command (container semantics). Shared with
 /// the JIT lifecycle ([`crate::jit`]), which forks the same serve binaries.
 pub(crate) fn argv(spec: &WorkloadSpec) -> Result<Vec<String>> {
@@ -393,13 +613,34 @@ async fn materialize_files(spec: &WorkloadSpec) -> Result<()> {
 /// fork+exec one child from `spec`. `truncate_logs` truncates the capture files
 /// (initial deploy) vs. appends to them (respawns, so crash-loop history is
 /// preserved). `extra_env` layers on top of the spec env (used by graceful
-/// upgrade to set `PASSWAY_UPGRADE=true`).
+/// upgrade to set `PASSWAY_UPGRADE=true`). `cgroup` is the workload's leaf
+/// (R885-B1); `None` means this host has no delegated subtree and the child runs
+/// unbounded, exactly as every native workload did before R885-B1.
+///
+/// @yah:ticket(R918-F8, "Interactive-session bridge for native-exec — run a Windows job inside session 1, not session 0")
+/// @yah:at(2026-09-18T01:34:45Z)
+/// @yah:status(open)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:parent(R918)
+/// @yah:next("Tier: Warrior — tricky implementation with a clear spec, crossing the systemd/Win32 session boundary.")
+/// @yah:next("The gap: kamaji's native-exec is systemd-parented, so every job it runs on a Windows host inherits session 0 and the non-interactive window station. A session-0 process cannot enumerate session-1 windows at all (EnumWindows is window-station scoped), so anything needing a real window (a GUI test, a DAW, a plugin editor) is structurally impossible today, and fails in a way that looks like the target is broken rather than the observer being blind.")
+/// @yah:next("Measured, not theorised (noisetable R726-T10, 2026-09-17, on us-west-002). From an SSH-launched powershell.exe, (Get-Process -Id $PID).SessionId = 0, while explorer.exe is session 1. Same user both sides (gamer\\struc). An earlier ticket (noisetable R726-T8) recorded 'this box has no logged-in interactive Windows desktop session' on the strength of a blank MainWindowTitle -- that conclusion was wrong, and the reason it was wrong is the whole point of this ticket: the observer was in session 0.")
+/// @yah:next("The mechanism is already proven: register a scheduled task /IT against the logged-on user -- schtasks /create /tn <n> /tr C:\\Tools\\<w>.bat /sc once /st 00:00 /rl limited /ru <user> /it /f -- then schtasks /run /tn <n>. A probe launched that way reports session=1, UserInteractive=True. REAPER launched through it yielded a real hwnd and non-blank title (REAPER v7.80 - EVALUATION LICENSE), SetForegroundWindow returned True, and a synthesized {ENTER} demonstrably dismissed a modal dialog. GOTCHA: /tr must point at a .bat -- a quoted command line with arguments is rejected with 'ERROR: Invalid argument/option - -NoProfile'.")
+/// @yah:next("Recommended shape: a task-scoped bridge, NOT a resident agent. kamaji (or a thin Windows-side shim it invokes) hands an interactive job to session 1 via schtasks /IT, and returns a clean, typed 'no interactive session available' error when none exists. It needs a result channel back; a file under C:\\Tools read back across the WSL-interop boundary is what every probe used and is sufficient.")
+/// @yah:next("Why not a resident always-on agent -- this is the load-bearing design judgment, carry it verbatim. On us-west-002 session 1 is an RDP session (rdp-tcp#0). It dies on logoff and does not survive the box's normal sleep/reboot cycle; the machine file calls the box EPHEMERAL, BUILD-ONLY and 'not expected to be up, and its absence is never a fault to chase', and there is no Wake-on-LAN anywhere in the repo. A resident agent therefore dies with the box and cannot be woken -- most of its value gone. Making one genuinely always-on needs both an autologon console session and a wake path that does not exist. The task-scoped bridge degrades honestly and costs nothing while the box sleeps.")
+/// @yah:next("See also: .yah/docs/working/W192-spill-win32-native-view-layer.md section 4.5.1 in the noisetable repo records the full verdict and the reusable route (cross-repo pointer, not a resolvable @arch:see).")
+/// @yah:gotcha("external/yah/.yah/infra/machines/us-west-002.toml declares nothing Windows-side -- provider=static, arch=x86_64, os:linux called out as load-bearing, reach via [connect].ssh into WSL. If this bridge lands, that machine declaration probably needs a Windows-side capability to describe it.")
+/// @yah:gotcha("There is currently no yah on the box's PATH, no ~/.yah, and nothing yah-side on the Windows half at all. The only thing that speaks to Windows today is full-path cmd.exe / powershell.exe interop calls from the Linux side. Always pipe </dev/null into cmd.exe -- it drains the parent's stdin and silently truncates otherwise.")
+/// @yah:gotcha("Two Win11 traps that produce convincing false negatives in any window/keystroke probe, both hit during the research: Start-Process notepad returns a stub process with no MainWindowHandle, and cmd.exe via Start-Process gets hwnd=0 because of the conhost / Windows Terminal handoff. Neither is a session-station problem -- pick a probe target that owns its own top-level window.")
+/// @yah:gotcha("Left on us-west-002 and reusable: C:\\Tools\\yah_t10_launch.bat and a scheduled task yah_t10_reaper.")
 async fn spawn_child(
     state_dir: &Path,
     spec: &WorkloadSpec,
     mesh_ip: Ipv4Addr,
     extra_env: &[(&str, &str)],
     truncate_logs: bool,
+    cgroup: Option<&crate::cgroup::CgroupHandle>,
+    collector: &crate::observe::Collector,
 ) -> Result<SpawnedChild> {
     let ident = &spec.expose.mesh.identity;
     let argv = argv(spec)?;
@@ -467,11 +708,32 @@ async fn spawn_child(
     for (k, v) in crate::ports::port_env(&crate::declared_port_names(&spec.expose.mesh)) {
         cmd.env(k, v);
     }
+    // "Where is my local collector, and what am I called?" — R893-B17, the
+    // other half of the deploy-time contract. A native child is a host process
+    // in the host's mount namespace, so it gets the socket path verbatim.
+    for (k, v) in collector.env_for(spec, crate::observe::MountNs::Host) {
+        cmd.env(k, v);
+    }
     // Spec env layers OVER the inherited environment, so a workload can override
     // a node default without the node having to know about the workload.
     for e in &spec.env {
-        if let EnvValue::Literal { value } = &e.value {
-            cmd.env(&e.name, value);
+        match &e.value {
+            EnvValue::Literal { value } => {
+                cmd.env(&e.name, value);
+            }
+            EnvValue::FromSecret { secret, .. } => bail!(
+                "workload {}: env {} carries an unresolved FromSecret({secret}) — yubaba \
+                 must resolve before Deploy; the guest would run without it",
+                spec.name,
+                e.name
+            ),
+            EnvValue::FromMesh { ident, .. } => bail!(
+                "workload {}: env {} carries an unresolved FromMesh({}) — yubaba must \
+                 resolve before Deploy; the guest would run without it",
+                spec.name,
+                e.name,
+                ident.0
+            ),
         }
     }
     // Layered last so a graceful upgrade's PASSWAY_UPGRADE=true wins over any
@@ -479,6 +741,55 @@ async fn spawn_child(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+
+    // R885-B1 — the boundary. The child writes its OWN pid into the leaf's
+    // `cgroup.procs` in the post-fork/pre-exec window, so by the time `execvpe`
+    // hands control to the workload binary the process is already inside its
+    // memory and cpu ceiling. There is no window at all, which is why this needs
+    // no sync pipe: the only thing between fork and the write is that closure.
+    //
+    // The hook itself lives on `CgroupHandle` (R885-B10 moved it there when the
+    // JIT fork path needed the same one); see `CgroupHandle::attach_at_exec` for
+    // why it is a self-attach rather than a parent-attach.
+    #[cfg(target_os = "linux")]
+    if let Some(handle) = cgroup {
+        handle.attach_at_exec(cmd.as_std_mut()).with_context(|| {
+            format!(
+                "installing the cgroup self-attach hook for workload {}",
+                spec.name
+            )
+        })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cgroup;
+
+    // R885-B11 — the THIRD boundary: what the child may write. Registered after
+    // the cgroup attach (which writes `cgroup.procs`, a path no ruleset grants)
+    // and before the capability drop, which is the order kamaji-bin's
+    // `pre_exec_in_child` used. Applies only to a workload whose spec describes
+    // its writes — see `sandbox::writable_roots` for that rule — and degrades to
+    // an unconfined spawn with a warning on a kernel without landlock.
+    #[cfg(target_os = "linux")]
+    crate::sandbox::confine_fs_at_exec(spec, &dir, cmd.as_std_mut()).with_context(|| {
+        format!(
+            "installing the filesystem-confinement hook for workload {}",
+            spec.name
+        )
+    })?;
+
+    // R885-B9 — the OTHER boundary, and W344's point that the two are separate
+    // axes: a `memory.max` never took CAP_SYS_ADMIN away from anything. Native
+    // workloads are a plain fork+exec, so until this hook they ran with kamaji's
+    // entire ambient set (measured: byte-identical, 0x2c14e0). Registered AFTER
+    // the cgroup attach because `std` runs pre_exec closures in registration
+    // order and the attach needs the write access this drop removes.
+    #[cfg(target_os = "linux")]
+    crate::sandbox::drop_caps_at_exec(spec, cmd.as_std_mut()).with_context(|| {
+        format!(
+            "installing the capability-drop hook for workload {}",
+            spec.name
+        )
+    })?;
 
     let child = cmd
         .spawn()
@@ -534,302 +845,273 @@ fn drain_reaper(mut old: SpawnedChild) {
     });
 }
 
-/// Exponential backoff delay for the `attempt`-th consecutive `OnFailure`
-/// restart (1-based): `initial_ms * multiplier^(attempt-1)`, capped at `max_ms`.
-fn backoff_delay(b: &BackoffPolicy, attempt: u32) -> Duration {
-    let factor = (b.multiplier as f64).powi(attempt.saturating_sub(1) as i32);
-    let ms = (b.initial_ms as f64 * factor).min(b.max_ms as f64);
-    Duration::from_millis(ms as u64)
+/// The signal that killed a child, if one did.
+///
+/// `ExitStatus::code()` is `None` for a signalled process and says nothing about
+/// which signal, so the OOM classification cannot be built on it. Unix-only by
+/// nature; a non-unix build has no signals to report and classifies on the exit
+/// code alone.
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
-/// Outcome of the running-phase select: the child exited, or a control message
-/// arrived (`None` = the control channel closed, i.e. the runtime was dropped).
-enum Ev {
-    Exited(std::io::Result<std::process::ExitStatus>),
-    Ctrl(Option<Ctrl>),
+/// Render a leaf's counters for a log line / status reason. Absent counters are
+/// **omitted**, never printed as `0` — see [`crate::cgroup::CgroupHandle::read_stats`]
+/// for why "not measured" and "measured zero" must not collapse. An entirely
+/// unmeasured leaf renders as the empty string, so the caller's message reads
+/// the same as it did before this ticket on a host with no cgroup subtree.
+pub(crate) fn format_stats(stats: &crate::cgroup::CgroupStats) -> String {
+    let mut parts = Vec::new();
+    if let Some(peak) = stats.memory_peak_bytes {
+        parts.push(format!("memory.peak={peak}B"));
+    }
+    if let Some(oom) = stats.oom_kill {
+        parts.push(format!("oom_kill={oom}"));
+    }
+    if let Some(group) = stats.oom_group_kill {
+        parts.push(format!("oom_group_kill={group}"));
+    }
+    if let Some(throttled) = stats.cpu_nr_throttled {
+        // Periods rides along only when there was throttling to put in context.
+        match (throttled, stats.cpu_nr_periods) {
+            (0, _) => parts.push("cpu.nr_throttled=0".to_string()),
+            (n, Some(periods)) => parts.push(format!("cpu.nr_throttled={n}/{periods}")),
+            (n, None) => parts.push(format!("cpu.nr_throttled={n}")),
+        }
+    }
+    if let Some(usec) = stats.cpu_throttled_usec {
+        parts.push(format!("cpu.throttled_usec={usec}"));
+    }
+    if let Some(pids) = stats.pids_current {
+        parts.push(format!("pids.current={pids}"));
+    }
+    parts.join(" ")
 }
 
-/// Parked phase: no child is running (a terminal exit, or a respawn that failed
-/// to fork). Wait for a control message that either revives the workload
-/// (`Restart`/`Adopt`) or ends supervision (`Teardown` / channel closed).
-async fn park(
-    ctrl_rx: &mut mpsc::Receiver<Ctrl>,
-    state_dir: &Path,
-    spec: &WorkloadSpec,
-    mesh_ip: Ipv4Addr,
-    pid: &Arc<AtomicU32>,
-    status_tx: &watch::Sender<WorkloadStatus>,
-) -> Option<SpawnedChild> {
-    loop {
-        match ctrl_rx.recv().await {
-            None => return None,
-            Some(Ctrl::Teardown(ack)) => {
-                let _ = status_tx.send(WorkloadStatus::Stopped);
-                let _ = ack.send(());
-                return None;
-            }
-            Some(Ctrl::Adopt { replacement, ack }) => {
-                pid.store(replacement.pid, Ordering::SeqCst);
-                let _ = status_tx.send(WorkloadStatus::Running);
-                let _ = ack.send(());
-                return Some(replacement);
-            }
-            Some(Ctrl::Restart(ack)) => {
-                match spawn_child(state_dir, spec, mesh_ip, &[], false).await {
-                    Ok(new) => {
-                        let p = new.pid;
-                        pid.store(p, Ordering::SeqCst);
-                        let _ = status_tx.send(WorkloadStatus::Running);
-                        let _ = ack.send(Ok(p));
-                        return Some(new);
-                    }
-                    Err(e) => {
-                        let _ = status_tx.send(WorkloadStatus::Failed {
-                            reason: format!("restart respawn failed: {e}"),
-                        });
-                        let _ = ack.send(Err(e));
-                        // stay parked, wait for the next control message
-                    }
-                }
-            }
+/// The sentence that goes into [`WorkloadStatus::Failed`]'s `reason`.
+///
+/// `reason` is node-local: it does **not** reach yubaba, because the postcard
+/// `WorkloadState` this flattens into (`kamaji-bin`'s `runtime_state_to_entry`)
+/// is a fieldless enum with nowhere to carry it. That is R885-F3's deliberate
+/// stopping point rather than an oversight — see this module's ticket block and
+/// R885-T6, which carries the wire delta. Naming the OOM here and in the log
+/// line is what collapses the R590-B10 diagnosis; the upward report is the
+/// version bump's job.
+fn describe_exit(
+    class: crate::cgroup::ExitClass,
+    status: &std::process::ExitStatus,
+    stats: &crate::cgroup::CgroupStats,
+) -> String {
+    use crate::cgroup::ExitClass;
+    let detail = format_stats(stats);
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" [{detail}]")
+    };
+    match class {
+        ExitClass::OomKilled { signal } => format!(
+            "OOM-killed by the kernel (signal {signal}); the workload exceeded its memory.max{detail}"
+        ),
+        ExitClass::ExitedUnderOom { exit_code } => format!(
+            "exited with code {exit_code} after a descendant was OOM-killed against its memory.max{detail}"
+        ),
+        ExitClass::Signaled { .. } | ExitClass::Exited { .. } => {
+            format!("exited with {status}{detail}")
         }
     }
 }
 
-/// Per-workload supervisor: owns the live child, re-execs it per the retained
-/// spec's [`RestartPolicy`], and serves control messages (teardown, in-place
-/// restart, graceful-upgrade adopt). Exits when torn down or when the control
-/// channel closes.
-async fn supervise(
+/// Publish one run's cgroup telemetry to the node's journal (R885-F3).
+///
+/// `warn!` for an OOM and `debug!` otherwise, on the same reasoning R605-F31's
+/// microVM terminal-status line settled: an ordinary exit is this backend's
+/// routine business and a crash loop must not flood the journal, but an OOM is
+/// a *capacity* fact an operator needs named at the node, and it is the only
+/// place it is named at all until the wire carries it.
+fn log_exit_telemetry(
+    workload: &str,
+    class: crate::cgroup::ExitClass,
+    stats: &crate::cgroup::CgroupStats,
+) {
+    use crate::cgroup::ExitClass;
+    let detail = format_stats(stats);
+    match class {
+        ExitClass::OomKilled { signal } => tracing::warn!(
+            workload = %workload,
+            signal,
+            cgroup = %detail,
+            "native backend: workload was OOM-killed — it exceeded its memory.max, not an ordinary crash (R885-F3)"
+        ),
+        ExitClass::ExitedUnderOom { exit_code } => tracing::warn!(
+            workload = %workload,
+            exit_code,
+            cgroup = %detail,
+            "native backend: a descendant of this workload was OOM-killed against its memory.max (R885-F3)"
+        ),
+        ExitClass::Signaled { signal } => tracing::debug!(
+            workload = %workload,
+            signal,
+            cgroup = %detail,
+            "native backend: workload was signalled; no OOM kill recorded against its cgroup"
+        ),
+        ExitClass::Exited { exit_code } => tracing::debug!(
+            workload = %workload,
+            exit_code,
+            cgroup = %detail,
+            "native backend: workload exited"
+        ),
+    }
+}
+
+/// Everything [`crate::supervise::supervise`] needs to re-exec this workload's
+/// child, and nothing else.
+///
+/// The retained [`WorkloadSpec`] is the load-bearing field (R591-F1): a respawn
+/// re-execs from the spec that was deployed, so a crash-looping workload keeps
+/// running the argv, env and config files it was admitted with rather than
+/// whatever the caller happens to still hold.
+struct NativeProcess {
     state_dir: PathBuf,
     spec: WorkloadSpec,
     mesh_ip: Ipv4Addr,
-    initial: SpawnedChild,
-    pid: Arc<AtomicU32>,
-    status_tx: watch::Sender<WorkloadStatus>,
-    mut ctrl_rx: mpsc::Receiver<Ctrl>,
-) {
-    let mut sc = initial;
-    // Consecutive failed exits, for OnFailure's max_attempts/backoff. Reset on a
-    // clean exit, an in-place restart, or an adopt.
-    let mut failure_streak: u32 = 0;
-    // Total re-execs, for the Restarting status payload.
-    let mut restart_count: u32 = 0;
+    /// The workload's cgroup leaf (R885-B1), retained for the same reason the
+    /// spec is: a respawn must land in the same ceiling the first run had, and
+    /// the leaf outlives any individual child.
+    cgroup: Option<crate::cgroup::CgroupHandle>,
+    /// Retained for the same reason the spec is (R893-B17): a respawn must see
+    /// the same collector the first run did, or a crash-looping workload would
+    /// stop reporting the very restarts an operator is trying to read.
+    collector: crate::observe::Collector,
+    /// `memory.events`' `oom_kill` as of the last settled exit (R885-F3).
+    ///
+    /// The counter is cumulative over the **workload node's** life and the node
+    /// outlives every restart — and, since R885-B4, every generation, which is
+    /// why that ticket's deeper hierarchy did not retire this field the way it
+    /// might look like it should. It stays nonzero forever after the first
+    /// OOM (the counters are hierarchical, so the node's reading already
+    /// includes every generation beneath it). Testing
+    /// it for nonzero would therefore relabel every subsequent crash of a
+    /// workload that OOMed once — the false-positive direction, and the one that
+    /// matters, because a wrong "OOM" sends an operator to raise a ceiling that
+    /// was never the problem. [`Supervised::settle`] diffs against this and then
+    /// stores the new total, so what reaches [`crate::cgroup::classify_exit`] is
+    /// always "OOM kills during *this* run".
+    ///
+    /// `0` is the right initial value: `deploy_workload` tears the predecessor
+    /// down and `mkdir`s a fresh node immediately before the first child, so
+    /// there is no prior history to miss.
+    oom_kills_settled: std::sync::atomic::AtomicU64,
+}
 
-    loop {
-        // ── RUNNING: own `sc`; wait for it to exit or a control message. The
-        //    two futures borrow disjoint locals (`sc.child` / `ctrl_rx`) and are
-        //    dropped before the handler runs, so the handler can move `sc`.
-        let ev = tokio::select! {
-            r = sc.child.wait() => Ev::Exited(r),
-            c = ctrl_rx.recv() => Ev::Ctrl(c),
+#[async_trait]
+impl Supervised for NativeProcess {
+    type Instance = SpawnedChild;
+
+    fn pid(&self, inst: &SpawnedChild) -> u32 {
+        inst.pid
+    }
+
+    async fn wait(&self, inst: &mut SpawnedChild) -> Exit {
+        inst.child.wait().await
+    }
+
+    /// Respawns **append** to the capture files rather than truncating them, so
+    /// a crash loop's history survives the loop that produced it.
+    async fn start(&self) -> Result<SpawnedChild> {
+        spawn_child(
+            &self.state_dir,
+            &self.spec,
+            self.mesh_ip,
+            &[],
+            false,
+            self.cgroup.as_ref(),
+            &self.collector,
+        )
+        .await
+    }
+
+    async fn stop(&self, inst: &mut SpawnedChild) {
+        stop_child(&mut inst.child, inst.pid).await
+    }
+
+    /// A host process's exit status is **almost** the whole story — there is no
+    /// second channel the way the microVM backend has one, but since R885-B1 put
+    /// a real `memory.max` on the live path there is a second *reading*, and
+    /// R885-F3 takes it here.
+    ///
+    /// An exit status of `Signaled(SIGKILL)` is what an OOM kill, an operator's
+    /// `kill -9` and this supervisor's own escalation after [`TERM_GRACE`] all
+    /// look like; `memory.events`' `oom_kill` is the only thing that separates
+    /// them, and until this ticket nothing read it. R590-B10 is the standing
+    /// scar — a forge workload SIGKILLed against a 256 MB ceiling, diagnosed by
+    /// disk forensics and stopgapped by raising the ceiling to 32 GiB.
+    ///
+    /// **This is the right place for the read and there is not a second one.**
+    /// The counters live in the leaf, the leaf is `rmdir`ed by
+    /// [`NativeRuntime::teardown_workload`], and `settle` runs inside the
+    /// supervisor task the instant [`Supervised::wait`] returns — before the
+    /// teardown that would remove them can be acknowledged. Reading any later
+    /// races the `rmdir` and loses the evidence exactly when a workload is dying.
+    async fn settle(&self, exit: Exit) -> Completion {
+        let exit_code = match &exit {
+            Ok(s) => s.code().unwrap_or(-1),
+            Err(_) => -1,
+        };
+        let succeeded = matches!(&exit, Ok(s) if s.success());
+        let signal = match &exit {
+            Ok(s) => exit_signal(s),
+            Err(_) => None,
         };
 
-        match ev {
-            // Control channel closed — the runtime was dropped. Stop and exit.
-            Ev::Ctrl(None) => {
-                stop_child(&mut sc.child, sc.pid).await;
-                return;
-            }
-            Ev::Ctrl(Some(Ctrl::Teardown(ack))) => {
-                stop_child(&mut sc.child, sc.pid).await;
-                pid.store(0, Ordering::SeqCst);
-                let _ = status_tx.send(WorkloadStatus::Stopped);
-                let _ = ack.send(());
-                return;
-            }
-            Ev::Ctrl(Some(Ctrl::Restart(ack))) => {
-                stop_child(&mut sc.child, sc.pid).await;
-                pid.store(0, Ordering::SeqCst);
-                match spawn_child(&state_dir, &spec, mesh_ip, &[], false).await {
-                    Ok(new) => {
-                        restart_count += 1;
-                        failure_streak = 0;
-                        let p = new.pid;
-                        pid.store(p, Ordering::SeqCst);
-                        let _ = status_tx.send(WorkloadStatus::Running);
-                        sc = new;
-                        let _ = ack.send(Ok(p));
-                    }
-                    Err(e) => {
-                        let _ = status_tx.send(WorkloadStatus::Failed {
-                            reason: format!("restart respawn failed: {e}"),
-                        });
-                        let _ = ack.send(Err(e));
-                        match park(&mut ctrl_rx, &state_dir, &spec, mesh_ip, &pid, &status_tx).await
-                        {
-                            Some(new) => {
-                                restart_count += 1;
-                                failure_streak = 0;
-                                sc = new;
-                            }
-                            None => return,
-                        }
-                    }
+        let stats = self
+            .cgroup
+            .as_ref()
+            .map(|cg| cg.read_stats())
+            .unwrap_or_default();
+        // Diff, don't test for nonzero — see `oom_kills_settled`. `None` leaves
+        // the baseline untouched: an unreadable counter is not evidence that the
+        // leaf's history restarted.
+        let oom_kills_this_run = stats.oom_kill.map(|total| {
+            let previous = self
+                .oom_kills_settled
+                .swap(total, std::sync::atomic::Ordering::SeqCst);
+            total.saturating_sub(previous)
+        });
+        let class = crate::cgroup::classify_exit(signal, exit_code, oom_kills_this_run);
+
+        log_exit_telemetry(&self.spec.expose.mesh.identity.0, class, &stats);
+
+        Completion {
+            succeeded,
+            exit_code,
+            terminal: if succeeded {
+                WorkloadStatus::Stopped
+            } else {
+                WorkloadStatus::Failed {
+                    reason: match &exit {
+                        Ok(s) => format!("{} (no restart)", describe_exit(class, s, &stats)),
+                        Err(e) => format!("wait failed: {e}"),
+                    },
+                    // The one place in the tree that can answer this — the
+                    // counters live in the leaf and `settle` is the only read
+                    // that beats the teardown's rmdir. R885-T6 carries it from
+                    // here to `WorkloadState::OomKilled` on the wire.
+                    oom_killed: class.is_oom(),
                 }
-            }
-            Ev::Ctrl(Some(Ctrl::Adopt { replacement, ack })) => {
-                // Graceful upgrade: the caller already spawned + settled the
-                // replacement. Drain+reap the outgoing process and adopt the new
-                // one; the main loop now supervises the replacement.
-                drain_reaper(sc);
-                restart_count += 1;
-                failure_streak = 0;
-                pid.store(replacement.pid, Ordering::SeqCst);
-                let _ = status_tx.send(WorkloadStatus::Running);
-                sc = replacement;
-                let _ = ack.send(());
-            }
-            Ev::Exited(res) => {
-                let exit_code = match &res {
-                    Ok(s) => s.code().unwrap_or(-1),
-                    Err(_) => -1,
-                };
-                let succeeded = matches!(&res, Ok(s) if s.success());
-                pid.store(0, Ordering::SeqCst);
-
-                let should_restart = match &spec.restart_policy {
-                    RestartPolicy::Always => true,
-                    RestartPolicy::Never => false,
-                    RestartPolicy::OnFailure { max_attempts, .. } => {
-                        !succeeded && failure_streak < *max_attempts
-                    }
-                };
-
-                if !should_restart {
-                    // Terminal: park until a control message arrives.
-                    let terminal = if succeeded {
-                        WorkloadStatus::Stopped
-                    } else {
-                        WorkloadStatus::Failed {
-                            reason: match &res {
-                                Ok(s) => format!("exited with {s} (no restart)"),
-                                Err(e) => format!("wait failed: {e}"),
-                            },
-                        }
-                    };
-                    let _ = status_tx.send(terminal);
-                    match park(&mut ctrl_rx, &state_dir, &spec, mesh_ip, &pid, &status_tx).await {
-                        Some(new) => {
-                            restart_count += 1;
-                            failure_streak = 0;
-                            sc = new;
-                            continue;
-                        }
-                        None => return,
-                    }
-                }
-
-                // Restarting: publish the rich status, back off, respawn.
-                restart_count += 1;
-                if !succeeded {
-                    failure_streak += 1;
-                }
-                let _ = status_tx.send(WorkloadStatus::Restarting {
-                    last_exit_code: exit_code,
-                    restart_count,
-                    last_finished_at_unix_ms: now_ms(),
-                });
-
-                let delay = match &spec.restart_policy {
-                    RestartPolicy::Always => ALWAYS_RESTART_DELAY,
-                    RestartPolicy::OnFailure { backoff, .. } => {
-                        backoff_delay(backoff, failure_streak)
-                    }
-                    // Unreachable: should_restart is false for Never.
-                    RestartPolicy::Never => Duration::ZERO,
-                };
-
-                // Interruptible backoff: a teardown (or a closed channel) during
-                // the wait wins instead of blocking for the whole delay.
-                let interrupted = tokio::select! {
-                    _ = tokio::time::sleep(delay) => None,
-                    c = ctrl_rx.recv() => Some(c),
-                };
-                match interrupted {
-                    None => {} // backoff elapsed → fall through to respawn
-                    Some(None) => return,
-                    Some(Some(Ctrl::Teardown(ack))) => {
-                        let _ = status_tx.send(WorkloadStatus::Stopped);
-                        let _ = ack.send(());
-                        return;
-                    }
-                    Some(Some(Ctrl::Adopt { replacement, ack })) => {
-                        failure_streak = 0;
-                        pid.store(replacement.pid, Ordering::SeqCst);
-                        let _ = status_tx.send(WorkloadStatus::Running);
-                        sc = replacement;
-                        let _ = ack.send(());
-                        continue;
-                    }
-                    Some(Some(Ctrl::Restart(ack))) => {
-                        match spawn_child(&state_dir, &spec, mesh_ip, &[], false).await {
-                            Ok(new) => {
-                                failure_streak = 0;
-                                let p = new.pid;
-                                pid.store(p, Ordering::SeqCst);
-                                let _ = status_tx.send(WorkloadStatus::Running);
-                                sc = new;
-                                let _ = ack.send(Ok(p));
-                                continue;
-                            }
-                            Err(e) => {
-                                let _ = status_tx.send(WorkloadStatus::Failed {
-                                    reason: format!("restart respawn failed: {e}"),
-                                });
-                                let _ = ack.send(Err(e));
-                                match park(
-                                    &mut ctrl_rx,
-                                    &state_dir,
-                                    &spec,
-                                    mesh_ip,
-                                    &pid,
-                                    &status_tx,
-                                )
-                                .await
-                                {
-                                    Some(new) => {
-                                        failure_streak = 0;
-                                        sc = new;
-                                        continue;
-                                    }
-                                    None => return,
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Backoff elapsed uninterrupted: respawn.
-                match spawn_child(&state_dir, &spec, mesh_ip, &[], false).await {
-                    Ok(new) => {
-                        pid.store(new.pid, Ordering::SeqCst);
-                        let _ = status_tx.send(WorkloadStatus::Running);
-                        sc = new;
-                    }
-                    Err(e) => {
-                        let _ = status_tx.send(WorkloadStatus::Failed {
-                            reason: format!("respawn failed: {e}"),
-                        });
-                        match park(&mut ctrl_rx, &state_dir, &spec, mesh_ip, &pid, &status_tx).await
-                        {
-                            Some(new) => {
-                                failure_streak = 0;
-                                sc = new;
-                            }
-                            None => return,
-                        }
-                    }
-                }
-            }
+            },
         }
+    }
+
+    fn discard(&self, replaced: SpawnedChild) {
+        drain_reaper(replaced)
     }
 }
 
@@ -873,10 +1155,33 @@ impl Kamaji for NativeRuntime {
         // Idempotent: clear any prior workload with the same identity.
         self.teardown_workload(&ident).await?;
 
+        // R885-B1: mint the cgroup leaf BEFORE the fork. A failure here fails
+        // the deploy rather than degrading to an unbounded fork — this runtime
+        // already decided at startup whether the host can confine anything
+        // (`self.cgroup`), so a failure at this point means the subtree it
+        // verified has gone wrong underneath us, which is worth surfacing.
+        let cgroup = self
+            .cgroup
+            .as_ref()
+            .map(|cg| {
+                cg.create_workload(&ident.0, &crate::cgroup::WorkloadLimits::from_spec(spec))
+            })
+            .transpose()
+            .with_context(|| format!("creating the cgroup leaf for workload {}", spec.name))?;
+
         // Spawn the first child synchronously so spawn errors (bad binary path,
         // empty argv) surface to the caller instead of failing in the
         // background supervisor.
-        let initial = spawn_child(&self.state_dir, spec, mesh.mesh_ip, &[], true).await?;
+        let initial = spawn_child(
+            &self.state_dir,
+            spec,
+            mesh.mesh_ip,
+            &[],
+            true,
+            cgroup.as_ref(),
+            &self.collector,
+        )
+        .await?;
         let start_pid = initial.pid;
         let stdout_path = initial.stdout_path.clone();
         let stderr_path = initial.stderr_path.clone();
@@ -885,9 +1190,16 @@ impl Kamaji for NativeRuntime {
         let (status_tx, status_rx) = watch::channel(WorkloadStatus::Running);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
         let task = tokio::spawn(supervise(
-            self.state_dir.clone(),
-            spec.clone(),
-            mesh.mesh_ip,
+            NativeProcess {
+                state_dir: self.state_dir.clone(),
+                spec: spec.clone(),
+                mesh_ip: mesh.mesh_ip,
+                cgroup: cgroup.clone(),
+                collector: self.collector.clone(),
+                // A freshly minted leaf has no OOM history — see the field doc.
+                oom_kills_settled: std::sync::atomic::AtomicU64::new(0),
+            },
+            spec.restart_policy.clone(),
             initial,
             Arc::clone(&pid),
             status_tx,
@@ -902,6 +1214,7 @@ impl Kamaji for NativeRuntime {
                 ports: crate::declared_port_names(&spec.expose.mesh),
                 stdout_path,
                 stderr_path,
+                cgroup,
                 pid,
                 status: status_rx,
                 ctrl: ctrl_tx,
@@ -913,6 +1226,7 @@ impl Kamaji for NativeRuntime {
             container_id: format!("native-{start_pid}"),
             mesh_ip: mesh.mesh_ip,
             task_pid: start_pid,
+            hydrate: None,
             ports: crate::declared_port_names(&spec.expose.mesh),
         })
     }
@@ -1023,6 +1337,25 @@ impl Kamaji for NativeRuntime {
             // workload is just a deploy.
             return self.deploy_workload(spec, mesh).await;
         };
+        // The replacement joins the LEAF THE OUTGOING GENERATION IS IN, not a
+        // fresh one: for the duration of the handoff both processes are alive
+        // and serving the same listener, so they are one workload and share one
+        // ceiling.
+        //
+        // R885-B4 made the ceiling a property of the workload NODE rather than
+        // of the leaf, so sharing the ceiling no longer requires sharing the
+        // directory — but this site still shares it, deliberately. Minting a
+        // generation here would leave `NativeProcess` holding a handle onto the
+        // leaf it no longer runs in, and `Supervised::start` respawns a crashed
+        // child into exactly that handle; the outgoing generation's directory
+        // would then be both destroyed and restarted into. Carrying a fresh
+        // handle through `Ctrl::Adopt` is what that needs, and neither defect
+        // B4 exists for requires it: the race is a redeploy's teardown against
+        // its own re-create, and a handoff `rmdir`s nothing.
+        let cgroup = {
+            let map = self.workloads.lock().await;
+            map.get(&ident.0).and_then(|h| h.cgroup.clone())
+        };
 
         // 1. Start the replacement in upgrade mode. It connects to the shared
         //    upgrade socket and receives the old process's listening fds instead
@@ -1033,6 +1366,8 @@ impl Kamaji for NativeRuntime {
             mesh.mesh_ip,
             &[("PASSWAY_UPGRADE", "true")],
             false,
+            cgroup.as_ref(),
+            &self.collector,
         )
         .await
         .context("spawning graceful-upgrade replacement")?;
@@ -1069,6 +1404,7 @@ impl Kamaji for NativeRuntime {
             container_id: format!("native-{new_pid}"),
             mesh_ip: mesh.mesh_ip,
             task_pid: new_pid,
+            hydrate: None,
             // A graceful upgrade is explicitly the *same* listener handed to a
             // new generation, so the resolved port is unchanged by construction.
             ports: crate::declared_port_names(&spec.expose.mesh),
@@ -1085,6 +1421,44 @@ impl Kamaji for NativeRuntime {
         // send fails the task already ended, so there's nothing left to stop.
         if handle.ctrl.send(Ctrl::Teardown(ack_tx)).await.is_ok() {
             let _ = ack_rx.await;
+        }
+        // The supervisor has stopped and reaped the child it owns. Anything the
+        // workload double-forked away is NOT reaped by that — it was reparented
+        // to init and is still sitting in the generation leaf. R885-B4's
+        // `destroy_workload` is what reaches it: `cgroup.kill` (or a freeze +
+        // `SIGKILL` sweep on a pre-5.14 kernel), then a bounded wait for the
+        // leaf to drain, then the final counter read, then the `rmdir`.
+        //
+        // A failure is still logged and stepped over rather than propagated —
+        // teardown's contract is idempotent success, and a leaked directory is
+        // strictly better than a teardown the caller reads as "the workload is
+        // still up". What changed is that reaching that branch now takes a
+        // process the kernel itself could not kill, rather than any ordinary
+        // double-fork.
+        if let (Some(cg), true) = (self.cgroup.as_ref(), handle.cgroup.is_some()) {
+            match cg.destroy_workload(&ident.0) {
+                Ok(outcome) if outcome.leaked.is_empty() => tracing::debug!(
+                    workload = %ident.0,
+                    generations = outcome.removed,
+                    kill = ?outcome.method,
+                    telemetry = %format_stats(&outcome.stats),
+                    "native backend: workload cgroup torn down"
+                ),
+                Ok(outcome) => tracing::warn!(
+                    workload = %ident.0,
+                    leaked = ?outcome.leaked,
+                    kill = ?outcome.method,
+                    telemetry = %format_stats(&outcome.stats),
+                    "native backend: a workload cgroup generation could not be emptied — it and \
+                     the ceiling above it are left in place so whatever survived stays bounded \
+                     (R885-B4)"
+                ),
+                Err(e) => tracing::warn!(
+                    workload = %ident.0,
+                    error = %e,
+                    "native backend: could not tear down the workload's cgroup (R885-B4)"
+                ),
+            }
         }
         Ok(())
     }
@@ -1104,12 +1478,11 @@ mod tests {
     use tokio_stream::StreamExt as _;
     use workload_spec::{
         BackoffPolicy, ExposeSpec, ImageRef, MeshExpose, Millis, NamespaceId, ResourceLimits,
-        RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag,
+        RestartPolicy, StopPolicy, TenantId, TierTag,
     };
 
     fn native_spec(name: &str, argv: Vec<String>) -> WorkloadSpec {
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
@@ -1131,7 +1504,10 @@ mod tests {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -1152,9 +1528,513 @@ mod tests {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: vec![],
         }
+    }
+
+    // ── R885-F3: the OOM classification, driven through the real `settle`
+    //    seam rather than through `classify_exit` alone. `cgroup.rs` owns the
+    //    pure truth table; these pin that the supervisor actually reads the
+    //    leaf, diffs the counter, and does not confuse the two kinds of kill.
+
+    /// Build the `NativeProcess` the supervisor task holds, pointed at a real
+    /// `CgroupHandle` over a tempdir leaf we can write counter files into.
+    fn settle_fixture(name: &str) -> (tempfile::TempDir, NativeProcess) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup_root = tmp.path().join("cgroup");
+        let cg = crate::cgroup::CgroupV2::new(&cgroup_root);
+        let handle = cg
+            .create_workload(
+                name,
+                &crate::cgroup::WorkloadLimits::from_request(&ResourceLimits {
+                    memory_mb: 256,
+                    cpu_millis: 500,
+                    memory_request_mb: None,
+                    cpu_limit_millis: None,
+                    pids_max: None,
+                    scratch_floor_mb: None,
+                }),
+            )
+            .unwrap();
+        let proc = NativeProcess {
+            state_dir: tmp.path().join("state"),
+            spec: native_spec(name, vec!["/bin/true".into()]),
+            mesh_ip: Ipv4Addr::new(100, 64, 0, 9),
+            cgroup: Some(handle),
+            collector: crate::observe::Collector::disabled(),
+            oom_kills_settled: std::sync::atomic::AtomicU64::new(0),
+        };
+        (tmp, proc)
+    }
+
+    fn write_oom_kill(proc: &NativeProcess, count: u64) {
+        // R885-B4: the counters are on the workload NODE, not the generation
+        // leaf — they are hierarchical, and the leaf carries no controller
+        // files at all. This is the one line in the F3 fixtures that moved.
+        let leaf = proc.cgroup.as_ref().unwrap().workload_path();
+        std::fs::write(
+            leaf.join("memory.events"),
+            format!("low 0\nhigh 0\nmax 9\noom 1\noom_kill {count}\noom_group_kill 0\n"),
+        )
+        .unwrap();
+    }
+
+    /// `wait4` status word for "killed by `signal`" — what an OOM kill and a
+    /// `kill -9` are equally indistinguishable as, before the counter is read.
+    #[cfg(unix)]
+    fn signalled(signal: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(signal)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_oom_killed_child_is_named_as_an_oom_at_the_settle_seam() {
+        let (_tmp, proc) = settle_fixture("hungry");
+        write_oom_kill(&proc, 1);
+
+        let done = proc.settle(Ok(signalled(9))).await;
+
+        assert!(!done.succeeded);
+        let WorkloadStatus::Failed { reason, .. } = done.terminal else {
+            panic!("a SIGKILLed child is a failure");
+        };
+        assert!(
+            reason.contains("OOM-killed"),
+            "the reason must name the OOM: {reason}"
+        );
+        assert!(
+            reason.contains("memory.max"),
+            "and point at what it exceeded: {reason}"
+        );
+    }
+
+    /// The false-positive direction, which is the one that bites: a `kill -9`
+    /// from an operator against a leaf that has never OOMed must not be dressed
+    /// up as a capacity problem.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plain_sigkill_is_not_misreported_as_an_oom() {
+        let (_tmp, proc) = settle_fixture("shot");
+        write_oom_kill(&proc, 0);
+
+        let done = proc.settle(Ok(signalled(9))).await;
+
+        let WorkloadStatus::Failed { reason, .. } = done.terminal else {
+            panic!("a SIGKILLed child is a failure");
+        };
+        assert!(
+            !reason.contains("OOM"),
+            "a measured-zero counter is not an OOM: {reason}"
+        );
+        assert!(
+            reason.contains("oom_kill=0"),
+            "but it is reported: {reason}"
+        );
+    }
+
+    /// A host with no delegated cgroup subtree reads nothing, and "we could not
+    /// tell" must classify as the plain signal the whole fleet saw before this
+    /// ticket — never as an invented OOM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unmeasurable_host_reports_a_plain_signal_not_an_oom() {
+        let (_tmp, mut proc) = settle_fixture("blind");
+        proc.cgroup = None;
+
+        let done = proc.settle(Ok(signalled(9))).await;
+
+        let WorkloadStatus::Failed { reason, .. } = done.terminal else {
+            panic!("a SIGKILLed child is a failure");
+        };
+        assert!(!reason.contains("OOM"), "no counter, no verdict: {reason}");
+        assert!(
+            !reason.contains("oom_kill"),
+            "and an unmeasured counter is not printed as 0: {reason}"
+        );
+    }
+
+    /// The reason the classifier takes a per-run **delta** and not the raw
+    /// counter: `oom_kill` is cumulative over the leaf's life and the leaf
+    /// outlives every restart, so a workload that OOMed once would otherwise
+    /// have every later crash relabelled as an OOM forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stale_oom_count_from_an_earlier_run_does_not_taint_a_later_kill() {
+        let (_tmp, proc) = settle_fixture("looper");
+
+        write_oom_kill(&proc, 1);
+        let first = proc.settle(Ok(signalled(9))).await;
+        let WorkloadStatus::Failed { reason: first, .. } = first.terminal else {
+            unreachable!()
+        };
+        assert!(
+            first.contains("OOM-killed"),
+            "run 1 really did OOM: {first}"
+        );
+
+        // Run 2: same leaf, counter unchanged — this kill was not an OOM.
+        let second = proc.settle(Ok(signalled(9))).await;
+        let WorkloadStatus::Failed { reason: second, .. } = second.terminal else {
+            unreachable!()
+        };
+        assert!(
+            !second.contains("OOM"),
+            "an unchanged counter is not a second OOM: {second}"
+        );
+
+        // Run 3: the counter advances again — and it is an OOM again.
+        write_oom_kill(&proc, 2);
+        let third = proc.settle(Ok(signalled(9))).await;
+        let WorkloadStatus::Failed { reason: third, .. } = third.terminal else {
+            unreachable!()
+        };
+        assert!(third.contains("OOM-killed"), "a fresh kill counts: {third}");
+    }
+
+    /// R590-B10's actual shape: the root process exited nonzero of its own
+    /// accord because a `rustc` beneath it was OOM-killed. Nothing was signalled,
+    /// so only the counter can see it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_descendant_oom_is_named_even_though_the_root_exited_normally() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (_tmp, proc) = settle_fixture("forge");
+        write_oom_kill(&proc, 1);
+
+        // Exit code 101 (cargo's), not a signal.
+        let done = proc
+            .settle(Ok(std::process::ExitStatus::from_raw(101 << 8)))
+            .await;
+
+        let WorkloadStatus::Failed { reason, .. } = done.terminal else {
+            panic!("a nonzero exit is a failure");
+        };
+        assert!(
+            reason.contains("descendant was OOM-killed"),
+            "the counter is the only witness: {reason}"
+        );
+    }
+
+    /// The rest of the telemetry rides the same read, and an absent counter is
+    /// omitted rather than printed as a measured zero.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn peak_throttling_and_pids_ride_the_same_read() {
+        let (_tmp, proc) = settle_fixture("noisy");
+        // R885-B4: the workload NODE carries the counters, not the generation
+        // leaf — see `write_oom_kill`.
+        let leaf = proc.cgroup.as_ref().unwrap().workload_path().to_path_buf();
+        write_oom_kill(&proc, 0);
+        std::fs::write(leaf.join("memory.peak"), "268435456\n").unwrap();
+        std::fs::write(
+            leaf.join("cpu.stat"),
+            "usage_usec 8000000\nnr_periods 400\nnr_throttled 37\nthrottled_usec 1250000\n",
+        )
+        .unwrap();
+        // pids.current deliberately absent — R885-T2's undelegated-pids host.
+
+        let done = proc.settle(Ok(signalled(9))).await;
+        let WorkloadStatus::Failed { reason, .. } = done.terminal else {
+            unreachable!()
+        };
+        assert!(reason.contains("memory.peak=268435456B"), "{reason}");
+        assert!(reason.contains("cpu.nr_throttled=37/400"), "{reason}");
+        assert!(reason.contains("cpu.throttled_usec=1250000"), "{reason}");
+        assert!(
+            !reason.contains("pids.current"),
+            "an absent counter is omitted, not zeroed: {reason}"
+        );
+    }
+
+    /// The live-workload half of the read path: counters for a workload that has
+    /// not exited, which the exit-time reading can never provide.
+    #[tokio::test]
+    async fn telemetry_is_readable_while_the_workload_is_still_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup_root = tmp.path().join("cgroup");
+        let rt = NativeRuntime::with_cgroup_root(tmp.path().join("state"), &cgroup_root);
+        let spec = native_spec("live", vec!["/bin/sleep".into(), "30".into()]);
+        let ident = spec.expose.mesh.identity.clone();
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        rt.deploy_workload(&spec, &mesh).await.unwrap();
+
+        std::fs::write(cgroup_root.join("live").join("pids.current"), "3\n").unwrap();
+
+        let stats = rt.workload_telemetry(&ident).await.expect("a live leaf");
+        assert_eq!(stats.pids_current, Some(3));
+        assert_eq!(stats.oom_kill, None, "nothing wrote memory.events here");
+
+        assert!(rt
+            .workload_telemetry(&MeshIdent("absent".into()))
+            .await
+            .is_none());
+        rt.teardown_workload(&ident).await.unwrap();
+    }
+
+    /// R885-B1 — THE CALL SITE, which is the whole point of that ticket.
+    ///
+    /// R406-T4 shipped a correct cgroup driver with passing tests that no
+    /// running binary could reach; this asserts the opposite property, that the
+    /// live `deploy_workload` path mints a per-workload leaf carrying the spec's
+    /// limits and that `teardown_workload` reaps it. Pointed at a tempdir, so it
+    /// runs on the camp Mac as well as on a node.
+    #[tokio::test]
+    async fn deploying_a_workload_mints_a_cgroup_leaf_carrying_its_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let runtime = NativeRuntime::with_cgroup_root(tmp.path().join("state"), &cgroup_root);
+
+        let spec = native_spec("native-cgroup", vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+
+        let leaf = cgroup_root.join("native-cgroup");
+        assert!(leaf.is_dir(), "deploy did not create {}", leaf.display());
+        // native_spec declares 64 MiB / 128 millicores.
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("memory.max")).unwrap(),
+            (64u64 * 1024 * 1024).to_string()
+        );
+        // R885-B5: 128m is a REQUEST, so it renders as a relative weight and
+        // NOT as a quota. This is the test that proves an ordinary workload
+        // stops being throttled — before B5 this leaf carried
+        // `cpu.max = 12800 100000`, capping it at 0.128 of a core on an idle
+        // node.
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("cpu.weight")).unwrap(),
+            "12"
+        );
+        assert!(
+            !leaf.join("cpu.max").exists(),
+            "a spec with no yah.limits.cpu-millis must leave cpu.max unwritten"
+        );
+        // R885-T2: `with_cgroup_root` never calls `ensure_root`, so `pids` was
+        // never (attempted to be) enabled here — this pins the call site's
+        // best-effort degrade the same way the assertion above pins cpu.max.
+        assert!(
+            !leaf.join("pids.max").exists(),
+            "pids.max must not be written when the controller was never enabled"
+        );
+
+        runtime
+            .teardown_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap();
+        // A tempdir has the control files as ordinary files, which a real
+        // cgroupfs removes with the directory — clear them, then the rmdir the
+        // teardown already attempted is observable as "nothing left holding it".
+        for f in ["cpu.weight", "cpu.max", "memory.max"] {
+            let _ = std::fs::remove_file(leaf.join(f));
+        }
+        assert!(
+            std::fs::remove_dir(&leaf).is_ok() || !leaf.exists(),
+            "the leaf was left holding something after teardown"
+        );
+    }
+
+    // ── R885-B4 at the CALL SITE. The driver's own tests in `cgroup.rs` prove
+    //    the mechanism; these prove the live `deploy_workload` /
+    //    `teardown_workload` path actually drives it — which is the property
+    //    R885-B1's first gotcha exists to insist on.
+
+    /// The generation directories under a workload node, oldest first.
+    fn generations(node: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(node) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The R885-B4 race, driven through the real deploy path: a rolling
+    /// replacement of one ident must not hand the incoming process the
+    /// directory the outgoing one is being torn out of. Two deploys, two
+    /// distinct generation leaves, one surviving, and one ceiling throughout.
+    #[tokio::test]
+    async fn a_redeploy_mints_a_new_generation_beside_the_same_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let runtime = NativeRuntime::with_cgroup_root(tmp.path().join("state"), &cgroup_root);
+        let spec = native_spec("rolling", vec!["/bin/sleep".into(), "30".into()]);
+        let ident = spec.expose.mesh.identity.clone();
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        let node = cgroup_root.join("rolling");
+        let first = generations(&node);
+        assert_eq!(first.len(), 1, "one deploy, one generation: {first:?}");
+
+        // `deploy_workload` tears the predecessor down before it creates, so
+        // this single call IS the rolling replacement.
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        let second = generations(&node);
+        assert_eq!(
+            second.len(),
+            1,
+            "the outgoing generation's leaf was left behind: {second:?}"
+        );
+        assert_ne!(
+            first, second,
+            "the redeploy landed in the outgoing generation's directory — the R885-B4 race"
+        );
+        // One workload, one ceiling: the node is shared and rewritten, not
+        // duplicated per generation.
+        assert_eq!(
+            std::fs::read_to_string(node.join("memory.max")).unwrap(),
+            (64u64 * 1024 * 1024).to_string()
+        );
+
+        runtime.teardown_workload(&ident).await.unwrap();
+        assert!(
+            generations(&node).is_empty(),
+            "teardown left a generation leaf: {:?}",
+            generations(&node)
+        );
+    }
+
+    /// The other defect, through the real `teardown_workload`: a descendant the
+    /// workload double-forked away is not reachable by the `SIGTERM`/`SIGKILL`
+    /// the supervisor aims at its own child, and before R885-B4 it was left
+    /// running with the `rmdir` failing `EBUSY` and nothing to do about it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_kills_a_double_forked_descendant_the_supervisor_cannot_reach() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let runtime = NativeRuntime::with_cgroup_root(tmp.path().join("state"), &cgroup_root);
+        let spec = native_spec("forker", vec!["/bin/sleep".into(), "30".into()]);
+        let ident = spec.expose.mesh.identity.clone();
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+
+        let node = cgroup_root.join("forker");
+        let leaf = node.join(&generations(&node)[0]);
+
+        // A real orphan: `sh` backgrounds a `sleep` and exits, so the `sleep` is
+        // reparented to init and is nobody's child. Recorded in the leaf's
+        // `cgroup.procs` the way a kernel would — the pre-exec attach hook opens
+        // that path without `O_CREAT`, so against a tempdir nothing else does.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & echo $!")
+            .output()
+            .unwrap();
+        let orphan: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), format!("{orphan}\n")).unwrap();
+        assert!(
+            unsafe { libc::kill(orphan as libc::pid_t, 0) } == 0,
+            "fixture premise: the orphan must be running before teardown"
+        );
+
+        runtime.teardown_workload(&ident).await.unwrap();
+
+        assert!(
+            unsafe { libc::kill(orphan as libc::pid_t, 0) } != 0,
+            "the double-forked descendant outlived teardown_workload"
+        );
+    }
+
+    /// R885-F3 under R885-B4's hierarchy, through the real deploy path. The
+    /// directory a child is attached to and the directory an OOM is counted in
+    /// are no longer the same one, so this pins that the read still follows the
+    /// node — a reader that followed the processes would report `None` and
+    /// classify every OOM as an ordinary crash, silently.
+    #[tokio::test]
+    async fn an_oom_is_still_classified_through_the_real_deploy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let runtime = NativeRuntime::with_cgroup_root(tmp.path().join("state"), &cgroup_root);
+        let spec = native_spec("oomer", vec!["/bin/sleep".into(), "30".into()]);
+        let ident = spec.expose.mesh.identity.clone();
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+
+        let node = cgroup_root.join("oomer");
+        let leaf = node.join(&generations(&node)[0]);
+        assert_ne!(leaf, node, "the premise: the two levels are distinct");
+
+        std::fs::write(
+            node.join("memory.events"),
+            "low 0\nhigh 0\nmax 4\noom 1\noom_kill 1\noom_group_kill 0\n",
+        )
+        .unwrap();
+
+        let stats = runtime
+            .workload_telemetry(&ident)
+            .await
+            .expect("a live node");
+        assert_eq!(
+            stats.oom_kill,
+            Some(1),
+            "the node's counter did not reach the read path"
+        );
+        assert!(
+            crate::cgroup::classify_exit(Some(9), -1, stats.oom_kill).is_oom(),
+            "F3's classification stopped firing under the generation hierarchy"
+        );
+
+        runtime.teardown_workload(&ident).await.unwrap();
+    }
+
+    /// R885-B5, the other shape: a workload that explicitly asks for a ceiling
+    /// gets one. `resources.cpu_limit_millis` is the only thing that may put a
+    /// quota in `cpu.max`, and it is independent of the request in `cpu_millis`.
+    #[tokio::test]
+    async fn a_declared_cpu_ceiling_renders_as_cpu_max() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let runtime = NativeRuntime::with_cgroup_root(tmp.path().join("state"), &cgroup_root);
+
+        let mut spec = native_spec("native-capped", vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]);
+        spec.resources.cpu_limit_millis = Some(500);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+
+        let leaf = cgroup_root.join("native-capped");
+        // The request is untouched by the ceiling: still 128m of weight.
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("cpu.weight")).unwrap(),
+            "12"
+        );
+        // 500m ceiling = half a core per 100ms period.
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("cpu.max")).unwrap(),
+            "50000 100000"
+        );
+
+        runtime
+            .teardown_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap();
+    }
+
+    /// The other half: a host with no delegated subtree must still deploy.
+    /// `NativeRuntime::new` on this Mac resolves no cgroup at all, so this is
+    /// the shape every non-Linux and every non-systemd run takes, and it must
+    /// stay a working unbounded fork rather than a refusal.
+    #[tokio::test]
+    async fn a_host_without_a_delegated_subtree_still_deploys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        assert!(
+            runtime.cgroup.is_none(),
+            "the camp Mac has no delegated cgroup subtree; this test's premise is gone"
+        );
+        let spec = native_spec("native-uncgrouped", vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        runtime
+            .teardown_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap();
     }
 
     /// R870-F23. The inner door reads its whole route table out of a file the
@@ -1210,21 +2090,37 @@ mod tests {
 
     /// The negative for every backend that does NOT write them: refuse the
     /// spec rather than start a process against a file that is not there.
+    ///
+    /// Docker is the stand-in now that containerd writes (R870-F27). Pinned
+    /// against the predicate rather than against a hard-coded pair, so a
+    /// backend that learns to materialize has to move
+    /// [`crate::Backend::materializes_files`] — the one place both halves of
+    /// the contract read — and cannot do it by editing a test.
     #[test]
     fn a_backend_that_cannot_materialize_files_refuses_the_spec() {
         let mut spec = native_spec("no-files-here", vec!["/bin/true".into()]);
-        assert!(crate::reject_unmaterializable_files(&spec, crate::Backend::Containerd).is_ok());
+        assert!(crate::reject_unmaterializable_files(&spec, crate::Backend::Docker).is_ok());
 
         spec.files = vec![workload_spec::InlineFile {
             path: "/etc/passway/inner.routes.json".into(),
             content: "{}".into(),
             mode: None,
         }];
-        let err = crate::reject_unmaterializable_files(&spec, crate::Backend::Containerd)
-            .expect_err("containerd does not write spec files")
+        let err = crate::reject_unmaterializable_files(&spec, crate::Backend::Docker)
+            .expect_err("docker does not write spec files")
             .to_string();
         assert!(err.contains("/etc/passway/inner.routes.json"), "{err}");
-        assert!(err.contains("Containerd"), "{err}");
+        assert!(err.contains("Docker"), "{err}");
+
+        // And the two that DO write accept it — the half that would otherwise
+        // rot into a guard nobody notices has been left on.
+        for backend in [crate::Backend::Native, crate::Backend::Containerd] {
+            assert!(
+                backend.materializes_files(),
+                "{backend:?} is expected to write WorkloadSpec::files"
+            );
+            assert!(crate::reject_unmaterializable_files(&spec, backend).is_ok());
+        }
     }
 
     #[tokio::test]
@@ -1573,6 +2469,166 @@ mod tests {
             captured.contains("overridden=from-the-spec"),
             "a spec literal must win over an inherited value; got:\n{captured}"
         );
+    }
+
+    /// R893-B17. The native half of the collector contract, read off a child
+    /// that actually ran rather than off the `Command` we built — the failure
+    /// this ticket fixes was precisely an injection everyone believed in and
+    /// nobody had observed.
+    ///
+    /// `MountNs::Host`: a native child is a host process, so the socket path it
+    /// is handed is the node's path verbatim, NOT the in-container one.
+    #[tokio::test]
+    async fn a_native_child_is_handed_the_collector_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("scryer.sock");
+        let runtime =
+            NativeRuntime::new(tmp.path()).with_collector(crate::observe::Collector::at(&sock));
+        let spec = native_spec(
+            "native-collector",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo ident=$YAH_SERVICE_IDENT; echo sock=$YAH_SCRYER_SOCKET; sleep 30".into(),
+            ],
+        );
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let captured = drain_logs(&runtime, &ident).await;
+        runtime.teardown_workload(&ident).await.unwrap();
+
+        assert!(
+            captured.contains(&format!("ident={}", ident.0)),
+            "YAH_SERVICE_IDENT must be the workload's mesh identity; got:\n{captured}"
+        );
+        assert!(
+            captured.contains(&format!("sock={}", sock.display())),
+            "a host-namespace child gets the host socket path verbatim; got:\n{captured}"
+        );
+    }
+
+    /// The other half, and the one that matters for a node that runs no
+    /// collector: nothing is injected, so `yah-log`'s `try_layer` keeps
+    /// returning `None` instead of pointing a workload at a dead socket.
+    #[tokio::test]
+    async fn a_node_without_a_collector_injects_neither_variable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let spec = native_spec(
+            "native-no-collector",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo ident=[$YAH_SERVICE_IDENT]; echo sock=[$YAH_SCRYER_SOCKET]; sleep 30".into(),
+            ],
+        );
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let captured = drain_logs(&runtime, &ident).await;
+        runtime.teardown_workload(&ident).await.unwrap();
+
+        assert!(captured.contains("ident=[]"), "got:\n{captured}");
+        assert!(captured.contains("sock=[]"), "got:\n{captured}");
+    }
+
+    /// Collect a workload's captured stdout/stderr into one string.
+    async fn drain_logs(runtime: &NativeRuntime, ident: &MeshIdent) -> String {
+        let mut logs = runtime
+            .stream_logs(
+                ident,
+                LogOpts {
+                    tail: None,
+                    follow: false,
+                    stream: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut captured = String::new();
+        while let Some(ev) = logs.next().await {
+            captured.push_str(&ev.message);
+            captured.push('\n');
+        }
+        captured
+    }
+
+    /// R876-B17: a non-literal env value must REFUSE the deploy, matching the
+    /// other four admission-path sites, not silently drop the variable.
+    #[tokio::test]
+    async fn deploy_refuses_unresolved_from_secret_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec("native-from-secret", vec!["/bin/true".into()]);
+        spec.env = vec![workload_spec::EnvVar {
+            name: "CREDENTIAL".into(),
+            value: EnvValue::FromSecret {
+                secret: "sentinel-secret".into(),
+                key: "sentinel-key".into(),
+            },
+        }];
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+
+        let err = runtime
+            .deploy_workload(&spec, &mesh)
+            .await
+            .expect_err("a spec carrying an unresolved FromSecret must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("CREDENTIAL"), "error must name the variable: {msg}");
+        assert!(msg.contains("FromSecret"), "error must name the shape: {msg}");
+    }
+
+    /// R876-B17: same refusal for an unresolved `FromMesh` reference.
+    #[tokio::test]
+    async fn deploy_refuses_unresolved_from_mesh_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec("native-from-mesh", vec!["/bin/true".into()]);
+        spec.env = vec![workload_spec::EnvVar {
+            name: "PEER_ADDR".into(),
+            value: EnvValue::FromMesh {
+                ident: MeshIdent("sentinel-peer".into()),
+                kind: workload_spec::MeshLookup::Url,
+            },
+        }];
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+
+        let err = runtime
+            .deploy_workload(&spec, &mesh)
+            .await
+            .expect_err("a spec carrying an unresolved FromMesh must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("PEER_ADDR"), "error must name the variable: {msg}");
+        assert!(msg.contains("FromMesh"), "error must name the shape: {msg}");
+    }
+
+    /// Non-vacuity for the two tests above: a spec carrying only `Literal` env
+    /// must still deploy and still carry its value — the refusal must not have
+    /// widened into refusing everything.
+    #[tokio::test]
+    async fn deploy_still_succeeds_with_only_literal_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-literal-only",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        spec.env = vec![workload_spec::EnvVar {
+            name: "PLAIN".into(),
+            value: EnvValue::Literal {
+                value: "plain-value".into(),
+            },
+        }];
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let ident = spec.expose.mesh.identity.clone();
+
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        runtime.teardown_workload(&ident).await.unwrap();
     }
 
     #[tokio::test]

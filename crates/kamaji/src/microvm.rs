@@ -12,16 +12,54 @@
 //! somewhere else to be. Isolation answers it by making "next to a raft voter"
 //! an acceptable place for a build to be.
 //!
-//! ## Shape: a job, not a service
+//! ## Two shapes: a job, or a service
 //!
-//! This backend is built for [`LifecycleArchetype::Job`] — a forge run that
-//! starts, does work, produces artifacts and exits. It deliberately does **not**
-//! implement the restart loop [`crate::native`] carries: a build that fails is
-//! finished, and re-running it is the dispatcher's decision (with a fresh
-//! workspace), not the supervisor's. [`MicroVmRuntime::restart_workload`] says
-//! so rather than pretending.
+//! This backend ran only one shape until R605-F31 — [`LifecycleArchetype::Job`],
+//! a forge run that starts, does work, produces artifacts and exits — and this
+//! heading said so. It now runs both, because "a long-lived VM" is a workload
+//! the fleet wants (a dev-cluster member living inside a node's hypervisor) and
+//! the alternative was supervising those outside kamaji as host systemd units,
+//! i.e. having two supervisors on one node that know nothing about each other.
+//!
+//! The shape is read off [`WorkloadSpec::effective_archetype`] by
+//! [`VmShape::of_spec`] — `Job` stays job-shaped, `Server`/`Appliance` are
+//! service-shaped — and it is the *only* input that decides which of these the
+//! guest gets. Nothing here is a flag or a fallback:
+//!
+//! | | job-shaped | service-shaped |
+//! |---|---|---|
+//! | **root device** | the node's one `rootfs.ext4`, **read-only** | a private copy under the workload's VM dir, **writable** |
+//! | **durable guest state** | none by design | the scratch disk **and the root** — see [`RootDisk`] |
+//! | **VMM process exit** | the job finished; read its verdict and stop | the instance ended; restart per [`RestartPolicy`] |
+//! | [`restart_workload`](MicroVmRuntime::restart_workload) | refused, naming why | re-boots the guest in place |
+//! | **artifacts** | copied back out of the scratch disk on halt | not copied — a service is not a producer |
+//! | **TAP device** | freed when the guest halts | kept across restarts, freed at teardown |
+//!
+//! The read-only root is the one line here that is a **correctness property and
+//! not hardening**: one image serves every job on the node, so a writable one
+//! would let job N leave state for job N+1. That survives verbatim for jobs. A
+//! service does not relax it — it *sidesteps* it, by not sharing an image at
+//! all: its root is a private copy, so no other workload can observe what it
+//! writes, and `rootfs.ext4` on the node is still never written by anyone.
+//! `the_rootfs_is_read_only_and_the_workspace_is_not` and
+//! `a_service_gets_its_own_root_and_never_writes_the_nodes` pin both halves.
+//!
+//! A service durably keeps **both** surfaces: the scratch disk, which this
+//! backend neither rebuilds nor extracts between restarts, and — since R605-F33
+//! finished the guest half — its root, which the init now keeps as the real
+//! block device rather than overlaying a tmpfs onto. [`RootDisk`] carries the
+//! history and why the two halves landed a day apart.
+//!
+//! The restart loop itself is **not** implemented here. It is
+//! [`crate::supervise`], shared with [`crate::native`], and this module supplies
+//! only the four operations that genuinely differ between forking a binary and
+//! booting a guest. That is the whole reason this heading no longer says the
+//! backend "deliberately does not implement the restart loop `crate::native`
+//! carries": there is now one loop and two backends, rather than a loop on one
+//! side and a disclaimer on the other.
 //!
 //! [`LifecycleArchetype::Job`]: workload_spec::LifecycleArchetype::Job
+//! [`RestartPolicy`]: workload_spec::RestartPolicy
 //!
 //! ## The four things a microVM needs that a container does not
 //!
@@ -29,10 +67,12 @@
 //! order this module deals with them:
 //!
 //! 1. **A kernel and a rootfs.** There is no image to pull — `spec.image` is
-//!    identity metadata here exactly as it is for native exec. The guest boots
-//!    the node's configured kernel with the node's configured rootfs attached
-//!    **read-only**, so no job can leave anything behind in it for the next one.
-//!    See [`MicroVmConfig`].
+//!    identity metadata here exactly as it is for native exec. A job-shaped
+//!    guest boots the node's configured kernel with the node's configured
+//!    rootfs attached **read-only**, so no job can leave anything behind in it
+//!    for the next one; a service-shaped guest boots the same kernel with a
+//!    private writable copy of that rootfs, which no other workload can see. See
+//!    [`MicroVmConfig`] and [`RootDisk`].
 //! 2. **A way in and out for files.** A container gets a bind mount; a guest
 //!    kernel cannot see the host filesystem at all. Each job gets a scratch
 //!    ext4 disk built from its bind-mount sources, attached as the second block
@@ -153,8 +193,8 @@
 //! @yah:verify("A PEER'S WIP-COMMIT SWEPT THESE CHANGES IN MID-TICKET. The courier verified its own work survived BY CONTENT rather than off `git status`, which is the correct move on this shared tree. Everything is in 88533e01 except the ~26 lines of board annotation, which the camp git plugin sweeps.")
 //!
 //! @yah:ticket(R605-F31, "Service-shaped VM archetype in kamaji: make long-lived VMs a first-class workload, not a job that happens not to exit")
-//! @yah:at(2026-09-11T00:18:14Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-11T01:19:04Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R605)
 //! @yah:next("OPERATOR DECISION 2026-09-10 CREATED THIS TICKET and it is the gating item for R605-F16's whole track. Offered the smaller option — supervise dev-cluster VM members as host-level systemd units outside kamaji, zero kamaji change — the operator chose instead to make 'long-lived VM workload' a real product capability, consistent with the standing direction that 'our cloud is meant to do' metal+VM mixing. So this is an architecture change in oss/kamaji, funded on purpose.")
@@ -166,6 +206,28 @@
 //! @yah:gotcha("THE ONLY NODE WHERE ANY OF THIS CAN BE TESTED IS us-west-003, AND IT HAS A LANDMINE. It runs tree build 0.8.38-h2 with /etc/systemd/system/kamaji.service.d/10-microvm.conf setting KAMAJI_MICROVM_DIR. NO PUBLISHED kamaji carries the microvm feature, and that env var on a feature-off binary is FATAL AT STARTUP (kamaji-bin/src/main.rs:827 bails before the socket binds); Restart=on-failure + StartLimitBurst=5 then gives up in 60s, leaving the node with no workload supervisor. So: do NOT run scripts/roll-node.sh against it, and NEVER ship kamaji without yubaba from the same tree — ProtocolVersion::CURRENT is V9 and a skewed pair fails every call at connect with HandshakeRefused while still reporting active with NRestarts=0. Use scripts/hotship.sh --binaries yubaba,kamaji.")
 //! @yah:gotcha("THE NODE'S CHECKOUT IS NOT THE CAMP'S TREE and syncing it fails misleadingly. ~/yah on us-west-003 was stale at 8675e1a0; verify it carries the symbols you are testing before trusting any result. Syncing oss/kamaji ALONE fails with an unpublished `yah-workload-spec 0.8.37` error naming a crate you never touched — the cause is the root [patch.crates-io] redirect to ../yah-base, whose copy on the node is stale, so sync oss/yah-base TOO. The node has NO rsync; use tar over ssh, and do not copy target/ (2.1G vs ~1.8M of crates). Also: ssh needs `-i ~/.ssh/yah -o IdentitiesOnly=yes` or it fails 'Permission denied (publickey)' in a way that reads as the box being down, and journalctl as the unprivileged user returns EMPTY rather than an error — use sudo or you will conclude a working thing is broken.")
 //! @yah:depends_on(R605-F16)
+//! @yah:gotcha("A LIVE PEER APPENDED TO THE kamaji-proto ENUMS WHILE THIS TICKET WAS IN FLIGHT, 2026-09-10 — @Ashguard:dove (session:1e4618c6) working R870-B24. This is a seam, not a break; their kamaji workspace was green when they ran it (cargo test --workspace all pass, kamaji-bin lib 244). WHAT LANDED: kamaji-proto/src/messages.rs gained `YubabaToKamaji::Describe { request_id, id }` and `KamajiToYubaba::WorkloadDescription { request_id, id, spec: Option<Workload> }`, both appended LAST, with WorkloadDescription classified as a correlated reply in reply_request_id(); NO ProtocolVersion bump, so V9 stays R605-T27's, because appending a variant keeps postcard indices stable. kamaji-bin/src/server.rs: `Registry.digests` became `Registry.specs: HashMap<WorkloadId, DeployedSpec>` (the whole Workload plus its precomputed digest), and `set_spec_digest`/`remove_spec_digest` became `set_deployed_spec`/`remove_deployed_spec`/`deployed_spec`; stamp_spec_digests is behaviourally unchanged. kamaji/src/sibling.rs gained `KamajiClient::describe(&id)`. EXPLICITLY UNTOUCHED BY THEM and therefore safe for this ticket: microvm.rs, kamaji/src/lib.rs, native.rs, supervise.rs, kamaji-bin/src/main.rs. THREE CONSEQUENCES. (1) If the archetype work appends to either enum, RE-READ THE ENUM AT EDIT TIME and append after theirs — two independent \"appended last\" edits shift postcard indices against each other, and the resulting skew fails every yubaba->kamaji call at connect with HandshakeRefused while systemctl still reports active with NRestarts=0, i.e. it does NOT look like a restart loop. (2) Any new reply variant MUST be classified in reply_request_id() or it is SILENTLY dropped as a push (R746-B11). (3) Think hard before bumping ProtocolVersion: V9 is what us-west-003 runs as 0.8.38-h2 and that is the only node this can be tested on, so a bump forces a paired yubaba+kamaji re-ship (scripts/hotship.sh --binaries yubaba,kamaji, never kamaji alone) before anything works there.")
+//! @yah:handoff("DONE AND PROVEN ON REAL HARDWARE (us-west-003, firecracker v1.16.1, guest kernel 6.1.187, 2026-09-11T01:15-01:30Z). All four job-shaped sites are now archetype-dependent, driven by ONE value: VmShape::of_spec(spec), which reads WorkloadSpec::effective_archetype() — Job stays job-shaped, Server/Appliance are service-shaped. Nothing is a flag, an Option param or a fallback.")
+//! @yah:handoff("THE SUPERVISION IS SHARED, NOT DUPLICATED — this was the brief's cheapest-correct-outcome and it is what landed. New oss/kamaji/crates/kamaji/src/supervise.rs holds the restart-loop state machine that used to live inside native.rs (Ctrl<I>, park, supervise, backoff_delay, now_ms, ALWAYS_RESTART_DELAY), lifted verbatim and made generic over a `Supervised` trait with five members: start / wait / stop / settle / discard. native.rs lost 299 lines and gained a 65-line `NativeProcess` impl; microvm.rs gained a `GuestBoot` impl. The policy decision, the exponential backoff, the Restarting publication, the parked phase and the control-message handling are now identical between the two backends BY CONSTRUCTION rather than by inspection. native's own suite (always_policy_respawns_after_exit, on_failure_gives_up_after_max_attempts, restart_workload_replaces_running_process, graceful_upgrade_swaps_process_and_signals_old, ...) passes unchanged, which is the evidence the lift preserved behaviour.")
+//! @yah:handoff("SITE 3 (the read-only rootfs) WAS NOT FLIPPED, AND THAT IS THE SUBSTANCE. Flipping is_read_only for services would not relax the property for services — it would DESTROY it for everyone, since the same file is what a job on the same node boots half a second later, and two service guests would be two concurrent writers to one ext4 image. So a service gets a DIFFERENT image: new `RootDisk` type, `RootDisk::for_shape` returns the node's shared rootfs.ext4 read-only for a Job and <vm_dir>/rootfs.ext4 writable for a Service, and `RootDisk::provision` seeds that private copy from the node image on first deploy and DELIBERATELY KEEPS an existing one on redeploy (a service's root belongs to the workload, and re-copying the pristine image would erase it). 30 MB per service — R605-F23's measurement, with the 1166 MB toolchain still in its own read-only volume. Pinned from both sides: the_rootfs_is_read_only_and_the_workspace_is_not now also asserts the job's root path IS the node image, and a_service_gets_its_own_root_and_never_writes_the_nodes asserts the service's is NOT.")
+//! @yah:handoff("SITE 4 (panic=1 reboot=k): THE ARGS ARE DELIBERATELY IDENTICAL FOR BOTH SHAPES AND THE COMPLETION MODEL IS WHAT CHANGED — read this before \"fixing\" the absence. What the pair buys is that the host always finds out the guest is gone; what differs is the interpretation, and that now lives in GuestBoot::settle. A job's VMM exit is the job finishing (extract artifacts, free the TAP, read the guest's verdict, park). A service's VMM exit is one INSTANCE ending: no extraction (a service is not a producer and reading the disk would race the next boot for the block device), no TAP teardown (the next boot needs the same device on the same /30; teardown frees it), and the RestartPolicy decides what follows. Removing panic=1 for services would buy exactly one thing: a panicked service guest that hangs forever reporting Running. Pinned by a_service_boots_with_the_same_args_because_only_the_reading_changes.")
+//! @yah:handoff("TWO THINGS FOUND AND FIXED IN THIS PASS THAT THE BRIEF DID NOT NAME. (1) teardown_workload signalled the VMM pid directly and polled a shared AtomicU32; with a restart loop in play that RACES the supervisor, which would see the exit, consult the policy and boot a replacement nobody held a handle on. It now goes through Ctrl::Teardown like native's, so there is one owner of the process. (2) A service's guest boots repeatedly, so a stale job-status.json from a killed instance would be read as the next one's verdict — reporting a crashed service as cleanly Stopped, the exact class of lie JOB_STATUS_FILE exists to prevent. New workspace::clear_job_status runs `debugfs -w -R \"rm /job-status.json\"` before every re-boot (same -w route write_job already uses, no new dependency); a failure warns and degrades to a stale read rather than killing the workload. Also: deploy now REFUSES a job-shaped spec carrying a non-Never restart_policy, naming both fields, rather than silently demoting it — nothing the fleet dispatches hits this, since WorkloadSpec::for_forge already sets Never.")
+//! @yah:gotcha("THE WRITABLE ROOT IS THE HOST HALF OF A PROPERTY WHOSE GUEST HALF IS NOT BUILT — do not read microvm.rs as claiming a service's / is durable, because it is not, and the doc comments were corrected mid-ticket to stop claiming it. MEASURED by reading oss/kamaji/crates/kamaji-guest-init/src/boot.rs:312-335: the init pivots UNCONDITIONALLY into an overlayfs with a TMPFS upper layer, so the writable block device this ticket attaches is the overlay's LOWER layer and the guest never writes to it. Confirmed live — the guest cmdline on us-west-003 reads `root=/dev/vda rw`, so the flag genuinely reaches the guest, and writes to / still vanish on reset. WHAT IS DURABLE FOR A SERVICE TODAY is the scratch disk at /workspace, which this backend now neither rebuilds nor extracts between restarts; that is proven (a_services_scratch_disk_survives_its_restarts). The guest half is filed as R605-F33 with the design (probe for a writable root, use a directory on it as upperdir, fall back to tmpfs on EROFS — no JOB_SCHEMA_VERSION bump) and with the reason it is separate: it means rebuilding and re-staging the rootfs image every other R605 proof was measured against, on the only testable node.")
+//! @yah:gotcha("NO PROTOCOL CHANGE, NO kamaji-bin CHANGE, NO SYSTEMD SANDBOX CHANGE — all three were checked rather than assumed, and all three are the answer a future reader will want. (1) ProtocolVersion stays V9: the archetype already rides the WorkloadSpec on the wire and the shape is derived host-side in kamaji, so nothing was appended to YubabaToKamaji/KamajiToYubaba and us-west-003's 0.8.38-h2 pairing is untouched. (2) kamaji-bin routes by the yah.exec=microvm annotation and validate_microvm_spec does not gate on archetype, so a service-shaped microVM spec already reaches MicroVmRuntime — untested above kamaji, which is the honest limit. (3) R605-T24's ProtectSystem=strict trap does NOT recur: the only new host path written is <microvm-dir>/vms/<ident>/rootfs.ext4, and kamaji-bin/src/main.rs:795 sets state_dir = <microvm-dir>/vms with KAMAJI_MICROVM_DIR=/var/lib/yah/kamaji/microvm, already inside kamaji.service's ReadWritePaths AND StateDirectory (/var/lib/yah/kamaji). Verified by reading app/yah/cli/resources/kamaji.service:139,175.")
+//! @yah:verify("PASS ON REAL HARDWARE AGAINST A NAMED BASELINE. BASELINE: before this ticket no microVM workload on this backend had ever been restarted — restart_workload bailed unconditionally and the supervisor had no loop — and R605-T24 recorded kamaji lib at 115 passed / 0 failed (--features microvm-integration). NOW: new oss/kamaji/crates/kamaji/tests/microvm_service_e2e.rs, 3 passed / 0 failed on us-west-003 in 14.57s (firecracker v1.16.1, guest kernel 6.1.187). a_service_guest_is_restarted_instead_of_reaped saw 3 DISTINCT VMM pids in 2.93s with Restarting published and visible through get_workload (the surface kamaji-bin uses), and the node's shared rootfs.ext4 was sha256-identical before and after. a_job_guest_is_still_reaped_and_never_restarted is the regression half — the job reports Stopped, STAYS Stopped across 8 polls over 4s (vs a 1s ALWAYS_RESTART_DELAY), and still refuses an explicit restart naming \"job-shaped\". a_services_scratch_disk_survives_its_restarts read the guest's appends back with debugfs after teardown and found one line per completed boot, which also proves clear_job_status's new `debugfs rm` does not damage the filesystem — a corrupted one would have failed the next guest's mount.")
+//! @yah:verify("REGRESSION SUITES, ALL GREEN. On us-west-003: microvm_guest_e2e 3 passed / 0 failed — R605-F14's own proof, re-run to confirm the job path is untouched, and confirmed with --nocapture that they RAN rather than SKIPped (each prints its guest's finish time; the cargo-build one is fast because its target dir is warm, not because it skipped). kamaji lib on the node 120 passed / 0 failed. On the camp Mac: kamaji lib 120 passed / 0 failed with --features microvm-integration (= T24's 115 baseline + the 5 new unit tests), 139 passed / 0 failed with microvm+native, oss/kamaji `cargo test --workspace --all-features` 0 failed across every target (kamaji lib 222, kamaji-bin lib 315, docker_live 5), and `cargo check --workspace --all-targets` clean at the yah repo root, which consumes kamaji through the root [patch.crates-io] path. clippy adds NO new warning on either feature set (microvm-only is clean; the one remaining is pre-existing too_many_arguments on jit.rs:312, untouched).")
+//! @yah:verify("WHAT WAS NOT DONE, stated plainly. (1) arm64 — out of scope by the brief; R605-F32 owns the guest image, and vmm_config's doc comment now names the x86-only cmdline tokens and points there. (2) The dispatch path ABOVE kamaji is unexercised for a service-shaped microVM spec: everything here drove MicroVmRuntime in-process on the node, exactly as F14/F22/F23 did. Nothing blocks it (no annotation or validation gates on archetype) but nobody has run a service-shaped VM through yubaba. (3) A service's / is not durable — R605-F33. (4) Nothing was shipped to the node's running kamaji: the tests build and run out of ~/yah on us-west-003 against a tempdir state_dir, the service is untouched, and no roll-node.sh or hotship was performed.")
+//! @yah:handoff("LEADER SIGN-OFF (R605, session:d990eccb). DELIVERED, AND IT TOOK THE HARDER, CORRECT ROUTE AT THE ONE PLACE THE BRIEF LEFT ROOM TO CHEAT. All four job-shaped sites in microvm.rs are now archetype-dependent off a single value (VmShape::of_spec reading WorkloadSpec::effective_archetype) rather than four independent conditionals — which is what keeps them from drifting apart later.")
+//! @yah:handoff("THE RESTART LOOP WAS LIFTED, NOT COPIED, which was the whole point of pointing the courier at crate::native first. microvm.rs:15-22 said the backend 'deliberately does not implement the restart loop crate::native carries'; the cheap answer was to give microvm its own copy. Instead the loop moved OUT of native.rs into a new shared oss/kamaji/crates/kamaji/src/supervise.rs, and both backends now implement a `Supervised` trait against it. That is the pre-1.0 instruction in CLAUDE.md applied correctly — change the shared abstraction rather than add a parallel path beside it — and it means the next backend that needs supervision inherits it instead of forking a third copy.")
+//! @yah:handoff("SITE 3 WAS DELIBERATELY NOT FLIPPED, AND THIS IS THE BEST DECISION IN THE TICKET. The brief said read-only-ness should become a function of the archetype. The courier found a better answer: flipping is_read_only for service-shaped VMs would have made the node's ONE SHARED rootfs.ext4 writable, destroying the job guarantee for every OTHER workload on that node — the archetype of the workload being deployed cannot be allowed to weaken an invariant held by its neighbours. Instead a service boots a PRIVATE WRITABLE COPY of the node rootfs (new RootDisk type), so the shared image stays read-only and job N still cannot leave state for job N+1. Verified on hardware by sha256: the node rootfs is unchanged after a service ran. I flagged this site as the one a careless edit silently destroys; the courier found the subtler version of that same trap and routed around it.")
+//! @yah:handoff("THE HONEST GAP, STATED RATHER THAN PAPERED OVER: THERE IS NO DURABLE SERVICE ROOT YET. kamaji-guest-init pivots UNCONDITIONALLY into an overlayfs with a tmpfs upper layer (boot.rs:312-335, read from source and confirmed live), so a writable root device does not survive a reset — the private RootDisk gives a service its own image, but the guest throws writes into RAM on top of it. The courier caught this MID-TICKET and corrected doc comments it had already written rather than letting them ship as a lie, which is the behaviour to reinforce. A service's durable channel today is the scratch disk. The guest half is filed as R605-F33 with its design and its cost. This matters for R605-F32: a raft member needs a durable --raft-dir, so F33 is on F32's critical path even though F32 does not name it.")
+//! @yah:handoff("SHARED-TREE DISCIPLINE, unprompted and exactly right: the courier checked camp.roster for a live peer on microvm.rs BEFORE editing, and when staging it deliberately EXCLUDED sibling.rs because that file carries @Ashguard:dove's in-flight KamajiClient::describe from R870-B24. It also established that no proto change was needed at all — the archetype rides the existing WorkloadSpec and the shape is derived host-side — so the enum-append hazard I steered it about never materialised and ProtocolVersion stays V9. That is the outcome I asked for and it was reached by making the change unnecessary rather than by sequencing it carefully.")
+//! @yah:verify("ON REAL HARDWARE (us-west-003, firecracker v1.16.1), against a baseline that is a genuine zero: BEFORE this ticket no microVM workload had ever been restarted — restart_workload bailed unconditionally and there was no supervisor at all. New tests/microvm_service_e2e.rs = 3 passed / 0 failed, showing THREE DISTINCT VMM PIDS with Restarting published, i.e. a real halt -> exit -> re-boot cycle observed on the console rather than inferred from a return code.")
+//! @yah:verify("THE JOB PATH IS PROVEN UNREGRESSED ON THE SAME NODE, which is the thing that could have been silently broken: microvm_guest_e2e stays 3 passed / 0 failed and genuinely RAN rather than skipping, and the job path is confirmed still reaped and never restarted. The node's rootfs sha256 is unchanged after a service workload ran — that is the direct evidence the job guarantee survived.")
+//! @yah:verify("UNIT AND WORKSPACE: kamaji lib 120 passed / 0 failed (baseline 115 from R605-T24, plus 5 new unit tests). oss/kamaji --workspace --all-features: 0 failures. The yah root workspace checks clean with no new clippy warning.")
+//! @yah:verify("A SELF-CAUGHT TEST BUG worth recording, because it is the kind that produces a false negative: the courier's first service-e2e assertion failed and it correctly diagnosed its own off-by-one — the scratch disk DOES persist; the 3rd instance is torn down mid-run before it can write — rather than concluding the feature was broken.")
+//! @yah:verify("NO PROTO, NO kamaji-bin, NO SYSTEMD SANDBOX CHANGE was needed and none was made. ProtocolVersion stays V9, so us-west-003's 0.8.38-h2 pairing is undisturbed and no re-ship is forced.")
+//! @yah:verify("UNCOMMITTED BY CAMP POLICY (git policy is 'defer'), against tree anchor e896d28a. The courier left the exact staging command for the operator's sweep, scoped to this ticket's five files and deliberately excluding sibling.rs.")
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
@@ -179,10 +241,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
-use workload_spec::{EnvValue, VolumeSource, WorkloadSpec};
+use workload_spec::{EnvValue, RestartPolicy, VolumeSource, WorkloadSpec};
 
+use crate::supervise::{supervise, Completion, Ctrl, Exit, Supervised};
 use crate::{
     Backend, DeployResult, Kamaji, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
     MeshIdent, RuntimeHealth, WorkloadState, WorkloadStatus,
@@ -253,6 +316,159 @@ const WORKSPACE_SIZE_MULTIPLIER: u64 = 4;
 
 /// Floor on the scratch disk, for the common case of an empty input tree.
 const WORKSPACE_MIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+// ── Workload shape ───────────────────────────────────────────────────────────
+
+/// Which lifecycle shape this backend was asked to boot (R605-F31).
+///
+/// Deliberately a two-valued type over [`LifecycleArchetype`]'s three, because
+/// every difference in this file is between "runs to completion" and "is meant
+/// to still be there tomorrow", and `Server` vs `Appliance` — where the
+/// scheduler *may* move it — is a question for the scheduler, not for the
+/// hypervisor. Collapsing the two here means a future fourth archetype has to
+/// be answered once, in [`Self::of_spec`], instead of at every site.
+///
+/// [`LifecycleArchetype`]: workload_spec::LifecycleArchetype
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmShape {
+    /// Starts, does work, produces artifacts, exits. The VMM process ending is
+    /// the completion signal, and there is nothing to restart.
+    Job,
+    /// Long-lived. The VMM process ending is an *instance* ending, and what
+    /// happens next is the spec's [`RestartPolicy`](workload_spec::RestartPolicy)'s
+    /// decision — which is the supervisor's job, not the dispatcher's.
+    Service,
+}
+
+impl VmShape {
+    /// Read the shape off the spec, through the one seam that answers "can I
+    /// kill and reschedule this?" for every other consumer in the fleet.
+    ///
+    /// Going through [`WorkloadSpec::effective_archetype`] rather than reading
+    /// `archetype` or `restart_policy` directly is what keeps a spec written
+    /// before that field existed meaning here exactly what it means to the
+    /// reconciler and the scheduler — including the forge convention, where
+    /// `RestartPolicy::Never` with no volumes infers `Job`.
+    pub fn of_spec(spec: &WorkloadSpec) -> Self {
+        match spec.effective_archetype() {
+            workload_spec::LifecycleArchetype::Job => Self::Job,
+            workload_spec::LifecycleArchetype::Server
+            | workload_spec::LifecycleArchetype::Appliance => Self::Service,
+        }
+    }
+}
+
+/// The root block device one guest boots, and whether it may write to it.
+///
+/// # Why a service does not simply get the rootfs flipped writable
+///
+/// Because the flag is not the property. `is_read_only: true` on the node's
+/// `rootfs.ext4` exists because **one image serves every workload on the node**,
+/// and a writable one lets workload N leave state for workload N+1. Flipping it
+/// for service-shaped guests would not relax that property for services — it
+/// would *destroy* it for everyone, since the very same file is what a job on
+/// the same node boots half a second later, and two service guests would be two
+/// concurrent writers to one ext4 image.
+///
+/// So a service gets its own image instead: a copy of the node's, in the
+/// workload's own VM directory, attached writable. Nothing is shared, so there
+/// is nothing to contaminate; the node's image is still never written by
+/// anybody. The copy is cheap on the measurement that R605-F23 took on
+/// us-west-003 — the rootfs is **30 MB**, with the 1166 MB of build toolchain
+/// living in a separate, still-read-only volume.
+///
+/// # What this buys, and when it started buying it
+///
+/// **Writes to `/` inside the guest survive a reset — as of R605-F33**, and for
+/// one boot-to-boot cycle only this host half existed. F31 landed the writable
+/// attachment on its own because it is the half that has to be *right*: flipping
+/// a shared image writable is the edit that silently destroys the job guarantee,
+/// and this is the shape that cannot. For that day it bought nothing observable,
+/// because `kamaji-guest-init` pivoted unconditionally into an overlayfs with a
+/// tmpfs upper, so the device attached here was the overlay's *lower* layer.
+///
+/// F33 is the guest half: the init probes for a writable root (a read-write
+/// remount of `/`, which a job's read-only attachment refuses by construction)
+/// and, when it finds one, keeps the real device as the root instead of stacking
+/// an overlay on it. No job-document field changed and `JOB_SCHEMA_VERSION` did
+/// not move, so no rootfs image can skew against a kamaji binary — but a rootfs
+/// image *older* than F33 gives a service an ephemeral `/` again, silently.
+/// `a_services_root_survives_its_restarts` is what catches that.
+///
+/// The **scratch disk** at [`GUEST_WORKSPACE_MOUNT`] is still durable and still
+/// the right place for bulk state: this backend neither rebuilds nor extracts it
+/// between a service's restarts, and it is sized for a build where the root is
+/// sized for a root.
+#[derive(Debug, Clone)]
+pub struct RootDisk {
+    /// Image the guest boots as `/dev/vda`.
+    pub path: PathBuf,
+    /// Whether Firecracker attaches it read-only.
+    pub read_only: bool,
+}
+
+impl RootDisk {
+    /// Filename of a service's private root, inside its own VM directory.
+    ///
+    /// The same basename as the node's image on purpose: an operator staring at
+    /// a VM dir should be able to see that the thing next to `workspace.ext4`
+    /// and `vm-config.json` is a root filesystem, and the directory it is in is
+    /// already what distinguishes it.
+    pub const SERVICE_ROOT_FILE: &'static str = "rootfs.ext4";
+
+    /// Which root image `shape` boots, given the node's config and the
+    /// workload's own state directory.
+    pub fn for_shape(cfg: &MicroVmConfig, shape: VmShape, vm_dir: &Path) -> Self {
+        match shape {
+            VmShape::Job => Self {
+                path: cfg.rootfs_image.clone(),
+                read_only: true,
+            },
+            VmShape::Service => Self {
+                path: vm_dir.join(Self::SERVICE_ROOT_FILE),
+                read_only: false,
+            },
+        }
+    }
+
+    /// Put the bytes where [`Self::path`] says they are.
+    ///
+    /// A no-op for a job (the node's image is already there) and for a service
+    /// that has one — and that second case is the load-bearing one. A redeploy
+    /// of the same identity onto the same node **keeps** the existing root,
+    /// because for a service-shaped guest the root is state that belongs to the
+    /// workload, and re-copying the pristine node image over it would silently
+    /// erase whatever the appliance had accumulated. That is the same promise
+    /// `LifecycleArchetype::Appliance` already makes everywhere else in the
+    /// fleet: stable identity, and a volume that follows it.
+    pub async fn provision(&self, cfg: &MicroVmConfig) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        if tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
+            tracing::info!(
+                root = %self.path.display(),
+                "reusing this service guest's existing root — its state is its root"
+            );
+            return Ok(());
+        }
+        tokio::fs::copy(&cfg.rootfs_image, &self.path)
+            .await
+            .with_context(|| {
+                format!(
+                    "seeding a private root for a service-shaped guest: copying {} to {}",
+                    cfg.rootfs_image.display(),
+                    self.path.display()
+                )
+            })?;
+        tracing::info!(
+            from = %cfg.rootfs_image.display(),
+            root = %self.path.display(),
+            "seeded a service guest's private writable root from the node image"
+        );
+        Ok(())
+    }
+}
 
 // ── Node configuration ───────────────────────────────────────────────────────
 
@@ -527,6 +743,19 @@ impl MicroVmJob {
     /// `validate_native_exec_spec` does: this backend can only write literals
     /// into the document, and a silently-absent credential fails the build
     /// somewhere far from its cause.
+    ///
+    /// NO DEPLOY-TIME INJECTION HAPPENS HERE, and that is a property of the
+    /// backend rather than an omission (R893-B17 re-checked it). This shape
+    /// carries only the spec's literals: no `YAH_MESH_IP`, no
+    /// `PORT` / `PORT_<NAME>`, and no `YAH_SERVICE_IDENT` /
+    /// `YAH_SCRYER_SOCKET`. A guest has its own kernel and no view of the
+    /// host's filesystem, so there is no path and no bind that could make a
+    /// host `AF_UNIX` socket reachable from inside it — reaching a microVM
+    /// workload's telemetry needs a network-addressed collector, which is a
+    /// different contract. (Note for anyone reading R893-S10's spike or the
+    /// `@yah:next` on `scryer::ingestion`: both say kamaji injects the
+    /// mesh-IP/port contract on "native, docker, containerd and microvm". The
+    /// first three are true; this one was not, and is not.)
     pub fn of_spec(
         spec: &WorkloadSpec,
         plan: &[workspace::PlannedMount],
@@ -642,17 +871,37 @@ pub struct NetworkInterface {
     pub guest_mac: String,
 }
 
-/// Build the VM definition for one job.
+/// Build the VM definition for one guest.
+///
+/// # Why the boot args are the same for both shapes
 ///
 /// `panic=1 reboot=k` is the load-bearing pair: it makes the guest **exit**
-/// rather than sit at a panic prompt, which is what turns "the VMM process
-/// ended" into a usable completion signal for the supervisor. Without it a
-/// crashed guest would hang until teardown and look identical to a slow build.
+/// rather than sit at a panic prompt, so the VMM process ending is a signal the
+/// supervisor can act on. Without it a wedged guest would hang until teardown
+/// and look identical to a slow build.
+///
+/// R605-F31 expected to have to make these archetype-dependent too, and they
+/// are not, which is worth stating so the next reader does not read the absence
+/// as an oversight. What the pair buys is that *the host always finds out*; what
+/// changes between a job and a service is the **interpretation**, and that lives
+/// in [`GuestBoot::settle`], not in the cmdline. For a job, the VMM exiting is
+/// the job finishing. For a service, the VMM exiting is one instance ending and
+/// the [`RestartPolicy`](workload_spec::RestartPolicy) decides what follows — so
+/// a service guest that panics is reset, observed, and booted again with
+/// backoff, which is strictly better supervision than a guest looping inside
+/// itself where the host can neither see it nor rate-limit it. Removing
+/// `panic=1` for services would buy exactly one thing: a panicked service guest
+/// that hangs forever and reports `Running`.
+///
+/// (`i8042.*` and `reboot=k` name x86 hardware. This backend is x86_64-only in
+/// practice today — see the module's board annotation and R605-F32, which owns
+/// the arm64 guest image and the `reboot=` value that goes with it.)
 pub fn vmm_config(
     cfg: &MicroVmConfig,
     spec: &WorkloadSpec,
     slot: Option<&GuestSlot>,
     workspace_disk: &Path,
+    root: &RootDisk,
 ) -> Result<VmmConfig> {
     let mut boot_args =
         String::from("console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux");
@@ -664,13 +913,20 @@ pub fn vmm_config(
     let mut drives = vec![
         Drive {
             drive_id: "rootfs".into(),
-            path_on_host: cfg.rootfs_image.to_string_lossy().into_owned(),
+            path_on_host: root.path.to_string_lossy().into_owned(),
             is_root_device: true,
-            // Read-only is a correctness property, not a hardening bonus:
-            // one rootfs image serves every job on the node, so a writable
-            // one would let job N leave state for job N+1 — the exact
-            // cross-contamination this backend exists to prevent.
-            is_read_only: true,
+            // Read-only-ness is a correctness property, not a hardening bonus,
+            // and it is a property of the IMAGE BEING SHARED rather than of the
+            // flag: the node's one rootfs.ext4 serves every job on the node, so
+            // a writable one would let job N leave state for job N+1 — the
+            // exact cross-contamination this backend exists to prevent.
+            //
+            // A service-shaped guest is therefore not handed this flag flipped.
+            // It is handed a DIFFERENT image — its own private copy, which no
+            // other workload can observe — and `read_only: false` is safe there
+            // for the reason the shared image could never have made it safe.
+            // See `RootDisk`.
+            is_read_only: root.read_only,
         },
         Drive {
             drive_id: "workspace".into(),
@@ -685,9 +941,15 @@ pub fn vmm_config(
             path_on_host: toolchain.to_string_lossy().into_owned(),
             is_root_device: false,
             // The whole basis of R605-F23's resolution. One image serves every
-            // job on the node exactly as the rootfs does, so it is attached
-            // exactly as the rootfs is, and "mounted" costs nothing against
-            // "baked in" on the correctness axis they were argued to differ on.
+            // workload on the node, so it is attached the way a shared image
+            // has to be attached, and "mounted" costs nothing against "baked
+            // in" on the correctness axis they were argued to differ on.
+            //
+            // Unconditional across both shapes, unlike the root device, and for
+            // the reason above rather than by omission: the toolchain volume IS
+            // shared — there is one per node, not one per workload — so the
+            // argument that lets a service write its own private root says
+            // nothing at all about this one.
             is_read_only: true,
         });
     }
@@ -774,17 +1036,367 @@ pub fn guest_vcpus(cfg: &MicroVmConfig, spec: &WorkloadSpec) -> u32 {
 
 // ── Runtime ──────────────────────────────────────────────────────────────────
 
+/// One booted guest: the VMM process running it, and the pid to signal.
+///
+/// The supervisor's unit of work — [`crate::supervise`]'s `Instance` for this
+/// backend, exactly as `SpawnedChild` is for [`crate::native`].
+struct BootedGuest {
+    child: tokio::process::Child,
+    pid: u32,
+}
+
+/// Everything [`crate::supervise::supervise`] needs to boot this workload's
+/// guest again, and to make sense of it when it ends.
+///
+/// Note what is *not* here: the spec. Every decision that depended on it —
+/// argv, env, memory, vCPUs, drives, network — was resolved at deploy into
+/// `vm-config.json` and the job document on the scratch disk, and a reboot
+/// re-reads those files rather than re-deriving them. That is not a shortcut;
+/// it is what makes the machine an operator can read off disk the same machine
+/// the supervisor actually boots.
+struct GuestBoot {
+    workload: String,
+    shape: VmShape,
+    vmm_bin: PathBuf,
+    config_path: PathBuf,
+    console_path: PathBuf,
+    workspace_disk: PathBuf,
+    plan: Vec<workspace::PlannedMount>,
+    slot: Option<GuestSlot>,
+    net: Option<GuestNetwork>,
+}
+
 /// One live guest's host-side bookkeeping.
 struct VmHandle {
     slot: Option<GuestSlot>,
     mesh_ip: Ipv4Addr,
     vm_dir: PathBuf,
     console_path: PathBuf,
+    /// What this workload is, which is what decides whether
+    /// [`MicroVmRuntime::restart_workload`] means anything for it.
+    shape: VmShape,
     pid: Arc<AtomicU32>,
     status: watch::Receiver<WorkloadStatus>,
+    /// Control channel to the supervisor task, which owns the VMM process.
+    ///
+    /// Teardown goes through here rather than signalling the pid directly
+    /// (which is what this backend did before R605-F31): with a restart loop in
+    /// play, signalling behind the supervisor's back races it — the supervisor
+    /// would see the exit, consult the policy and boot a replacement, while
+    /// teardown sat waiting for a pid that had already been superseded.
+    ctrl: mpsc::Sender<Ctrl<BootedGuest>>,
     /// Supervisor task; detached on drop.
     #[allow(dead_code)]
     task: JoinHandle<()>,
+}
+
+impl GuestBoot {
+    /// Start the VMM on this workload's machine definition.
+    ///
+    /// `truncate` distinguishes the initial boot from a re-boot, and follows
+    /// [`crate::native`]'s convention exactly: the first boot truncates the
+    /// console capture, every later one appends, so a crash-looping service's
+    /// history survives the loop that produced it.
+    async fn boot(&self, truncate: bool) -> Result<BootedGuest> {
+        let console = if truncate {
+            std::fs::File::create(&self.console_path)
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.console_path)
+        }
+        .with_context(|| format!("opening {}", self.console_path.display()))?;
+
+        // R885-B10 — THE THIRD FORK PATH, and the one deliberately NOT attached
+        // to a cgroup leaf. `native` (keep-alive) and `jit` (on-demand) both put
+        // their children inside `<delegated-root>/<workload-id>/<generation>/`
+        // before `exec`; this one does not, and the reason is that the ceiling
+        // is already expressed somewhere else: a microVM's memory is the
+        // `mem_size_mib` written into its machine config, enforced by the VMM
+        // and by the guest kernel's own view of RAM, and the vCPU count is the
+        // cpu allocation. Wrapping a `memory.max` around the VMM process would
+        // put a second, independent ceiling on the same workload, and the one
+        // that fired first would be an OOM kill of the whole VM with no OOM
+        // inside the guest to explain it.
+        //
+        // This is a stated exclusion, not an oversight — if a later ticket
+        // decides the VMM *should* also sit in a leaf (for `pids.max`, or to
+        // bound VMM overhead above the guest's RAM), the mechanism to use is
+        // `CgroupHandle::attach_at_exec`, the same one both other paths use. Do
+        // not grow a second one here.
+        let child = tokio::process::Command::new(&self.vmm_bin)
+            .arg("--no-api")
+            .arg("--config-file")
+            .arg(&self.config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(console.try_clone()?))
+            .stderr(Stdio::from(console))
+            .kill_on_drop(false)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "spawning {} — is firecracker installed and is /dev/kvm openable?",
+                    self.vmm_bin.display()
+                )
+            })?;
+        let pid = child.id().unwrap_or(0);
+        Ok(BootedGuest { child, pid })
+    }
+
+    /// Free this guest's TAP device, warning rather than failing.
+    ///
+    /// A leak here costs the slot until kamaji restarts, which is worth a loud
+    /// log and not worth failing a workload over.
+    async fn release_tap(&self) {
+        if let (Some(slot), Some(net)) = (self.slot.as_ref(), self.net.as_ref()) {
+            if let Err(e) = net::delete_tap(slot, net).await {
+                tracing::warn!(workload = %self.workload, tap = %slot.tap, error = %e,
+                    "leaked a TAP device: the slot stays allocated until kamaji restarts");
+            }
+        }
+    }
+
+    /// R605-T24: log the terminal status, and specifically its REASON.
+    ///
+    /// Every arm of [`Self::settle_job`] composes a careful sentence naming what
+    /// went wrong, and until T24 not one of them was ever written anywhere: the
+    /// reason travelled only inside [`WorkloadStatus::Failed`], and by the time
+    /// it crossed the wire it had been flattened to the `WorkloadEntry` shape —
+    /// a bare `"Failed"` string with no reason field at all. So a caller
+    /// dispatching a forge through yubaba saw `status=Failed`, the node's
+    /// journal said nothing beyond "microVM booted" and "microVM torn down", and
+    /// the sentence that would have explained it was dropped on the floor.
+    ///
+    /// INFO, not WARN: a job that fails is this backend's ordinary business, and
+    /// the line is the run's epitaph either way.
+    fn log_outcome(&self, status: &WorkloadStatus) {
+        match status {
+            WorkloadStatus::Failed { reason, .. } => tracing::info!(
+                workload = %self.workload, shape = ?self.shape, %reason, "microVM instance failed"
+            ),
+            other => tracing::info!(
+                workload = %self.workload, shape = ?self.shape, status = ?other,
+                "microVM instance finished"
+            ),
+        }
+    }
+
+    /// A job's guest has halted: this is the end of the workload.
+    async fn settle_job(&self, exit: Exit) -> Completion {
+        // Artifacts come back out *after* the guest halts, not during: the
+        // scratch disk is a block device the guest owns exclusively while it
+        // runs, and reading a live ext4 from the host would see a half-written
+        // filesystem.
+        let extracted = workspace::extract_disk(&self.workspace_disk, &self.plan).await;
+        // The guest will not boot again, so the device is dead weight from here.
+        self.release_tap().await;
+
+        let (succeeded, exit_code, terminal) = match (exit, extracted) {
+            // The VMM exiting cleanly means the *machine* stopped, and says
+            // nothing about the job: a reset is a reset whether the build
+            // passed, failed, or panicked the guest kernel, so firecracker
+            // exits 0 for all three (measured — see JOB_STATUS_FILE). The
+            // guest's own status document is the only thing that can tell them
+            // apart, so a clean VMM exit is where reading it belongs.
+            (Ok(st), Ok(())) if st.success() => {
+                match workspace::read_job_status(&self.workspace_disk).await {
+                    Ok(js) if js.exit_code == 0 => (true, 0, WorkloadStatus::Stopped),
+                    Ok(js) => (
+                        false,
+                        js.exit_code,
+                        WorkloadStatus::Failed {
+                            oom_killed: false,
+                            // The guest's own `detail` already names the exit
+                            // code or the signal, so repeating the number here
+                            // would read "the job exited 3 ... job exited 3".
+                            // It is `#[serde(default)]` though, so an empty one
+                            // must still produce a reason worth reading.
+                            reason: if js.detail.is_empty() {
+                                format!("the job exited {} inside the guest", js.exit_code)
+                            } else {
+                                format!("the job failed inside the guest: {}", js.detail)
+                            },
+                        },
+                    ),
+                    Err(e) => (
+                        false,
+                        -1,
+                        WorkloadStatus::Failed {
+                            oom_killed: false,
+                            reason: format!("the guest did not report a job status: {e:#}"),
+                        },
+                    ),
+                }
+            }
+            (Ok(st), Ok(())) => (
+                false,
+                st.code().unwrap_or(-1),
+                WorkloadStatus::Failed {
+                    oom_killed: false,
+                    reason: format!("microVM exited with {st}"),
+                },
+            ),
+            (Ok(_), Err(e)) => (
+                false,
+                -1,
+                WorkloadStatus::Failed {
+                    oom_killed: false,
+                    reason: format!("guest finished but its artifacts could not be read back: {e:#}"),
+                },
+            ),
+            (Err(e), _) => (
+                false,
+                -1,
+                WorkloadStatus::Failed {
+                    oom_killed: false,
+                    reason: format!("waiting on the VMM failed: {e}"),
+                },
+            ),
+        };
+        self.log_outcome(&terminal);
+        Completion {
+            succeeded,
+            exit_code,
+            terminal,
+        }
+    }
+
+    /// A service's guest has gone away: this is the end of an *instance*.
+    ///
+    /// Two things the job path does are deliberately not done here.
+    ///
+    /// **Artifacts are not copied back out.** A service is not a producer; its
+    /// state lives on the scratch disk it keeps across restarts (and, once
+    /// R605-F33 lands the guest half, on its own root). Extracting between two
+    /// boots would cost the copy
+    /// on every crash and race the next boot for the block device it is about to
+    /// open.
+    ///
+    /// **The TAP device is not freed.** The next boot needs the same device on
+    /// the same `/30`; tearing it down between restarts would mean re-creating
+    /// it and re-installing the NAT rules on every crash, and would drop the
+    /// guest's address in between. [`MicroVmRuntime::teardown_workload`] frees
+    /// it, which is the point at which the guest really is not coming back.
+    ///
+    /// What is the *same* is the verdict: the guest's own status document, for
+    /// the reason [`JOB_STATUS_FILE`] gives — the VMM's exit code structurally
+    /// cannot carry it, and that is a property of firecracker rather than of
+    /// what the guest was running. A stale document from a previous instance
+    /// would be read as this one's, which is why [`Self::start`] clears it
+    /// before every re-boot.
+    async fn settle_service(&self, exit: Exit) -> Completion {
+        let (succeeded, exit_code, terminal) = match exit {
+            Ok(st) if st.success() => {
+                match workspace::read_job_status(&self.workspace_disk).await {
+                    Ok(js) if js.exit_code == 0 => (true, 0, WorkloadStatus::Stopped),
+                    Ok(js) => (
+                        false,
+                        js.exit_code,
+                        WorkloadStatus::Failed {
+                            oom_killed: false,
+                            reason: if js.detail.is_empty() {
+                                format!("the guest's process exited {}", js.exit_code)
+                            } else {
+                                format!("the guest's process failed: {}", js.detail)
+                            },
+                        },
+                    ),
+                    // A guest that reset without reporting panicked, was killed,
+                    // or never reached the end of its init. Not a success: a
+                    // service that resets silently must back off under
+                    // `OnFailure` rather than be credited with a clean run.
+                    Err(e) => (
+                        false,
+                        -1,
+                        WorkloadStatus::Failed {
+                            oom_killed: false,
+                            reason: format!("the guest reset without reporting a status: {e:#}"),
+                        },
+                    ),
+                }
+            }
+            Ok(st) => (
+                false,
+                st.code().unwrap_or(-1),
+                WorkloadStatus::Failed {
+                    oom_killed: false,
+                    reason: format!("microVM exited with {st}"),
+                },
+            ),
+            Err(e) => (
+                false,
+                -1,
+                WorkloadStatus::Failed {
+                    oom_killed: false,
+                    reason: format!("waiting on the VMM failed: {e}"),
+                },
+            ),
+        };
+        self.log_outcome(&terminal);
+        Completion {
+            succeeded,
+            exit_code,
+            terminal,
+        }
+    }
+}
+
+#[async_trait]
+impl Supervised for GuestBoot {
+    type Instance = BootedGuest;
+
+    fn pid(&self, inst: &BootedGuest) -> u32 {
+        inst.pid
+    }
+
+    async fn wait(&self, inst: &mut BootedGuest) -> Exit {
+        inst.child.wait().await
+    }
+
+    /// Boot the guest again from the machine definition already on disk.
+    ///
+    /// Only ever called for a service — a job's `RestartPolicy::Never` means the
+    /// supervisor never asks, and [`MicroVmRuntime::restart_workload`] refuses
+    /// to ask on its behalf.
+    async fn start(&self) -> Result<BootedGuest> {
+        // Drop the previous instance's verdict before booting, so the next
+        // exit's status document cannot be this one's. A failure here degrades
+        // to a stale read, not to a dead workload, so it warns and continues.
+        if let Err(e) = workspace::clear_job_status(&self.workspace_disk).await {
+            tracing::warn!(
+                workload = %self.workload, error = %format!("{e:#}"),
+                "could not clear the previous instance's status document; a guest that resets \
+                 without writing a new one may be reported with the previous verdict"
+            );
+        }
+        self.boot(false).await
+    }
+
+    /// SIGTERM to Firecracker is a guest power-off, not a guest signal: there is
+    /// nothing inside to catch it. That is why teardown is not the normal
+    /// completion path for either shape — the normal path is the guest going
+    /// away on its own, which the supervisor sees as the VMM process exiting.
+    async fn stop(&self, inst: &mut BootedGuest) {
+        if matches!(inst.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        signal_pid(inst.pid, libc::SIGTERM);
+        if tokio::time::timeout(TERM_GRACE, inst.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = inst.child.start_kill();
+            let _ = inst.child.wait().await;
+        }
+    }
+
+    async fn settle(&self, exit: Exit) -> Completion {
+        match self.shape {
+            VmShape::Job => self.settle_job(exit).await,
+            VmShape::Service => self.settle_service(exit).await,
+        }
+    }
 }
 
 /// Firecracker microVM backend. One instance runs any number of guests, each in
@@ -905,6 +1517,30 @@ impl Kamaji for MicroVmRuntime {
         workload_spec::admission::check(spec)
             .map_err(|e| anyhow!("workload {} not admitted: {e}", spec.name))?;
 
+        // Job or service (R605-F31). Every decision below that differs between
+        // the two reads this one value, and nothing else.
+        let shape = VmShape::of_spec(spec);
+
+        // A job-shaped guest that asks to be restarted is a spec that
+        // contradicts itself, and it is refused here rather than silently
+        // demoted. `restart_workload` explains the substance: re-running a job
+        // means a fresh guest with a fresh workspace, so a supervisor that
+        // re-booted this one would hand the retry the previous run's output
+        // disk. The forge convention (`WorkloadSpec::for_forge`) already sets
+        // `Never`, so nothing the fleet dispatches today reaches this.
+        if shape == VmShape::Job && !matches!(spec.restart_policy, RestartPolicy::Never) {
+            return Err(anyhow!(
+                "workload {}: Backend::MicroVm was handed a job-shaped spec ({:?}) with \
+                 restart_policy {:?}. A job's retry needs a fresh workspace, so restarting this \
+                 guest in place would re-run it over the last run's output. Set \
+                 restart_policy = never, or declare archetype = server/appliance if this really \
+                 is a long-lived VM",
+                spec.name,
+                spec.effective_archetype(),
+                spec.restart_policy,
+            ));
+        }
+
         let ident = spec.expose.mesh.identity.clone();
         // Idempotent, like every other backend's deploy.
         self.teardown_workload(&ident).await?;
@@ -915,15 +1551,27 @@ impl Kamaji for MicroVmRuntime {
             .await
             .with_context(|| format!("creating microVM state dir {}", vm_dir.display()))?;
 
-        // 1. Scratch disk: the job's input tree in, its artifacts out.
+        // 1. Scratch disk: the workload's input tree in, and for a job its
+        //    artifacts out. Rebuilt on every deploy for both shapes — it is the
+        //    declared-inputs channel, so a redeploy must present what the
+        //    current spec declares. A service's *durable* state is its root
+        //    (step 3), which is exactly what is not rebuilt.
         let disk = vm_dir.join("workspace.ext4");
         let plan = workspace::plan(spec);
-        workspace::build_disk(&plan, &disk, spec.resources.ephemeral_storage_mb)
+        workspace::build_disk(&plan, &disk, spec.scratch_floor_mb())
             .await
             .with_context(|| format!("building scratch disk for workload {}", spec.name))?;
 
         // 2. The job document, written *into* that disk — the guest has no
         //    other way to be told what it was booted for.
+        //
+        //    Identical for both shapes, deliberately. The document is a
+        //    cross-artifact contract with a rootfs image that ships separately
+        //    (see JOB_SCHEMA_VERSION), a service needs exactly what a job needs
+        //    from it — argv, env, mounts, a resolver — and teaching the guest
+        //    about archetypes would mean a schema bump that every rootfs image
+        //    already in the fleet would refuse. The shape is the host's
+        //    business; the guest's job is the same either way.
         let job = MicroVmJob::of_spec(
             spec,
             &plan,
@@ -933,7 +1581,13 @@ impl Kamaji for MicroVmRuntime {
             .await
             .with_context(|| format!("writing {JOB_FILE} into {}", disk.display()))?;
 
-        // 3. Host networking for this slot.
+        // 3. Root device: the node's shared read-only image for a job, this
+        //    workload's own writable copy for a service (seeded from the node's
+        //    if it has none yet, kept as-is if it has).
+        let root = RootDisk::for_shape(&self.cfg, shape, &vm_dir);
+        root.provision(&self.cfg).await?;
+
+        // 4. Host networking for this slot.
         if let (Some(slot), Some(net)) = (slot.as_ref(), self.cfg.network.as_ref()) {
             net::create_tap(slot, net).await.with_context(|| {
                 format!(
@@ -943,125 +1597,60 @@ impl Kamaji for MicroVmRuntime {
             })?;
         }
 
-        // 4. The machine definition, kept on disk next to the logs.
+        // 5. The machine definition, kept on disk next to the logs. A restart
+        //    re-reads this file rather than re-deriving it, so what an operator
+        //    can read here is what the supervisor actually boots.
         let config_path = vm_dir.join("vm-config.json");
-        let vmm = vmm_config(&self.cfg, spec, slot.as_ref(), &disk)?;
+        let vmm = vmm_config(&self.cfg, spec, slot.as_ref(), &disk, &root)?;
         tokio::fs::write(&config_path, serde_json::to_vec_pretty(&vmm)?)
             .await
             .with_context(|| format!("writing {}", config_path.display()))?;
 
-        // 5. Boot. The guest console is the workload's log, so it is captured
-        //    the same way the native backend captures stdout.
-        let console_path = vm_dir.join("console.log");
-        let console = std::fs::File::create(&console_path)
-            .with_context(|| format!("creating {}", console_path.display()))?;
-        let mut child = tokio::process::Command::new(&self.cfg.vmm_bin)
-            .arg("--no-api")
-            .arg("--config-file")
-            .arg(&config_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(console.try_clone()?))
-            .stderr(Stdio::from(console))
-            .kill_on_drop(false)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "spawning {} — is firecracker installed and is /dev/kvm openable?",
-                    self.cfg.vmm_bin.display()
-                )
-            })?;
+        // 6. Boot, and hand the guest to the shared supervisor.
+        //
+        //    The first boot happens here rather than inside the supervisor so a
+        //    boot failure (no firecracker, no /dev/kvm) surfaces to the caller
+        //    instead of dying in a background task — the same reason the native
+        //    backend fork+execs its first child synchronously.
+        let boot = GuestBoot {
+            workload: spec.name.clone(),
+            shape,
+            vmm_bin: self.cfg.vmm_bin.clone(),
+            config_path,
+            // The guest console is the workload's log, so it is captured the
+            // same way the native backend captures stdout.
+            console_path: vm_dir.join("console.log"),
+            workspace_disk: disk,
+            plan,
+            slot: slot.clone(),
+            net: self.cfg.network.clone(),
+        };
+        let console_path = boot.console_path.clone();
+        let initial = boot.boot(true).await?;
+        let vm_pid = initial.pid;
 
-        let vm_pid = child.id().unwrap_or(0);
         let pid = Arc::new(AtomicU32::new(vm_pid));
         let (status_tx, status_rx) = watch::channel(WorkloadStatus::Running);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        // One restart loop, shared with the native backend (crate::supervise).
+        // For a job the policy is `Never` — checked above — and the supervisor's
+        // handling of `Never` (settle, publish the terminal status, park) is
+        // precisely the behaviour this backend had when it had no supervisor at
+        // all, which is why the job path's observable semantics are unchanged.
+        let task = tokio::spawn(supervise(
+            boot,
+            spec.restart_policy.clone(),
+            initial,
+            Arc::clone(&pid),
+            status_tx,
+            ctrl_rx,
+        ));
 
-        let supervisor_slot = slot.clone();
-        let supervisor_net = self.cfg.network.clone();
-        let supervisor_disk = disk.clone();
-        let supervisor_plan = plan.clone();
-        let supervisor_pid = Arc::clone(&pid);
-        let name = spec.name.clone();
-        let task = tokio::spawn(async move {
-            let outcome = child.wait().await;
-            supervisor_pid.store(0, Ordering::SeqCst);
-
-            // Artifacts come back out *after* the guest halts, not during: the
-            // scratch disk is a block device the guest owns exclusively while
-            // it runs, and reading a live ext4 from the host would see a
-            // half-written filesystem.
-            let extracted = workspace::extract_disk(&supervisor_disk, &supervisor_plan).await;
-
-            if let (Some(slot), Some(net)) = (supervisor_slot.as_ref(), supervisor_net.as_ref()) {
-                if let Err(e) = net::delete_tap(slot, net).await {
-                    tracing::warn!(workload = %name, tap = %slot.tap, error = %e,
-                        "leaked a TAP device: the slot stays allocated until kamaji restarts");
-                }
-            }
-
-            let status = match (outcome, extracted) {
-                // The VMM exiting cleanly means the *machine* stopped, and says
-                // nothing about the job: a reset is a reset whether the build
-                // passed, failed, or panicked the guest kernel, so firecracker
-                // exits 0 for all three (measured — see JOB_STATUS_FILE). The
-                // guest's own status document is the only thing that can tell
-                // them apart, so a clean VMM exit is where reading it belongs.
-                (Ok(st), Ok(())) if st.success() => {
-                    match workspace::read_job_status(&supervisor_disk).await {
-                        Ok(js) if js.exit_code == 0 => WorkloadStatus::Stopped,
-                        Ok(js) => WorkloadStatus::Failed {
-                            // The guest's own `detail` already names the exit code
-                            // or the signal, so repeating the number here would
-                            // read "the job exited 3 ... job exited 3". It is
-                            // `#[serde(default)]` though, so an empty one must
-                            // still produce a reason worth reading.
-                            reason: if js.detail.is_empty() {
-                                format!("the job exited {} inside the guest", js.exit_code)
-                            } else {
-                                format!("the job failed inside the guest: {}", js.detail)
-                            },
-                        },
-                        Err(e) => WorkloadStatus::Failed {
-                            reason: format!("the guest did not report a job status: {e:#}"),
-                        },
-                    }
-                }
-                (Ok(st), Ok(())) => WorkloadStatus::Failed {
-                    reason: format!("microVM exited with {st}"),
-                },
-                (Ok(_), Err(e)) => WorkloadStatus::Failed {
-                    reason: format!("guest finished but its artifacts could not be read back: {e:#}"),
-                },
-                (Err(e), _) => WorkloadStatus::Failed {
-                    reason: format!("waiting on the VMM failed: {e}"),
-                },
-            };
-            // R605-T24: log the terminal status, and specifically its REASON.
-            //
-            // Every one of the five arms above composes a careful sentence
-            // naming what went wrong, and until now not one of them was ever
-            // written anywhere: the reason travelled only inside
-            // `WorkloadStatus::Failed`, and by the time it crossed the wire it
-            // had been flattened to the `WorkloadEntry` shape — a bare
-            // `"Failed"` string with no reason field at all. So a caller
-            // dispatching a forge through yubaba saw `status=Failed`, the node's
-            // journal said nothing beyond "microVM booted" and "microVM torn
-            // down", and the sentence that would have explained it was dropped
-            // on the floor. That is how this ticket's first green dispatch —
-            // guest booted, job exited 0, artifacts extracted — was reported as
-            // a failure that took a disk forensics pass to even characterise.
-            //
-            // INFO, not WARN: a job that fails is this backend's ordinary
-            // business, and the line is the run's epitaph either way.
-            match &status {
-                WorkloadStatus::Failed { reason } => tracing::info!(
-                    workload = %name, %reason, "microVM job failed"
-                ),
-                other => tracing::info!(
-                    workload = %name, status = ?other, "microVM job finished"
-                ),
-            }
-            let _ = status_tx.send(status);
-        });
+        tracing::info!(
+            workload = %spec.name, shape = ?shape, pid = vm_pid,
+            root = %root.path.display(), root_read_only = root.read_only,
+            "microVM booted"
+        );
 
         self.vms.lock().await.insert(
             ident.0.clone(),
@@ -1070,8 +1659,10 @@ impl Kamaji for MicroVmRuntime {
                 mesh_ip: mesh.mesh_ip,
                 vm_dir,
                 console_path,
+                shape,
                 pid,
                 status: status_rx,
+                ctrl: ctrl_tx,
                 task,
             },
         );
@@ -1080,6 +1671,7 @@ impl Kamaji for MicroVmRuntime {
             container_id: format!("microvm-{vm_pid}"),
             mesh_ip: mesh.mesh_ip,
             task_pid: vm_pid,
+            hydrate: None,
             // R844-F2: the guest owns its own network stack, so the declared
             // port is the bound port — nothing for this backend to resolve.
             ports: Default::default(),
@@ -1151,20 +1743,46 @@ impl Kamaji for MicroVmRuntime {
         Ok(Box::pin(tokio_stream::iter(events)))
     }
 
-    /// Not supported, on purpose.
+    /// Re-boot a service's guest in place; refused for a job, naming why.
     ///
-    /// Restart means "run this again", and for a job that is a new run with a
-    /// fresh workspace — the scratch disk this guest halted with holds a failed
-    /// build's output, and rebooting into it would produce a result neither
-    /// clean nor reproducible. The dispatcher decides to retry; the supervisor
-    /// does not decide for it.
+    /// The refusal is the substance, not the leftover. Restart means "run this
+    /// again", and for a job that is a *new run with a fresh workspace* — the
+    /// scratch disk this guest halted with holds the last run's output, and
+    /// re-booting into it would produce a result neither clean nor reproducible.
+    /// The dispatcher decides to retry a job; the supervisor does not decide for
+    /// it.
+    ///
+    /// None of that is true of a service. Its scratch disk is state it is meant
+    /// to keep, its root is its own, and "bring it back" is exactly what a
+    /// supervisor is for — so for a service this does what the native backend's
+    /// has always done: hand the live supervisor a `Restart` and wait for the
+    /// new pid.
     async fn restart_workload(&self, ident: &MeshIdent) -> Result<()> {
-        bail!(
-            "Backend::MicroVm does not restart workload {} in place: it is job-shaped \
-             (LifecycleArchetype::Job, RestartPolicy::Never), and re-running a build means a \
-             fresh guest with a fresh workspace. Tear down and deploy again",
-            ident.0
-        )
+        let (shape, ctrl) = {
+            let vms = self.vms.lock().await;
+            let Some(h) = vms.get(&ident.0) else {
+                return Err(anyhow!("no microVM workload with identity {}", ident.0));
+            };
+            (h.shape, h.ctrl.clone())
+        };
+
+        if shape == VmShape::Job {
+            bail!(
+                "Backend::MicroVm does not restart workload {} in place: it is job-shaped \
+                 (LifecycleArchetype::Job, RestartPolicy::Never), and re-running a build means a \
+                 fresh guest with a fresh workspace. Tear down and deploy again",
+                ident.0
+            );
+        }
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        ctrl.send(Ctrl::Restart(ack_tx))
+            .await
+            .map_err(|_| anyhow!("supervisor for {} is gone", ident.0))?;
+        ack_rx
+            .await
+            .map_err(|_| anyhow!("supervisor for {} dropped before restart ack", ident.0))??;
+        Ok(())
     }
 
     async fn teardown_workload(&self, ident: &MeshIdent) -> Result<()> {
@@ -1172,25 +1790,17 @@ impl Kamaji for MicroVmRuntime {
             return Ok(()); // idempotent
         };
 
-        let pid = handle.pid.load(Ordering::SeqCst);
-        if pid != 0 {
-            // SIGTERM to Firecracker is a guest power-off, not a guest signal:
-            // there is nothing inside to catch it. That is acceptable for a job
-            // being torn down (its artifacts are already lost either way) and
-            // is why teardown is not the normal completion path — the normal
-            // path is the guest halting on its own, which the supervisor sees
-            // as the VMM process exiting.
-            signal_pid(pid, libc::SIGTERM);
-            let deadline = std::time::Instant::now() + TERM_GRACE;
-            while std::time::Instant::now() < deadline {
-                if handle.pid.load(Ordering::SeqCst) == 0 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if handle.pid.load(Ordering::SeqCst) != 0 {
-                signal_pid(pid, libc::SIGKILL);
-            }
+        // Through the supervisor, not around it. The supervisor owns the VMM
+        // process; signalling the pid ourselves would race a service's restart
+        // loop, which would see the exit, consult the policy and boot a
+        // replacement we then had no handle on. `Ctrl::Teardown` stops the
+        // instance AND ends supervision, in that order, with one owner.
+        //
+        // A dead supervisor (its task already returned) is not an error — that
+        // is a torn-down workload, which is what was asked for.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if handle.ctrl.send(Ctrl::Teardown(ack_tx)).await.is_ok() {
+            let _ = tokio::time::timeout(TERM_GRACE * 2, ack_rx).await;
         }
 
         if let (Some(slot), Some(net)) = (handle.slot.as_ref(), self.cfg.network.as_ref()) {
@@ -1371,29 +1981,35 @@ pub mod workspace {
         }
     }
 
-    /// Size the scratch image: the largest of what the spec asks for, what the
-    /// input tree implies, and [`WORKSPACE_MIN_BYTES`].
+    /// Size the scratch image: the largest of the workload's declared floor,
+    /// what the input tree implies, and [`WORKSPACE_MIN_BYTES`].
     ///
-    /// # Why `ephemeral_storage_mb` is a floor and not the answer
+    /// # Every input here is a floor, and that is now said out loud
     ///
-    /// It is the field that *means* this — "cap on the writable layer + tmpfs
-    /// footprint" — and on the container path nothing enforces it, so it has
-    /// drifted: `WorkloadSpec::for_forge` sets **512 MiB**, and the builds this
-    /// backend exists to isolate check out multi-gigabyte source trees. Taking
-    /// it literally would hand every forge run a 512 MiB disk and fail every
-    /// one of them at the first `git clone`.
+    /// `scratch_floor_mb` is [`WorkloadSpec::scratch_floor_mb`] — the
+    /// `yah.limits.scratch-floor-mb` annotation, `None` when the workload
+    /// declares none. Until R885-T6 this argument was
+    /// `ResourceLimits::ephemeral_storage_mb`, a field whose own doc comment
+    /// called it a **cap** on the writable layer. This function has always read
+    /// it as a **floor**, i.e. the exact opposite, and it was right to: the
+    /// builds this backend exists to isolate check out multi-gigabyte source
+    /// trees, `for_forge` set the field to 512 MiB, and obeying that as a cap
+    /// would have failed every forge run at its first `git clone`. The field is
+    /// gone and the floor is spelled `floor`; nothing about the arithmetic
+    /// below changed, only the name of the thing it reads.
     ///
     /// This is the mirror image of [`super::guest_memory_mb`]'s problem and the
     /// treatment is deliberately opposite. Memory is a real allocation, so an
     /// over-large spec value must be clamped *down* to what the node has.
-    /// Scratch is a sparse file, so an under-set spec value is raised *up* to
-    /// what a build needs, and costs only the blocks actually written. Neither
-    /// field can simply be believed; each is wrong in a different direction.
-    pub fn disk_size_bytes(input_bytes: u64, ephemeral_storage_mb: u32) -> u64 {
-        let requested = u64::from(ephemeral_storage_mb).saturating_mul(1024 * 1024);
+    /// Scratch is a sparse file, so a small declared floor is raised *up* to
+    /// what a build needs, and costs only the blocks actually written.
+    ///
+    /// [`WorkloadSpec::scratch_floor_mb`]: workload_spec::WorkloadSpec::scratch_floor_mb
+    pub fn disk_size_bytes(input_bytes: u64, scratch_floor_mb: Option<u32>) -> u64 {
+        let declared = u64::from(scratch_floor_mb.unwrap_or(0)).saturating_mul(1024 * 1024);
         input_bytes
             .saturating_mul(WORKSPACE_SIZE_MULTIPLIER)
-            .max(requested)
+            .max(declared)
             .max(WORKSPACE_MIN_BYTES)
     }
 
@@ -1424,7 +2040,7 @@ pub mod workspace {
     pub async fn build_disk(
         plan: &[PlannedMount],
         image: &Path,
-        ephemeral_storage_mb: u32,
+        scratch_floor_mb: Option<u32>,
     ) -> Result<()> {
         let staging = image.with_extension("staging");
         let _ = tokio::fs::remove_dir_all(&staging).await;
@@ -1455,7 +2071,7 @@ pub mod workspace {
             .await?;
         }
 
-        let size = disk_size_bytes(input_bytes, ephemeral_storage_mb);
+        let size = disk_size_bytes(input_bytes, scratch_floor_mb);
         let file = std::fs::File::create(image)
             .with_context(|| format!("creating {}", image.display()))?;
         // Sparse: the image is sized for the build's *worst case*, and a
@@ -1540,6 +2156,31 @@ pub mod workspace {
             );
         }
         Ok(status)
+    }
+
+    /// Remove a previous instance's [`JOB_STATUS_FILE`] from the scratch disk
+    /// (R605-F31).
+    ///
+    /// The job path never needs this: a job's guest boots exactly once, so there
+    /// is no previous document to mistake for this one's. A **service**'s guest
+    /// boots again after every restart, and one that is killed before its init
+    /// can write a new document would otherwise leave the supervisor reading the
+    /// previous instance's verdict and attributing it to this one — reporting a
+    /// crashed service as having exited cleanly, which is the same class of lie
+    /// [`JOB_STATUS_FILE`] exists to prevent.
+    ///
+    /// `debugfs rm` unlinks and deallocates, the same `-w` route
+    /// [`write_job`] already uses, so this adds no dependency. Like every
+    /// `debugfs` call here it exits 0 on a file that is not in the image, which
+    /// is the wanted behaviour for the first restart.
+    pub async fn clear_job_status(image: &Path) -> Result<()> {
+        let script = format!("rm /{JOB_STATUS_FILE}");
+        run(
+            "debugfs",
+            &["-w".as_ref(), "-R".as_ref(), script.as_ref(), image.as_os_str()],
+        )
+        .await
+        .context("debugfs rm failed — is e2fsprogs installed on this node?")
     }
 
     /// Copy the guest's output back over the host-side bind sources.
@@ -1990,6 +2631,84 @@ mod tests {
         spec
     }
 
+    /// The same workload, declared as something meant to still be there
+    /// tomorrow (R605-F31).
+    ///
+    /// Declared explicitly rather than inferred, because the point of the
+    /// archetype field is that a workload gets to *say* what it is: the
+    /// inference `LifecycleArchetype::infer` applies to specs written before the
+    /// field existed reads `RestartPolicy::Never` + no volumes as `Job`, which
+    /// is exactly what a forge spec is and exactly what this is not.
+    fn service_spec(name: &str) -> WorkloadSpec {
+        let mut spec = spec(name);
+        spec.archetype = Some(workload_spec::LifecycleArchetype::Server);
+        spec.restart_policy = RestartPolicy::Always;
+        spec
+    }
+
+    /// The VM dir a workload's private state lives in, for the root helpers.
+    fn vm_dir() -> PathBuf {
+        PathBuf::from("/var/lib/yah/microvm/vms/b")
+    }
+
+    /// What a job-shaped guest boots: the node's one shared image, read-only.
+    fn job_root() -> RootDisk {
+        RootDisk::for_shape(&cfg(), VmShape::Job, &vm_dir())
+    }
+
+    /// What a service-shaped guest boots: its own copy, writable.
+    fn service_root() -> RootDisk {
+        RootDisk::for_shape(&cfg(), VmShape::Service, &vm_dir())
+    }
+
+    /// A constructible backend rooted in `tmp` — the guest material only has to
+    /// *exist* for `MicroVmRuntime::new`, which is what these tests need.
+    fn runtime_on(tmp: &tempfile::TempDir) -> MicroVmRuntime {
+        let mut c = cfg();
+        for p in ["firecracker", "vmlinux", "rootfs.ext4"] {
+            std::fs::write(tmp.path().join(p), b"").unwrap();
+        }
+        c.vmm_bin = tmp.path().join("firecracker");
+        c.kernel_image = tmp.path().join("vmlinux");
+        c.rootfs_image = tmp.path().join("rootfs.ext4");
+        c.state_dir = tmp.path().join("vms");
+        MicroVmRuntime::new(c).unwrap()
+    }
+
+    /// Register a workload of `shape` without booting a hypervisor, returning
+    /// the control channel a real supervisor would be reading.
+    ///
+    /// The lifecycle branches this backend gained in R605-F31 are decided from
+    /// the registry entry, not from anything a guest does, so they are testable
+    /// on a host with no `/dev/kvm` — which is every host in this camp.
+    async fn register(
+        rt: &MicroVmRuntime,
+        ident: &str,
+        shape: VmShape,
+    ) -> mpsc::Receiver<Ctrl<BootedGuest>> {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (status_tx, status_rx) = watch::channel(WorkloadStatus::Running);
+        // Kept alive for the life of the handle, as the real supervisor's is.
+        let task = tokio::spawn(async move {
+            status_tx.closed().await;
+        });
+        rt.vms.lock().await.insert(
+            ident.to_string(),
+            VmHandle {
+                slot: None,
+                mesh_ip: Ipv4Addr::new(100, 64, 0, 9),
+                vm_dir: rt.cfg.state_dir.join(ident),
+                console_path: rt.cfg.state_dir.join(ident).join("console.log"),
+                shape,
+                pid: Arc::new(AtomicU32::new(0)),
+                status: status_rx,
+                ctrl: ctrl_tx,
+                task,
+            },
+        );
+        ctrl_rx
+    }
+
     // ── Slot arithmetic ─────────────────────────────────────────────────────
 
     #[test]
@@ -2086,7 +2805,10 @@ mod tests {
         spec.resources = ResourceLimits {
             memory_mb: 4096,
             cpu_millis: 1500,
-            ephemeral_storage_mb: 512,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         };
         // 1.5 cores rounds up to 2: a VM cannot be scheduled onto a fraction.
         assert_eq!(guest_vcpus(&cfg(), &spec), 2);
@@ -2103,16 +2825,69 @@ mod tests {
     #[test]
     fn the_rootfs_is_read_only_and_the_workspace_is_not() {
         let slot = GuestSlot::derive(&GuestNetwork::for_uplink("eth0"), 0).unwrap();
-        let vm = vmm_config(&cfg(), &spec("b"), Some(&slot), Path::new("/w/workspace.ext4")).unwrap();
+        let vm = vmm_config(&cfg(), &spec("b"), Some(&slot), Path::new("/w/workspace.ext4"), &job_root()).unwrap();
 
         let root = vm.drives.iter().find(|d| d.is_root_device).unwrap();
         assert!(
             root.is_read_only,
             "a writable shared rootfs lets job N leave state for job N+1"
         );
+        assert_eq!(
+            root.path_on_host, "/var/lib/yah/microvm/rootfs.ext4",
+            "a job boots the NODE's image — that sharing is why it must stay read-only"
+        );
         let work = vm.drives.iter().find(|d| d.drive_id == "workspace").unwrap();
         assert!(!work.is_read_only);
         assert!(!work.is_root_device);
+    }
+
+    /// The other half of the property above (R605-F31).
+    ///
+    /// A service is allowed a writable root, and the reason it is allowed one is
+    /// **not** that the rule was relaxed — it is that a service does not share
+    /// the image the rule is about. Both halves are asserted together here
+    /// because checking only `is_read_only == false` would pass just as happily
+    /// if someone had flipped the flag on the node's shared image, which is the
+    /// single edit that silently destroys the guarantee.
+    #[test]
+    fn a_service_gets_its_own_root_and_never_writes_the_nodes() {
+        let vm = vmm_config(
+            &cfg(),
+            &service_spec("s"),
+            None,
+            Path::new("/w/d.ext4"),
+            &service_root(),
+        )
+        .unwrap();
+
+        let root = vm.drives.iter().find(|d| d.is_root_device).unwrap();
+        assert!(!root.is_read_only, "a service's root is the workload's, not the node's");
+        assert_eq!(
+            root.path_on_host, "/var/lib/yah/microvm/vms/b/rootfs.ext4",
+            "the writable root is a PRIVATE copy inside the workload's own VM dir"
+        );
+        assert_ne!(
+            root.path_on_host,
+            cfg().rootfs_image.to_string_lossy(),
+            "the node's shared image must never be the thing a guest writes to"
+        );
+    }
+
+    /// The shape comes from the archetype, through the one seam the rest of the
+    /// fleet uses to ask the same question.
+    #[test]
+    fn the_shape_is_read_off_the_archetype_not_off_a_flag() {
+        // A forge spec: Never + no volumes infers Job, per the pre-R572
+        // convention `effective_archetype` preserves.
+        assert_eq!(VmShape::of_spec(&spec("b")), VmShape::Job);
+        assert_eq!(VmShape::of_spec(&service_spec("s")), VmShape::Service);
+
+        // Appliance is service-shaped too: the Server/Appliance distinction is
+        // the scheduler's question (may this move?), not the hypervisor's.
+        let mut appliance = spec("a");
+        appliance.archetype = Some(workload_spec::LifecycleArchetype::Appliance);
+        appliance.restart_policy = RestartPolicy::Always;
+        assert_eq!(VmShape::of_spec(&appliance), VmShape::Service);
     }
 
     /// R605-F23's whole argument, as an assertion.
@@ -2125,7 +2900,7 @@ mod tests {
     /// again.
     #[test]
     fn the_toolchain_volume_is_as_read_only_as_the_rootfs() {
-        let vm = vmm_config(&cfg_with_toolchain(), &spec("b"), None, Path::new("/w/d.ext4")).unwrap();
+        let vm = vmm_config(&cfg_with_toolchain(), &spec("b"), None, Path::new("/w/d.ext4"), &job_root()).unwrap();
 
         let tc = vm
             .drives
@@ -2147,7 +2922,7 @@ mod tests {
         // Absent is a legitimate configuration, not a degraded one: it is what
         // every node ran before R605-F23, and the guest still mounts and still
         // runs argv. The drive list must not grow a hole for it.
-        let vm = vmm_config(&cfg(), &spec("b"), None, Path::new("/w/d.ext4")).unwrap();
+        let vm = vmm_config(&cfg(), &spec("b"), None, Path::new("/w/d.ext4"), &job_root()).unwrap();
         assert_eq!(vm.drives.len(), 2);
         assert!(vm.drives.iter().all(|d| d.drive_id != "toolchain"));
     }
@@ -2158,7 +2933,7 @@ mod tests {
     /// contract with `kamaji-guest-init`, not an implementation detail.
     #[test]
     fn the_toolchain_is_the_third_drive_after_the_rootfs_and_the_scratch_disk() {
-        let vm = vmm_config(&cfg_with_toolchain(), &spec("b"), None, Path::new("/w/d.ext4")).unwrap();
+        let vm = vmm_config(&cfg_with_toolchain(), &spec("b"), None, Path::new("/w/d.ext4"), &job_root()).unwrap();
         let ids: Vec<&str> = vm.drives.iter().map(|d| d.drive_id.as_str()).collect();
         assert_eq!(ids, ["rootfs", "workspace", "toolchain"]);
     }
@@ -2168,17 +2943,40 @@ mod tests {
         // `panic=1 reboot=k` is what turns "the VMM process ended" into a
         // completion signal. Without it a crashed guest is indistinguishable
         // from a slow build until teardown.
-        let vm = vmm_config(&cfg(), &spec("b"), None, Path::new("/w/d.ext4")).unwrap();
+        let vm = vmm_config(&cfg(), &spec("b"), None, Path::new("/w/d.ext4"), &job_root()).unwrap();
         assert!(vm.boot_source.boot_args.contains("panic=1"));
         assert!(vm.boot_source.boot_args.contains("reboot=k"));
         assert!(vm.boot_source.boot_args.contains("console=ttyS0"));
+    }
+
+    /// R605-F31 expected the boot args to become archetype-dependent and they
+    /// did not, so the *sameness* is pinned rather than left to be rediscovered.
+    ///
+    /// A service needs `panic=1 reboot=k` for the same reason a job does — the
+    /// host has to find out that the guest is gone. What differs is what the
+    /// host then does about it, and that is the supervisor's restart policy, not
+    /// a kernel command line. Removing them for services would buy exactly one
+    /// thing: a panicked service guest that hangs forever reporting `Running`.
+    #[test]
+    fn a_service_boots_with_the_same_args_because_only_the_reading_changes() {
+        let job = vmm_config(&cfg(), &spec("b"), None, Path::new("/w/d.ext4"), &job_root()).unwrap();
+        let svc = vmm_config(
+            &cfg(),
+            &service_spec("s"),
+            None,
+            Path::new("/w/d.ext4"),
+            &service_root(),
+        )
+        .unwrap();
+        assert_eq!(job.boot_source.boot_args, svc.boot_source.boot_args);
+        assert_eq!(job.boot_source.kernel_image_path, svc.boot_source.kernel_image_path);
     }
 
     #[test]
     fn an_air_gapped_node_emits_no_network_interface() {
         let mut cfg = cfg();
         cfg.network = None;
-        let vm = vmm_config(&cfg, &spec("b"), None, Path::new("/w/d.ext4")).unwrap();
+        let vm = vmm_config(&cfg, &spec("b"), None, Path::new("/w/d.ext4"), &job_root()).unwrap();
         assert!(vm.network_interfaces.is_empty());
         // And the guest is not handed an `ip=` it has no interface for.
         assert!(!vm.boot_source.boot_args.contains("ip="));
@@ -2195,7 +2993,7 @@ mod tests {
         // These are an external contract with a binary that will reject
         // anything else, and nothing else in the build would catch a rename.
         let slot = GuestSlot::derive(&GuestNetwork::for_uplink("eth0"), 0).unwrap();
-        let vm = vmm_config(&cfg(), &spec("b"), Some(&slot), Path::new("/w/d.ext4")).unwrap();
+        let vm = vmm_config(&cfg(), &spec("b"), Some(&slot), Path::new("/w/d.ext4"), &job_root()).unwrap();
         let json = serde_json::to_value(&vm).unwrap();
         for key in ["boot-source", "drives", "machine-config", "network-interfaces"] {
             assert!(json.get(key).is_some(), "missing top-level key {key}");
@@ -2328,18 +3126,68 @@ mod tests {
 
     #[test]
     fn disk_size_floors_then_scales() {
-        // for_forge's 512 MiB `ephemeral_storage_mb` must NOT win — that is the
-        // exact value that would fail every real build at its first checkout.
-        assert_eq!(workspace::disk_size_bytes(0, 512), WORKSPACE_MIN_BYTES);
+        // for_forge's 512 MiB scratch floor must NOT win — that is the exact
+        // value that would fail every real build at its first checkout.
+        assert_eq!(workspace::disk_size_bytes(0, Some(512)), WORKSPACE_MIN_BYTES);
         let big = 10 * 1024 * 1024 * 1024u64;
-        assert_eq!(workspace::disk_size_bytes(big, 512), big * 4);
+        assert_eq!(workspace::disk_size_bytes(big, Some(512)), big * 4);
         // But a spec that genuinely asks for more than the heuristic gets it.
         assert_eq!(
-            workspace::disk_size_bytes(0, 64 * 1024),
+            workspace::disk_size_bytes(0, Some(64 * 1024)),
             64 * 1024 * 1024 * 1024
         );
         // No overflow panic on an absurd input.
-        assert!(workspace::disk_size_bytes(u64::MAX, u32::MAX) >= WORKSPACE_MIN_BYTES);
+        assert!(workspace::disk_size_bytes(u64::MAX, Some(u32::MAX)) >= WORKSPACE_MIN_BYTES);
+    }
+
+    /// R885-T6 acceptance: deleting `ResourceLimits::ephemeral_storage_mb` must
+    /// not change the disk any real workload is given.
+    ///
+    /// The regression this guards is silent and expensive — a forge run handed a
+    /// smaller scratch disk fails at its first checkout, which is the failure
+    /// the deleted field would have caused if it had ever been obeyed as the
+    /// cap it claimed to be. Asserted against the live `for_forge` spec through
+    /// the real accessor rather than against a hand-written number, so it still
+    /// holds if `FORGE_SCRATCH_FLOOR_MB` is later changed.
+    #[test]
+    fn deleting_the_field_did_not_change_what_for_forge_is_given() {
+        // `spec()` is built on the real `WorkloadSpec::for_forge`.
+        let spec = spec("forge-r885-t6");
+
+        // The declaration survived the field's deletion, at the same value.
+        assert_eq!(
+            spec.scratch_floor_mb(),
+            Some(workload_spec::FORGE_SCRATCH_FLOOR_MB),
+            "for_forge must still declare its scratch floor, via the annotation"
+        );
+
+        // And it still sizes to exactly what it sized to before: the backend's
+        // own 8 GiB floor dominates, for an empty tree and for a real one.
+        assert_eq!(
+            workspace::disk_size_bytes(0, spec.scratch_floor_mb()),
+            WORKSPACE_MIN_BYTES
+        );
+        let tree = 3 * 1024 * 1024 * 1024u64;
+        assert_eq!(
+            workspace::disk_size_bytes(tree, spec.scratch_floor_mb()),
+            tree * WORKSPACE_SIZE_MULTIPLIER
+        );
+
+        // A workload that declares nothing is not punished for it — the
+        // backend floor is the whole answer, identical to a declared floor
+        // below it. `None` must never read as "zero, so give it nothing".
+        assert_eq!(workspace::disk_size_bytes(0, None), WORKSPACE_MIN_BYTES);
+        assert_eq!(
+            workspace::disk_size_bytes(0, None),
+            workspace::disk_size_bytes(0, spec.scratch_floor_mb())
+        );
+
+        // The floor is still load-bearing above the backend default, which is
+        // the only reason to keep the mechanism at all.
+        assert_eq!(
+            workspace::disk_size_bytes(0, Some(32 * 1024)),
+            32 * 1024 * 1024 * 1024
+        );
     }
 
     fn spec_with_volumes(name: &str) -> WorkloadSpec {
@@ -2352,11 +3200,13 @@ mod tests {
                 },
                 target: PathBuf::from("/yah/produced"),
                 read_only: false,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Tmpfs { size_mb: 64 },
                 target: PathBuf::from("/tmp"),
                 read_only: false,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Named {
@@ -2364,6 +3214,7 @@ mod tests {
                 },
                 target: PathBuf::from("/cache"),
                 read_only: false,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Bind {
@@ -2371,6 +3222,7 @@ mod tests {
                 },
                 target: PathBuf::from("/etc/certs"),
                 read_only: true,
+                from_secret_mount: false,
             },
         ];
         s
@@ -2412,6 +3264,7 @@ mod tests {
                 },
                 target: PathBuf::from("/x/y"),
                 read_only: false,
+                from_secret_mount: false,
             },
             VolumeMount {
                 source: VolumeSource::Bind {
@@ -2419,6 +3272,7 @@ mod tests {
                 },
                 target: PathBuf::from("/x-y"),
                 read_only: false,
+                from_secret_mount: false,
             },
         ];
         let plan = workspace::plan(&s);
@@ -2498,15 +3352,8 @@ mod tests {
     #[tokio::test]
     async fn restart_is_refused_with_the_reason_not_a_silent_noop() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut c = cfg();
-        for p in ["firecracker", "vmlinux", "rootfs.ext4"] {
-            std::fs::write(tmp.path().join(p), b"").unwrap();
-        }
-        c.vmm_bin = tmp.path().join("firecracker");
-        c.kernel_image = tmp.path().join("vmlinux");
-        c.rootfs_image = tmp.path().join("rootfs.ext4");
-        c.state_dir = tmp.path().join("vms");
-        let rt = MicroVmRuntime::new(c).unwrap();
+        let rt = runtime_on(&tmp);
+        let _ctrl = register(&rt, "forge-1", VmShape::Job).await;
 
         let err = rt
             .restart_workload(&MeshIdent("forge-1".into()))
@@ -2514,6 +3361,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("job-shaped"), "got {err}");
+    }
+
+    /// The refusal above is now a property of the *workload*, not of the
+    /// backend, and this is the assertion that says so (R605-F31).
+    ///
+    /// Dispatching straight into the live supervisor rather than reproducing a
+    /// "service restarts too" branch here: what is being pinned is that a
+    /// service's restart reaches the shared restart loop at all, which is the
+    /// thing the job-shaped bail used to make impossible for every workload on
+    /// this backend.
+    #[tokio::test]
+    async fn a_service_restart_reaches_the_supervisor_instead_of_being_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rt = runtime_on(&tmp);
+        let mut ctrl_rx = register(&rt, "vm-1", VmShape::Service).await;
+
+        // Stand in for the supervisor: take the one control message and ack it
+        // with the pid a real re-boot would have produced.
+        let sup = tokio::spawn(async move {
+            match ctrl_rx.recv().await {
+                Some(Ctrl::Restart(ack)) => {
+                    let _ = ack.send(Ok(4242));
+                    true
+                }
+                _ => false,
+            }
+        });
+
+        rt.restart_workload(&MeshIdent("vm-1".into()))
+            .await
+            .expect("a service-shaped guest is restartable");
+        assert!(sup.await.unwrap(), "the supervisor saw a Restart");
+    }
+
+    /// An identity this backend never booted is not a shape question at all.
+    #[tokio::test]
+    async fn restarting_an_unknown_workload_names_the_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rt = runtime_on(&tmp);
+
+        let err = rt
+            .restart_workload(&MeshIdent("never-booted".into()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no microVM workload"), "got {err}");
+        assert!(err.contains("never-booted"), "got {err}");
     }
 
     #[tokio::test]

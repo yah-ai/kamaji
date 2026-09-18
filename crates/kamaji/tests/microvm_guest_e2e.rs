@@ -137,8 +137,9 @@ fn which(bin: &str) -> Option<PathBuf> {
 /// `for_forge` on purpose rather than a minimal hand-built spec: it is the shape
 /// this backend exists to run, and it carries the two values that have caught
 /// this code before — a 32 GiB memory *ceiling* that must be clamped rather than
-/// allocated, and a 512 MiB `ephemeral_storage_mb` that must be treated as a
-/// floor rather than the scratch disk's size.
+/// allocated, and a 512 MiB scratch *floor* (`yah.limits.scratch-floor-mb`,
+/// R885-T6's successor to the old `ephemeral_storage_mb` field) that must be
+/// treated as a floor rather than as the scratch disk's size.
 fn artifact_spec(forge_id: &str, produced_dir: &Path) -> WorkloadSpec {
     let mut spec = WorkloadSpec::for_forge(
         forge_id,
@@ -445,7 +446,7 @@ async fn a_failing_job_is_not_reported_as_a_clean_stop() {
     let console = state_dir.join(sanitized(&ident.0)).join("console.log");
     let status = wait_for_exit(&rt, &ident, Duration::from_secs(180), &console).await;
     match &status {
-        WorkloadStatus::Failed { reason } => assert!(
+        WorkloadStatus::Failed { reason, .. } => assert!(
             reason.contains("exited 3"),
             "the failure names something other than the job's exit code: {reason:?}"
         ),

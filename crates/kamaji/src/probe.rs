@@ -13,10 +13,13 @@
 //! camp can show install UI before queuing a workload.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(unix)]
 use tokio::time::timeout;
 
 use crate::{Backend, BackendUnavailable};
@@ -121,6 +124,8 @@ impl BackendAvailability {
     }
 }
 
+/// Only the AF_UNIX connect path has anything to time out (R918-T1).
+#[cfg(unix)]
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn home_dir() -> Option<PathBuf> {
@@ -266,6 +271,7 @@ pub fn probe_microvm(kvm: &Path) -> BackendProbe {
     }
 }
 
+#[cfg(unix)]
 async fn try_connect(path: &Path) -> bool {
     if !path.exists() {
         return false;
@@ -274,6 +280,15 @@ async fn try_connect(path: &Path) -> bool {
         timeout(CONNECT_TIMEOUT, UnixStream::connect(path)).await,
         Ok(Ok(_))
     )
+}
+
+/// Off-unix there is no AF_UNIX socket to reach, so every container-runtime
+/// probe reports unavailable and the caller gets the same structured
+/// [`BackendUnavailable`] + install hint it would get on a Linux box with no
+/// daemon running. The probe stays *passive* on every platform (R918-T1).
+#[cfg(not(unix))]
+async fn try_connect(_path: &Path) -> bool {
+    false
 }
 
 async fn probe_containerd(paths: Vec<PathBuf>) -> BackendProbe {

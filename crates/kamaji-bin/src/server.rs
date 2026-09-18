@@ -192,6 +192,7 @@
 //! @yah:handoff("LEADER DECISION, so the ticket's three-way \"which identity to match on\" question is settled: option (c) + (a) — an explicit required scope on the arm that REFUSES to activate without one, resolved to the per-service bundle digest for the match. Option (b) (ask kamaji by pid) was rejected as adding a runtime round-trip to a bash script for something already present in the serve argv. The install half was deliberately left shared and unchanged: one runtime asset backs every tenant naming that version, and that is correct for a runtime tier — the bug was only that ACTIVATION converted a shared-bytes change into a shared-outage change.")
 //! @yah:verify("LIVE MEASUREMENT, four real ships against us-east-001 (0.8.36-h12/h13/h14/h15), asserted on pid rather than on a log line as the ticket demanded. yah-marketing re-forked 611260,611273 -> 617664,617671 -> 617987,617998 -> 618240,618253 -> 619423,619436 while noisetable's pid 614524 stayed UNCHANGED throughout, confirmed by both pid and `ps -o lstart`. noisetable's probe: zero non-200s across 200 samples. yah.dev cost exactly 1x502 per activation — its own restart, which is in-scope and expected. Before the fix the same ship re-forked all three processes.")
 //! @yah:gotcha("THE FIRST LIVE SHIP EXPOSED TWO REPORTING BUGS IN THE NEW ARM AND BOTH WERE FIXED IN THE SAME PASS, which is worth knowing because both would have made a correct ship look wrong: a `kill -0` EPERM false alarm, and a fixed `sleep 3` that read pid state inside the 5s stop grace and so saw a partial set. The \"service not deployed on this node\" case was also changed from aborting a multi-node roll to a loud skip, matching the `unit:` arm's stated convention. Deploy-state reads were routed through sudo so that R876-B9's permission fix will not silently disarm this arm — that coupling is deliberate and B9 must not undo it.")
+//! @yah:gotcha("NOISETABLE R131-T19 IS BLOCKED ON ONE YAH-SIDE ACTION AND CANNOT PROCEED WITHOUT IT. The account-scoped R2 admin pair was rotated on 2026-09-10 (option A: mint the replacement, write both vault slots, leave the old token alive so nothing goes down). The vault is correct and unchanged — `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives f293d33294250d04 and cloudflare-r2-secret-key gives 8d0ad8c9470d48df. But /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 still carries the OLD value inline as MESOFACT_S3_ACCESS_KEY_ID — re-measured 2026-09-11T06:02Z, it hashes to 38da59ad427a7e1f. THE ASK: re-apply the yah-marketing mirror from a host whose vault holds the new pair, so that field stops hashing to 38da59ad427a7e1f and starts matching f293d33294250d04. It is materialized by `yah cloud apply` out of those same slots (app/yah/cli/src/cloud.rs, revalidate-receiver block) and nothing in the noisetable repo can do it. UNTIL THEN THE DISCLOSURE STAYS OPEN: the outgoing Cloudflare token 92414fa46ea2b8a5f06df51bae1a3512, name `yah-dev-1a3512`, issued 2026-05-26, is account-wide and deliberately still ALIVE. Deleting it before the re-apply breaks yah-marketing revalidate. AND ONE THING ONLY THE YAH CAMP KNOWS: that token is account-wide and the noisetable camp never enumerated its yah-side users — before it is deleted, someone on your side needs to confirm it was only ever the R2 admin pair. FILING NOTE from the courier that wrote this: R131-T19's next-step cites THIS ticket as \"already owns the exposure record\", which looks like a mis-citation — R876-B9 is the ticket carrying the credential-exposure/rotation record (its own gotcha names MESOFACT_S3_ACCESS_KEY_ID in this exact deploy file and says the secrets stay disclosed until rotated), while R876-B5 is the hotship activation-scoping bug. Mirror this onto R876-B9 if that is where the yah camp actually tracks it.")
 //!
 //! @yah:ticket(R605-T27, "No remote surface reports whether a node attached the microVM backend — the kvm probe is in-process only")
 //! @yah:status(review)
@@ -212,6 +213,31 @@
 //! @yah:verify("cd oss/kamaji && cargo check -p kamaji-bin (no microvm feature, default): clean, only 2 pre-existing unrelated warnings.")
 //! @yah:verify("cd oss/kamaji && cargo check --workspace --all-features and cd oss/yubaba && cargo check -p yubaba --all-features: both clean.")
 //! @yah:gotcha("THIS TICKET BUMPED THE WIRE PROTOCOL, V8 -> V9, so it is not shippable on its own — sequence the roll as if both versions exist, because on a live fleet they will. kamaji-proto's NodeCapabilities grew a `microvm: MicroVmHealth { attached, kvm_ok, detail }` field and the bump is per the crate's own wire-break rule, which is the right call under the camp's pre-1.0 \"break it, don't tape it\" policy. But it means a yubaba speaking V9 and a kamaji speaking V8 must not meet: roll kamaji before yubaba, or roll them together. Compounding this, R605-B26 enabled the `microvm` cargo feature in the build recipes and NOTHING HAS BEEN BUILT OR SHIPPED with it yet — nobody has cross-compiled that feature for either musl triple. So the next fleet build carries two unshipped changes at once (feature-on kamaji, V9 protocol) plus R605-F22's networking work. Do not roll any of it piecemeal.")
+//!
+//! @yah:ticket(R876-T10, "Enumerate yah-side consumers of account-wide Cloudflare token yah-dev-1a3512 before it is deleted (closes noisetable R131-T19 step 4)")
+//! @yah:status(review)
+//! @yah:at(2026-09-11T19:15:50Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:next("THE ASK, and it is the whole ticket: ENUMERATE THE YAH-SIDE CONSUMERS of Cloudflare API token id 92414fa46ea2b8a5f06df51bae1a3512, name `yah-dev-1a3512`, issued 2026-05-26 — then either (a) confirm it is safe to delete, or (b) name the consumers that still read it so they can be moved to the new pair first. The deletion itself is noisetable R131-T19 step 4 and is that camp's to perform once this answer exists; this ticket owes the ANSWER, not the deletion. DO NOT DELETE ANYTHING under this ticket.")
+//! @yah:gotcha("WHY THE NOISETABLE CAMP CANNOT ANSWER THIS ITSELF. That token is ACCOUNT-WIDE (Cloudflare account 3948dc292e724e71b0deefde0ea95999, three account-scoped groups: Workers R2 Storage Write bf7481a1826f439697cb59a20b22293e, R2 Data Catalog Write d229766a2f7f4d299f20eaa8c9b1fde9, R2 SQL Read f45430d92e2b4a6cb9f94f2594c141b8). Noisetable R131-T19 only ever proved it was the pair behind NOISETABLE's r2 vault slots; it never enumerated yah-side users, and nothing in the noisetable repo can see them. Deleting it blind breaks an unrelated yah service with NO WAY BACK: the S3 secret is SHA-256 of a token value that Cloudflare shows once and stores nowhere, so a deleted token cannot be reconstructed from anything either camp holds.")
+//! @yah:gotcha("STATE OF THE ROTATION, so the enumerator knows what is already safe. noisetable R131-T19 rotated the Cloudflare R2 admin pair; its steps 1-3 are DONE and independently verified. THE REPLACEMENT PAIR IS ALREADY LIVE IN THE VAULT: `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives f293d33294250d04 and cloudflare-r2-secret-key gives 8d0ad8c9470d48df — every slot-name consumer is already on the new pair, and the yah-marketing deploy record on us-east-001 was re-applied to match. THE OLD PAIR IS PARKED at vault slots `cloudflare-r2-access-key-id-pre-r131t19` / `cloudflare-r2-secret-key-pre-r131t19` (fingerprints 38da59ad427a7e1f / 9198605d52642726) and those parked slots are THE ONLY WAY BACK if a consumer turns out to still need the old value — they exist for exactly that reason and must not be deleted before this enumeration is answered. So the enumeration is looking for consumers that read the token VALUE by some route other than the vault slot names: anything with an inline/baked copy, a separate secret store, a CI or workflow secret, or a machine-local env file.")
+//! @yah:gotcha("WHY THIS IS ITS OWN TICKET RATHER THAN THE NOTE IT WAS. This ask previously sat only as a gotcha appended to R876-B9 (and mirrored on R876-B5). R876-B9 is at status `review` — a dead-letter box, where an appended gotcha reaches nobody but a signing reviewer and is stripped from source when the ticket archives. The ask has been MOVED here so it is claimable and has an owner; R876-B9's copy stays as provenance, not as the live home. Tier: Cleric — a bounded read-only audit (vault slots, infra TOML, cloud-init, CI/QED secrets, Cloudflare's own token audit log) ending in a yes/no with named consumers; careful and cross-cutting, but no design work and no code change.")
+//! @yah:verify("DONE = a written verdict on this ticket naming either \"no yah-side consumer of 92414fa46ea2b8a5f06df51bae1a3512 remains, safe to delete\" or the specific consumers that still read it, with how each was checked (vault slot fingerprints, grep over .yah/infra and cloud-init, QED/CI secret stores, and Cloudflare's own token last-used / audit record for that id). Fingerprint form that prints no secret: `yah keys get <slot> | shasum -a 256 | cut -c1-16` — the old pair is 38da59ad427a7e1f / 9198605d52642726, the new pair f293d33294250d04 / 8d0ad8c9470d48df. NO SECRET VALUE SHOULD BE PRINTED OR READ INTO CONTEXT at any point; hash on the remote host, compare hashes only. Nothing is deleted by this ticket.")
+//! @yah:handoff("VERDICT (audit 2026-09-11, read-only, nothing deleted/revoked/rotated): NOT SAFE TO DELETE. Cloudflare API token 92414fa46ea2b8a5f06df51bae1a3512 (`yah-dev-1a3512`) still has FOUR live yah-side consumers that read its derived R2 pair by a route OTHER than the vault slot names, on three fleet nodes plus this workstation. Cloudflare's own record confirms the token is still real and armed: GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/92414fa46ea2b8a5f06df51bae1a3512 (authenticated with the `cloudflare-legacy-yah` vault slot; `cloudflare-api-token` returns 9109 Unauthorized for this endpoint) returns status=active, name=yah-dev-1a3512, issued_on=2026-05-26T03:52:19Z, expires_on=null, last_used_on=NULL. CAUTION ON THAT NULL: do NOT read `last_used_on: null` as \"nobody uses it\". That field tracks api.cloudflare.com bearer-auth calls; the consumers found below authenticate to R2 over the S3 protocol with the derived access-key/secret pair, which is a different code path (this last clause is INFERENCE from the field's meaning, not from Cloudflare docs I read - but the consumers themselves are directly measured and are decisive on their own).")
+//! @yah:handoff("CONSUMER 1 - us-east-001 (debian@51.81.85.145), yah-scryer.service, ACTIVE+ENABLED, ExecMainStartTimestamp Fri 2026-09-11 06:57:22 UTC. `systemctl show yah-scryer.service -p EnvironmentFiles` returns `/etc/yah/scryer-r2.env (ignore_errors=no)`. That file (root:root 0600, mtime Sep 10 07:46) holds CF_R2_ACCESS_KEY_ID and CF_R2_SECRET_KEY; hashed ON THE HOST they are 38da59ad427a7e1f / 9198605d52642726 = THE OLD PAIR. TRAP FOR THE NEXT READER: the main unit /etc/systemd/system/yah-scryer.service contains NO EnvironmentFile= directive - only a comment mentioning one - so reading the unit file alone says \"not wired\" and is WRONG. The directive lives in the drop-in /etc/systemd/system/yah-scryer.service.d/10-snapshot-producer.conf, which also sets --long-tier-bucket yah-analytics --r2-account 3948dc292e724e71b0deefde0ea95999 --snapshot-interval-secs 300. So this node is authenticating to R2 with the old pair every 5 minutes right now; deleting the token stops the yah-analytics long-tier snapshot producer. Two stale copies of the unit sit beside it (yah-scryer.service.rollback-20260911, .rollback-20260908); neither carries an EnvironmentFile= line.")
+//! @yah:handoff("CONSUMERS 2-4 - us-west-011, us-west-013, us-west-014 all carry /etc/yah-cloud/litestream.env (root:root 0600, mtime Sep 8 20:02 on 011) holding LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY; hashed ON EACH HOST they are 38da59ad427a7e1f / 9198605d52642726 = THE OLD PAIR on all three. Two units reference it on each node: /etc/systemd/system/yubaba.service.d/50-r858t5.conf (a drop-in whose own header calls itself TEMPORARY, an R858-T5 dev-cluster exercise of the litestream restore-before-serve leg) and /etc/systemd/system/litestream-headscale.service. Measured states: us-west-011 yubaba.service ACTIVE+ENABLED since 2026-09-10 08:45:57 BST, litestream-headscale INACTIVE; us-west-013 yubaba.service ACTIVE since 2026-09-10 08:46:07 BST AND litestream-headscale.service ACTIVE - this is the hottest one, a replicator actually running against R2 on the old pair; us-west-014 yubaba.service ACTIVE since 2026-09-10 08:45:45 BST, litestream-headscale INACTIVE. `systemctl show yubaba.service -p EnvironmentFiles` on all three lists /etc/yah-cloud/litestream.env, so the old pair is in the live process environment on every one.")
+//! @yah:handoff("CONSUMER 5 (workstation, not a service but the most complete copy anywhere) - /Users/leif/ss/yah/.env, untracked and gitignored (.gitignore:22), mtime Aug 9 15:31, is the ONLY file in the whole tree carrying this credential. Line 6 R2_ACCESS_KEY fingerprints to 38da59ad427a7e1f, line 7 R2_SECRET_KEY to 9198605d52642726 - the old pair - and line 8 R2_TOKEN is the RAW CLOUDFLARE TOKEN VALUE ITSELF (53 chars, `cfat_` prefix). PROVEN BY DERIVATION, not assumed: sha256(R2_TOKEN) hashes to 9198605d52642726, i.e. it is exactly the preimage of the R2 secret access key, which is how Cloudflare derives an R2 secret from a token value. ALSO PROVEN: sha256(\"92414fa46ea2b8a5f06df51bae1a3512\") = 38da59ad427a7e1f, so the R2 access-key-id IS the token id and any host carrying that literal is carrying this credential - that identity is what made the fleet grep decisive. TWO CONSEQUENCES. (a) This file is a SECOND way back, independent of the parked `-pre-r131t19` vault slots, and unlike them it holds the one-time-shown token VALUE that Cloudflare stores nowhere - worth knowing before anyone treats the parked slots as the single point of recovery. (b) It is sourced wholesale into the camp environment by app/yah/desktop/camp-env.sh:47-49 and app/yah/desktop/install-mac.sh:152-153 (`set -a; . \"$root/.env\"; set +a`), so R2_ACCESS_KEY / R2_SECRET_KEY / R2_TOKEN are exported into every process those launch.")
+//! @yah:handoff("SURFACES CHECKED AND CLEAN. (1) VAULT - `yah keys list` gives 50 slots; all 17 Cloudflare/R2-suggestive ones fingerprinted. cloudflare-r2-access-key-id = f293d33294250d04 and cloudflare-r2-secret-key = 8d0ad8c9470d48df (both NEW, correct); the two -pre-r131t19 slots = 38da59ad427a7e1f / 9198605d52642726 (OLD, parked as designed); NO OTHER SLOT matches the old pair. I also ran a derivation test on every slot - sha256(slot value) then fingerprint, compared against 9198605d52642726 - to catch any slot secretly holding the raw token value: zero matches, so `cloudflare-api-token` (fp eff3bd48b192aba7) is a DIFFERENT token, as are the account-backup / cert-store / fleet-read pairs. (2) REPO LITERALS - swept for the token id, `yah-dev-1a3512`, the account id, `cfat_`/`cfut_` token shapes and every R2/CF env var name across the tree including oss/ and dotfile dirs; the ONLY file carrying this credential is ./.env (session transcripts under .yah/sessions and .yah/forms excluded as agent scrollback, not consumers). (3) .yah/infra - machines/*.toml, state/bundles, providers/cloudflare.toml: no baked credential, account id only. (4) .yah/qed - every reference goes through vault slots or the CF_R2_* env fallback (yah-release.toml:32-33, yah-cli-release.toml:112, yah-desktop-release.toml:388); no inline value. (5) us-east-001's yah-marketing deploy record - I RE-VERIFIED the R876-B9 re-apply landed: /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json now has MESOFACT_S3_ACCESS_KEY_ID = f293d33294250d04 and MESOFACT_S3_SECRET_ACCESS_KEY = 8d0ad8c9470d48df (NEW pair). Its CLOUDFLARE_API_TOKEN field fingerprints to eff3bd48b192aba7 = the `cloudflare-api-token` slot, a different token, NOT this one. The older gotcha on oss/kamaji/crates/kamaji-bin/src/server.rs:195 saying that field still hashes to 38da59ad427a7e1f is now STALE. (6) us-south-001, us-west-001, us-west-002, us-west-003, us-west-015 - no /etc/yah/scryer-r2.env, no /etc/yah-cloud/litestream.env, no occurrence of the old access-key-id or any cfat_ literal under /etc, /var/lib/yah, /opt, /root, /home. (7) Workstation outside the repo - ~/.config, ~/.aws, ~/.local/share, ~/Library/Application Support/yah: clean.")
+//! @yah:handoff("GAPS I COULD NOT CLOSE, stated plainly rather than guessed. (A) GITHUB REPO SECRETS on yah-ai/yah - `gh secret list -R yah-ai/yah` shows CF_R2_ACCESS_KEY_ID, CF_R2_SECRET_KEY, CF_R2_ACCOUNT_ID, CLOUDFLARE_TOKEN and R2_ACCESS_KEY, EVERY ONE last updated 2026-06-19T22:40Z - i.e. after this token was issued (2026-05-26) and nearly three months BEFORE the 2026-09-10 rotation. GitHub Actions secrets are write-only by design, so I could not fingerprint them and CANNOT prove which pair they hold; the dates are strong circumstantial evidence they still hold the OLD one. They are consumed by .github/workflows/fleet-index.yml:153-156 (as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY against the R2 endpoint) and .github/workflows/smoke.yml:86,129. Per CLAUDE.md no workflow in this repo has an `on: push` trigger any more, so these are dormant-but-dispatchable: deleting the token would not break a push, it would break the next manual `workflow_dispatch`. Settling this needs someone who can re-set those secrets, not someone who can read them. `gh secret list --org yah-ai` returned HTTP 403 (not an org admin), so ORG-LEVEL secrets are entirely unchecked. (B) LATENT, NOT LIVE - app/yah/web/dashboard/mesofact.config.toml:21-23 names access_key_id_env = \"R2_ACCESS_KEY\" / secret_access_key_env = \"R2_SECRET_KEY\" / api_token_env = \"CLOUDFLARE_KEY\", which are EXACTLY the names ./.env exports with the old pair, so a publish from this workstation would sign with the old credential. It is dormant only because the same file still carries the unsubstituted `endpoint = \"https://ACCOUNT_ID.r2.cloudflarestorage.com\"` / `zone_id = \"ZONE_ID\"` placeholders - the identical R330-T35 landmine already defused in marketing's and analytics' configs but NOT in dashboard's. Note this corrects a claim in the crates/yah/hub/src/in_process.rs:103 handoff that \"nothing in the tree sets any of the three\": ./.env sets two of them and camp-env.sh exports them. (C) SIDE FINDING, different credential, out of scope for the deletion but should not go unreported - .yah/forms/01KSJH81803BHCCTVXWSBXEJJ3.json (and several sibling form records) contain a literal `cfut_` bearer token in plaintext in the recorded command. It fingerprints to 3e9091fc44f7060b, which equals both the `cloudflare-legacy-yah` vault slot and ./.env's CLOUDFLARE_KEY. It is NOT 92414fa46ea2b8a5f06df51bae1a3512, so it does not change this verdict, but it is a live Cloudflare credential sitting unencrypted in approval-form scrollback and deserves its own ticket.")
+//! @yah:handoff("WHAT NOISETABLE R131-T19 STEP 4 NEEDS BEFORE IT CAN PROCEED, in dependency order. (1) Rewrite /etc/yah/scryer-r2.env on us-east-001 with the new pair and restart yah-scryer.service. (2) Rewrite /etc/yah-cloud/litestream.env on us-west-011, us-west-013 and us-west-014 with the new pair and restart yubaba.service on all three plus litestream-headscale.service on us-west-013 - OR, since the 50-r858t5.conf drop-in describes itself as a temporary R858-T5 exercise, remove the drop-in on any node where that exercise is finished, which retires the consumer instead of rotating it. (3) Re-set the five GitHub repo secrets on yah-ai/yah to the new pair (they cannot be read, so re-setting is the only way to make them safe) and check org-level secrets with an admin account. (4) Decide what to do with ./.env on the workstation - it is the only copy of the raw token value anywhere, so it is a recovery asset as well as an exposure; do not shred it before the deletion is committed to. (5) Fix the dashboard mesofact.config.toml placeholders and repoint its three env names at the MESOFACT_S3_* defaults, matching what was already done for marketing and analytics. ONLY THEN is the token free. Note that NONE of these is deletion and none was performed under this ticket: this audit changed nothing on any host, in the vault, in the repo, or at Cloudflare. Every fingerprint quoted was computed on the machine holding the value (`... | sha256sum | cut -c1-16` on Linux hosts, `shasum -a 256` locally); no secret value was printed or read into an agent context at any point.")
+//! @yah:handoff("VERDICT: **NOT SAFE TO DELETE.** Cloudflare API token 92414fa46ea2b8a5f06df51bae1a3512 (`yah-dev-1a3512`, account 3948dc292e724e71b0deefde0ea95999) still has live yah-side consumers reading the OLD pair by a NON-VAULT route. The enumeration this ticket owed is complete and the answer is (b): named consumers remain. noisetable R131-T19 step 4 must NOT proceed yet. The four fleet consumers, all measured on-host: (1) us-east-001 `yah-scryer.service`, ACTIVE, restarted 2026-09-11 06:57:22 UTC, EnvironmentFile=/etc/yah/scryer-r2.env on the old pair, producing snapshots every 300s; (2,3,4) us-west-011 / -013 / -014, /etc/yah-cloud/litestream.env on the old pair, loaded by an ACTIVE yubaba.service on each plus an ACTIVE litestream-headscale.service on -013. Plus a fifth, in-tree: repo-root .env holds the RAW TOKEN VALUE (not merely the derived pair) and app/yah/desktop/camp-env.sh:47-49 sources it with `set -a` into every camp session.")
+//! @yah:handoff("THE MIGRATION WORK THIS ENUMERATION EXPOSED IS FILED AS **R891** — \"Retire the old Cloudflare R2 pair: migrate the non-vault consumers R876-T10 found, then unblock noisetable R131-T19 step 4\". Five children: R891-T2 (the four live fleet units), R891-B3 (repo-root .env: raw token to the vault, exports to the new pair), R891-T4 (GitHub repo secrets pre-rotation + org secrets unchecked, blocked_on operator), R891-B5 (a plaintext cfut_ bearer in 3 .yah/forms/*.json — a DIFFERENT credential, fingerprint 3e9091fc44f7060b = cloudflare-legacy-yah), R891-B6 (the R330-T35 publish landmine still armed in the dashboard's mesofact.config.toml). R891's own acceptance is the handoff to the noisetable camp once T2, B3 and T4 close — which is when this ticket's answer flips to \"safe to delete\".")
+//! @yah:verify("HOW EACH SURFACE WAS CHECKED (courier @Glimmerstone:polaris, session:c3eaf0c9). CLEAN: all 17 CF/R2 vault slots fingerprinted, including a derivation test for any slot holding the raw token value — zero hits; repo literal sweep for the token id, token name, account id and the R2/CF env-var names; .yah/infra; .yah/qed; ~/.config; ~/.aws. Every fingerprint was computed on the host holding the value via `shasum -a 256 | cut -c1-16` and compared as 16 hex chars — NO SECRET VALUE WAS PRINTED OR READ INTO CONTEXT at any point, and nothing was deleted, revoked, rotated or written on any host. Cloudflare's own record: status=active, last_used_on=NULL, fetched via the cloudflare-legacy-yah slot (the cloudflare-api-token slot returns error 9109 on that endpoint).")
+//! @yah:verify("LEADER RE-VERIFICATION (@Ashguard:coffee), independent of the courier and the decisive claim re-derived from scratch: chained `shasum -a 256` over repo-root .env's R2_TOKEN yields 9198605d52642726 — byte-identical to the recorded old-secret fingerprint — which proves .env holds the one-time-shown token value itself, since the R2 secret IS sha256(token). Also confirmed directly: app/yah/desktop/camp-env.sh sources .env under `set -a` (exports every variable to every camp session), and `grep -rlo cfut_ .yah/forms/` returns 3 files. GAPS, stated rather than papered over: 5 of 9 fleet nodes were reached, so 4 were not; GitHub repo secrets are write-only and cannot be fingerprinted (dates say pre-rotation); `gh secret list --org yah-ai` returned HTTP 403 so ORG-level secrets are wholly unchecked. R891-T4 owns those gaps.")
+//! @yah:gotcha("CORRECTION TO A STALE GOTCHA ON THIS RELAY: the note at oss/kamaji/crates/kamaji-bin/src/server.rs:195 saying us-east-001's yah-marketing deploy record is still on the OLD pair is NO LONGER TRUE. This audit independently re-verified that the R876-B9 re-apply landed — us-east-001's yah-marketing.json is on the NEW pair. Do not act on that gotcha.")
+//! @yah:handoff("THE ANSWER FLIPS: **SAFE TO DELETE**, as of 2026-09-16 (R891 closed by @Ashguard:vortex, session:c8036b0c). Every consumer this audit named is migrated, and each was verified by measurement rather than by assuming the edit took. CONSUMER 1, us-east-001 yah-scryer.service: /etc/yah/scryer-r2.env rewritten to the new pair (38da59ad427a7e1f/9198605d52642726 -> f293d33294250d04/8d0ad8c9470d48df, hashed on the host), unit restarted and ACTIVE, and it published analytics snapshot b8eefe2550da5d3f7acf68856550de5894ad11d2ac0bcec59896e27354acf031 four seconds later — confirmed present in the yah-analytics bucket. CONSUMERS 2-4, us-west-011/-013/-014: /etc/yah-cloud/litestream.env rewritten to the new pair on all three, yubaba.service restarted one node at a time with followers first and the leader (013) last, litestream-headscale.service restarted on 013, and each node separately proved it can WRITE to R2 with the rotated file via a throwaway `litestream replicate -config` that logged both 'snapshot written' and 'wal segment written'. Dev raft never dipped: leader 13, term 66, all three peers live before, between and after. Rotation rather than drop-in removal, because `systemctl cat yubaba.service` shows the SHIPPED unit reads litestream.env independently of the R858-T5 drop-in — deleting the drop-in would have removed nothing. CONSUMER 5, repo-root .env: the raw token moved to the vault slot `cloudflare-r2-token-pre-r131t19` (derivation test passes — sha256 of that slot's value fingerprints to 9198605d52642726), R2_ACCESS_KEY/R2_SECRET_KEY rotated to the new pair, R2_TOKEN retired, file tightened 0644 -> 0600. GAP (A) IS CLOSED BY DELETION, NOT ROTATION: the operator's call was that GitHub repo secrets are not needed (R915 — `gh` is a non-goal), so all NINE were deleted via direct REST, verified total_count 0. Gap (A)'s org-level half is ACCEPTED-UNCHECKED by operator decision. GAP (B) fixed (R891-B6). GAP (C) fixed at the mechanism (R891-B5); its rotation was declined by the operator on the record.")
+//! @yah:verify("THE SWEEP THIS AUDIT COULD NOT FINISH IS NOW FINISHED, AND IT IS CLEAN. This ticket reached 5 of 9 fleet nodes and said so. All NINE have now been swept for the old pair, by piping both old-pair VALUES from the parked vault slots onto `ssh <node> 'sudo -n grep -rlFI -f - /etc /root /home /var/lib/yah /var/lib/yah-cloud /opt'` — patterns on stdin, only filenames returned, no value printed in either direction. Zero hits on us-east-001, us-south-001, us-west-001, -002, -003, -011, -013, -014, with `sudo -n id -u` = 0 confirmed separately on each so that an empty result is a real read rather than a permission failure reading as clean. ONE BOUNDED EXCEPTION: us-west-015 has no passwordless sudo and refuses root SSH, so its grep ran unprivileged; it is also not a systemd box (`systemctl` not found) and has no /etc/yah or /etc/yah-cloud, so the consumer class this audit is about cannot exist there. The same sweep over the workstation — whole repo tree minus target/.git/node_modules, plus ~/.config, ~/.aws, ~/.zshrc, ~/.zshenv, ~/.profile — found zero copies of the old SECRET and zero of the RAW TOKEN. Three files matched the old ACCESS KEY ID and all three are board annotation prose, which is expected and harmless: this audit's own proof that sha256('92414fa46ea2b8a5f06df51bae1a3512') = 38da59ad427a7e1f means the access-key-id half IS the public token id and was never secret material.")
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -303,9 +329,9 @@ pub struct Registry {
     /// absent here, which the Probe handler maps to [`ProbeStatus::Ready`] —
     /// i.e. "no probe declared ↔ trust the workload's existence".
     probes: HashMap<WorkloadId, ProbeTarget>,
-    /// Digest of the `Workload` each admitted deploy carried (R852-B4), keyed
-    /// by workload id and stamped onto `List` entries as
-    /// [`WorkloadEntry::spec_digest`].
+    /// The `Workload` each admitted deploy carried, keyed by workload id, with
+    /// its digest (R852-B4) computed once at admission and stamped onto `List`
+    /// entries as [`WorkloadEntry::spec_digest`].
     ///
     /// Kept **here** rather than in each backend for two reasons. The backends
     /// hold a lowered spec (a `WorkloadSpec`, a container config), not the
@@ -314,10 +340,30 @@ pub struct Registry {
     /// its own declaration, not about a backend's internals — one recording
     /// point keeps every backend's entries answering it the same way.
     ///
+    /// R870-B24 widened this from the digest alone to the whole envelope,
+    /// because a digest can only answer "does this still match the spec I am
+    /// holding". A caller about to *replace* a workload it did not deploy is
+    /// asking the opposite question — what is in the spec I am NOT holding —
+    /// and that is what `Describe` returns. The digest stays precomputed
+    /// rather than derived per `List` sweep: `List` runs every reconcile tick
+    /// and re-encoding every spec on each one would pay a postcard encode for
+    /// a value that cannot change without passing back through here.
+    ///
     /// In memory on purpose: after a kamaji restart nothing is bound, so the
     /// honest answer to "is this workload still deployed with that spec" is
     /// `None`/"redeploy", which is exactly what an empty map yields.
-    digests: HashMap<WorkloadId, kamaji_proto::SpecDigest>,
+    specs: HashMap<WorkloadId, DeployedSpec>,
+}
+
+/// One admitted deploy's `Workload` and the digest of it (R870-B24).
+///
+/// The digest is `Option` because [`kamaji_proto::spec_digest`] returns one:
+/// a spec that will not encode has no digest, which `stamp_spec_digests`
+/// reports as `None` ("unknown, redeploy") rather than as a match.
+#[derive(Debug, Clone)]
+pub struct DeployedSpec {
+    pub workload: workload_spec::Workload,
+    pub digest: Option<kamaji_proto::SpecDigest>,
 }
 
 /// Per-Kamaji runtime context handed to [`handle_message`] (R406-T9).
@@ -568,6 +614,9 @@ pub struct BundleDeployRecord {
 /// @yah:handoff("FLEET REMEDIATION WAS DONE, NOT JUST THE WRITE PATH — that distinction matters, because fixing only `record_deploy` would have left every already-written 0644 file exposed forever. us-east-001 was the only node in the fleet carrying deploy records and was remediated live: files 0600, dir 0700, unprivileged read now denied, all four serve pids alive, and yah.dev / yah.dev/releases / noisetable.com byte-identical 200s afterwards. **us-west-002 is UNREACHABLE and therefore UNVERIFIED, not clean** — if it comes back and holds deploy records, it still needs the chmod.")
 /// @yah:verify("THE R876-B5 COUPLING HELD: `scripts/hotship.sh --dry-run --services yah-marketing` still resolves the bundle digest and reverse-maps the out-of-scope noisetable pid through B5's sudo route against the now-0700 dir, so no script change was needed. This was the one way B9 could have silently disarmed the hot-ship arm, and it was checked rather than assumed. Leader re-verification of the sibling ticket also came back clean: yah-cloud lib re-run 1137/0/4 exactly as R876-B7 reported, and `public-ip` confirmed an AFFINITY key by code (`taint_effect` returns `Repels` only for `no-<archetype>` keys; `AFFINITY_TAINT_KEYS` holds `PUBLIC_IP_TAINT`), so B7 did not move any live placement.")
 /// @yah:gotcha("THE CREDENTIAL ROTATION IS DELIBERATELY NOT DONE AND IS THE OPERATOR'S CALL — do not read this ticket reaching review as \"the exposure is closed\". Three credentials (CLOUDFLARE_API_TOKEN, MESOFACT_S3_ACCESS_KEY_ID, MESOFACT_S3_SECRET_ACCESS_KEY, values never reproduced) sat world-readable in /var/lib/yah/kamaji/bundles/state/deploys/ on us-east-001, a multi-tenant production box, for a 9-day LOWER BOUND measured from the deploys dir birth time. The permissions are now closed; the secrets should still be treated as disclosed until rotated.")
+/// @yah:gotcha("THE ROTATION THIS TICKET LEFT TO THE OPERATOR IS HALF DONE, AND THE REMAINING HALF IS A YAH-SIDE ACTION. Noisetable R131-T19 rotated the account-scoped R2 admin pair on 2026-09-10 (option A: mint the replacement, write both vault slots, leave the old token alive so nothing goes down) and its step 3 is now BLOCKED on this camp. The vault is correct and unchanged — `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives f293d33294250d04 and cloudflare-r2-secret-key gives 8d0ad8c9470d48df. But /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 — the exact file this ticket measured at 644 — still carries the OLD value inline as MESOFACT_S3_ACCESS_KEY_ID: re-measured 2026-09-11T06:02Z, that field hashes to 38da59ad427a7e1f. THE ASK: re-apply the yah-marketing mirror from a host whose vault holds the new pair, so that field stops hashing to 38da59ad427a7e1f and starts matching f293d33294250d04. It is materialized by `yah cloud apply` out of those same slots (app/yah/cli/src/cloud.rs, revalidate-receiver block) and nothing in the noisetable repo can do it. UNTIL THAT LANDS THE DISCLOSURE STAYS OPEN AND THE OLD TOKEN MUST NOT BE DELETED: Cloudflare token 92414fa46ea2b8a5f06df51bae1a3512, name `yah-dev-1a3512`, issued 2026-05-26, is deliberately still ALIVE because yah-marketing revalidate is still running on its inline copy — deleting it before the re-apply breaks revalidate. AND ONE THING ONLY THE YAH CAMP KNOWS: that token is account-wide and the noisetable camp never enumerated its yah-side users, so before it is deleted someone on your side has to confirm it was only ever the R2 admin pair. THE SAME TEXT IS ALSO ON R876-B5, so a reader of either ticket finds the other; act on it once.")
+/// @yah:gotcha("FILING PROVENANCE, so nobody re-files this as a duplicate: noisetable R131-T19's step-3 next-step cites R876-B5 as the ticket that 'already owns the exposure record'. That is a mis-citation — R876-B5 is the hotship bundle-serve activation-scoping bug; THIS ticket (R876-B9) is the one carrying the credential-exposure and rotation record. The gotcha above was written to R876-B5 first, following that citation, and is mirrored here; the noisetable side is correcting its own citation to point at R876-B9. Two tickets carry the ask on purpose, not by accident.")
+/// @yah:gotcha("THE R2 ROTATION DID NOT CLOSE THIS DEFECT - MEASURED FROM THE NOISETABLE CAMP (R131-T19) ON 2026-09-11. The MESOFACT_S3_* pair this ticket names has now been rotated and the record re-applied (`yah cloud apply --service yah-marketing --env cloud`): /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 (mtime 2026-09-11T06:49:28, size 11815) now carries ONLY the new pair - MESOFACT_S3_ACCESS_KEY_ID at /revalidate/env/MESOFACT_S3_ACCESS_KEY_ID hashes f293d33294250d04 (was 38da59ad427a7e1f) and MESOFACT_S3_SECRET_ACCESS_KEY at /revalidate/env/MESOFACT_S3_SECRET_ACCESS_KEY hashes 8d0ad8c9470d48df, both matching the vault slots; no stale copy remains anywhere in the record. BUT THE SAME ENV BLOCK STILL HOLDS A THIRD LIVE SECRET THAT WAS NOT ROTATED: CLOUDFLARE_API_TOKEN at /revalidate/env/CLOUDFLARE_API_TOKEN, sha256-16 eff3bd48b192aba7, 53 chars, inline in cleartext. Full inventory of that file today, by name and hash only, no value read into any context (extraction and hashing were done on the remote host): CLOUDFLARE_API_TOKEN=eff3bd48b192aba7, MESOFACT_S3_ACCESS_KEY_ID=f293d33294250d04, MESOFACT_S3_SECRET_ACCESS_KEY=8d0ad8c9470d48df - three of three keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL, all still materialized inline. PERMISSION BITS MEASURED TODAY: 600 root:root, i.e. this ticket's own chmod remediation is HOLDING and the file is no longer world-readable - the 0644 half of the title is fixed, the secrets-inline half is not. So the underlying defect - live secrets written inline into a deploy record on disk - is UNCHANGED; only two of the three secrets in it were rotated, and rotation does not remove them from the file. DO NOT CLOSE THIS TICKET ON THE STRENGTH OF THAT ROTATION. Rotating each exposed secret one at a time is not the fix; the fix is that these values should not be materialized inline into an on-disk record at all (indirect by vault-slot reference resolved at process start), or at minimum the record must never be world-readable - and the 0600 currently holding is a runtime property of one node, re-established by `record_deploy`, not a guarantee that a future writer or a manual copy keeps it. Reported by the noisetable camp, which consumes the same control plane: its own deploy record noisetable.json sits in the SAME directory and was measured in the same pass at 600 root:root, size 706, with ZERO keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL - so noisetable is currently unexposed by luck of payload, not by design, and would carry the same inline cleartext the moment its service needs a credential.")
 #[cfg(feature = "bundle-serving")]
 impl BundleBackend {
     /// Build a bundle backend over `store`, caching materialized trees under
@@ -577,6 +626,7 @@ impl BundleBackend {
         store: Arc<dyn yah_object_store::ObjectStore>,
         cache_dir: impl Into<PathBuf>,
         state_dir: impl Into<PathBuf>,
+        collector: kamaji::observe::Collector,
     ) -> Self {
         // R844-F2: no `.unwrap_or(DEFAULT_BUNDLE_PORT)`. Unset means allocate,
         // not "8080" — see the field docs.
@@ -585,8 +635,20 @@ impl BundleBackend {
             .and_then(|v| v.parse().ok());
         let state_dir = state_dir.into();
         Self {
-            native: Arc::new(kamaji::native::NativeRuntime::new(state_dir.clone())),
-            jit: Arc::new(kamaji::jit::JitRuntime::new(state_dir.clone())),
+            // R893-B17: both runtimes take the SAME collector. This backend
+            // serves one bundle workload through the keep-alive tier and
+            // another through the on-demand one, and a workload whose tracing
+            // depended on which tier served it is exactly the per-backend
+            // divergence the contract exists to prevent — so it is a
+            // constructor argument rather than a builder, to make it
+            // unskippable at the call site.
+            native: Arc::new(
+                kamaji::native::NativeRuntime::new(state_dir.clone())
+                    .with_collector(collector.clone()),
+            ),
+            jit: Arc::new(
+                kamaji::jit::JitRuntime::new(state_dir.clone()).with_collector(collector),
+            ),
             store,
             cache_dir: cache_dir.into(),
             cache_budget: 0,
@@ -1081,19 +1143,28 @@ impl Registry {
         self.deploys.remove(id)
     }
 
-    /// Record the digest of the `Workload` `id` was just deployed with
-    /// (R852-B4). Replaces any prior record — the last accepted deploy is what
+    /// Record the `Workload` `id` was just deployed with (R852-B4, widened by
+    /// R870-B24). Replaces any prior record — the last accepted deploy is what
     /// this node is running, so a redeploy with a changed spec must not leave
-    /// the previous digest visible and read as "unchanged".
-    pub fn set_spec_digest(&mut self, id: WorkloadId, digest: kamaji_proto::SpecDigest) {
-        self.digests.insert(id, digest);
+    /// the previous one visible and read as "unchanged".
+    pub fn set_deployed_spec(&mut self, id: WorkloadId, workload: workload_spec::Workload) {
+        let digest = kamaji_proto::spec_digest(&workload);
+        self.specs.insert(id, DeployedSpec { workload, digest });
     }
 
-    /// Drop the spec digest for `id` — called when the workload is torn down,
+    /// The `Workload` `id` was last deployed with, if this Kamaji admitted it
+    /// (R870-B24). `None` is "no record", which a caller must read as unknown
+    /// — see [`kamaji_proto::KamajiToYubaba::WorkloadDescription`].
+    pub fn deployed_spec(&self, id: &WorkloadId) -> Option<workload_spec::Workload> {
+        self.specs.get(id).map(|s| s.workload.clone())
+    }
+
+    /// Drop the spec record for `id` — called when the workload is torn down,
     /// so a later redeploy of the same spec is not skipped as unchanged when
-    /// nothing is actually bound.
-    pub fn remove_spec_digest(&mut self, id: &WorkloadId) -> Option<kamaji_proto::SpecDigest> {
-        self.digests.remove(id)
+    /// nothing is actually bound, and so a `Describe` cannot describe a
+    /// workload that is gone.
+    pub fn remove_deployed_spec(&mut self, id: &WorkloadId) -> Option<DeployedSpec> {
+        self.specs.remove(id)
     }
 
     /// Stamp each entry with the digest of the spec it was deployed with.
@@ -1106,7 +1177,7 @@ impl Registry {
     pub fn stamp_spec_digests(&self, entries: &mut [WorkloadEntry]) {
         for entry in entries.iter_mut() {
             if entry.spec_digest.is_none() {
-                entry.spec_digest = self.digests.get(&entry.id).copied();
+                entry.spec_digest = self.specs.get(&entry.id).and_then(|s| s.digest);
             }
         }
     }
@@ -1605,15 +1676,17 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             spec,
         } => {
             // R852-B4: an accepted upgrade IS the workload's current spec, so
-            // the digest record moves with it. Leaving the pre-upgrade digest
-            // on record would make the next caller that re-declares the
-            // upgraded spec see a mismatch and issue a plain `Deploy` — a
+            // the spec record moves with it. Leaving the pre-upgrade one on
+            // record would make the next caller that re-declares the upgraded
+            // spec see a digest mismatch and issue a plain `Deploy` — a
             // connection-dropping redeploy of the very workload the graceful
-            // path had just replaced without dropping one.
-            let digest = kamaji_proto::spec_digest(&spec);
+            // path had just replaced without dropping one — and would make a
+            // R870-B24 `Describe` answer with the spec that is no longer
+            // running.
+            let record = spec.clone();
             let reply = graceful_upgrade_workload(ctx, request_id, id.clone(), spec).await;
-            if let (KamajiToYubaba::Ack { .. }, Some(digest)) = (&reply, digest) {
-                ctx.registry.lock().await.set_spec_digest(id, digest);
+            if let KamajiToYubaba::Ack { .. } = &reply {
+                ctx.registry.lock().await.set_deployed_spec(id, record);
             }
             reply
         }
@@ -1652,6 +1725,18 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
                         id.0
                     ),
                 },
+            }
+        }
+        YubabaToKamaji::Describe { request_id, id } => {
+            // R870-B24. `None` is the honest answer for an id this kamaji
+            // never admitted (or admitted before a restart) and is reported as
+            // such rather than as an error — see `WorkloadDescription`'s doc
+            // for why a guard needs those two apart.
+            let spec = ctx.registry.lock().await.deployed_spec(&id);
+            KamajiToYubaba::WorkloadDescription {
+                request_id,
+                id,
+                spec,
             }
         }
         // The Yubaba→Kamaji enum is #[non_exhaustive]; reject any variant
@@ -1694,17 +1779,17 @@ fn recipe_is_not_deployable(request_id: kamaji_proto::RequestId) -> KamajiToYuba
 }
 
 /// Dispatch a `Deploy` to the backend its spec selects, and — on acceptance —
-/// record what it was deployed with (R852-B4).
+/// record what it was deployed with (R852-B4, R870-B24).
 ///
-/// The digest is taken **before** dispatch, because the arms below take the
-/// `Workload` apart and the value a caller compares against is the whole
+/// The envelope is cloned **before** dispatch, because the arms below take the
+/// `Workload` apart and what a caller compares (or reads back) is the whole
 /// envelope it sent, not one variant's remains. It is recorded only on an
 /// `Ack`, so a refused deploy leaves no record and the next `List` reports the
 /// workload as unknown-spec rather than as deployed-with-something.
 ///
 /// One caveat the field's doc also carries: on the bundle path an `Ack` means
 /// *admitted* (`ProtocolVersion::V3`), not running. A bundle that fails while
-/// materializing therefore leaves a digest behind — harmless, because the
+/// materializing therefore leaves a record behind — harmless, because the
 /// digest is only ever stamped onto an entry a backend still reports, and a
 /// caller comparing digests is deciding whether to *re-declare*, not whether
 /// the workload is healthy.
@@ -1715,10 +1800,10 @@ async fn deploy_workload(
     spec: workload_spec::Workload,
     mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
-    let digest = kamaji_proto::spec_digest(&spec);
+    let record = spec.clone();
     let reply = dispatch_deploy(ctx, request_id, id.clone(), spec, mesh).await;
-    if let (KamajiToYubaba::Ack { .. }, Some(digest)) = (&reply, digest) {
-        ctx.registry.lock().await.set_spec_digest(id, digest);
+    if let KamajiToYubaba::DeployAck { .. } = &reply {
+        ctx.registry.lock().await.set_deployed_spec(id, record);
     }
     reply
 }
@@ -1867,9 +1952,10 @@ async fn deploy_tenant_passway(
                     .lock()
                     .await
                     .set_deploy_progress(id.clone(), DeployProgress::at(WorkloadState::Running));
-                KamajiToYubaba::Ack {
+                KamajiToYubaba::DeployAck {
                     request_id,
-                    kind: kamaji_proto::AckKind::Deploy,
+                    id: id.clone(),
+                    hydrate: None,
                 }
             }
             Err(e) => KamajiToYubaba::Error {
@@ -1946,7 +2032,7 @@ async fn deploy_tenant_passway(
 /// @yah:handoff("TWO PIECES OF DISCOVERED WORK, both inside the blast radius and both done here. (1) EGRESS WAS BROKEN TOO, and nobody had written it down — R881 was filed as an ingress bug. kamaji-containerd-core/src/lib.rs bound /etc/resolv.conf only under `wants_host_network()`, on the stated reasoning that \"an isolated netns has no upstream resolver to inherit\". That was true only because an isolated netns had no route at all; a workload joining a namespace this ticket wires has a default route and MASQUERADE, so the host resolver is as reachable from inside as from the host. Without the widening such a workload gets an address, gets IP egress, and still cannot resolve a name — which reads as a networking bug and is a missing file. Condition is now `wants_host_network() || pod.join_netns.is_some()`, pinned by `a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not`, whose other half asserts a BARE namespace still gets no resolv.conf (a resolver pointing at an unreachable nameserver turns an instant failure into a DNS timeout on every lookup). (2) THE SHARED ADDRESS PLAN, built here rather than left for R881-T4: `ContainerNet::node_subnet(node_mesh_ip)` and `workload_address(node_mesh_ip, n)`. yubaba will call them to allocate; kamaji never does — it recovers the same /24 from the address it is handed. Two implementations of one scheme is exactly the drift R881 was, so there is one, in one file, with `yubabas_allocation_and_kamajis_recovery_agree_without_talking` asserting the round trip.")
 /// @yah:verify("FULL RADIUS, exit codes echoed rather than inferred from an empty grep. `cargo check --workspace --all-features --all-targets` in oss/kamaji = KAMAJI_CHECK_EXIT 0 (two warnings, both pre-existing and unrelated: yah-object-store parse_list_v2 dead_code, kamaji-bin pidfd events_tx). `cargo test --workspace --all-features` in oss/kamaji = KAMAJI_TEST_EXIT 0, zero failures across every target; the two suites this touched are kamaji lib (303, +20 new container_net tests) and kamaji-bin lib (200, +4 new). `cargo check --workspace --all-targets` from the REPO ROOT = ROOT_CHECK_EXIT 0 — the run that would have caught a call site outside the oss/kamaji workspace, since kamaji is patched in via [patch.crates-io]; `ContainerdBackend::deploy` gained a parameter and a workspace-local check cannot see past its own members. Grepped app/ crates/ oss/yubaba/ xtask/ for ContainerdBackend first: only two doc-comment mentions, no call sites.")
 /// @yah:gotcha("THIS IS INERT ON EVERY NODE UNTIL TWO THINGS HAPPEN, AND THAT IS BY DESIGN — do not read a green build as \"the fleet has container networking now\". (a) `--container-net CIDR` / `$KAMAJI_CONTAINER_NET` is off by default, the same explicit opt-in every other kamaji backend requires; no node's kamaji.service passes it yet. (b) EVEN WITH THE FLAG SET, `ContainerNet::plan()` returns None for every workload today, because yubaba still sends the NODE's own mesh address (100.64.0.x) in the MeshAssignment for everybody — that is R881-T4's job. Building a namespace around the node's own address would put it on a veth and break every container on the box, so the None arm is load-bearing rather than a stub, and `a_node_address_builds_no_namespace_rather_than_a_broken_one` is the test that keeps it. Consequence for whoever rolls this: the safe order is T4 first (or same release), then the flag, then R881-T5's route advertisement. A node with the flag and no T4 behaves exactly like a node without it.")
-/// @yah:assumes("NOTHING RAN AGAINST A LINUX NODE — stated plainly, because it is the honest limit of this ticket's verification. Every test here is pure: it asserts the COMMAND SEQUENCE, not its effect, since `ip` and `iptables` do not exist on a darwin camp host. What is therefore unproven by test and reasoned from documented behaviour: that `ip -n <ns> link set <peer> name eth0` succeeds on a link that is down but already moved (it is, the rename precedes the `up`); that deleting a namespace destroys its veth and with it the host-side peer (the basis for teardown naming only the namespace); and that runc accepts /var/run/netns/<name> as a `{\"type\":\"network\",\"path\":...}` target (the same path shape kamaji::socket_custody::netns_path already builds for the custody netns). First live deploy on a node with --container-net set is the real test, and it should be one workload on one node, not a fleet roll.")
+/// @yah:assumes("NOTHING RAN AGAINST A LINUX NODE — stated plainly, because it is the honest limit of this ticket's verification. Every test here is pure: it asserts the COMMAND SEQUENCE, not its effect, since `ip` and `iptables` do not exist on a darwin camp host. What is therefore unproven by test and reasoned from documented behaviour: that `ip -n <ns> link set <peer> name eth0` succeeds on a link that is down but already moved (it is, the rename precedes the `up`); that deleting a namespace destroys its veth and with it the host-side peer (the basis for teardown naming only the namespace); and that runc accepts /var/run/netns/<name> as a `{\"type\":\"network\",\"path\":...}` target (the same path shape kamaji::container_net::netns_path already builds for the custody netns; R895-F1 deleted the duplicate that lived in socket_custody). First live deploy on a node with --container-net set is the real test, and it should be one workload on one node, not a fleet roll.")
 #[allow(unused_variables)]
 async fn deploy_container(
     ctx: &Arc<ServerCtx>,
@@ -1982,10 +2068,7 @@ async fn deploy_container(
 
     let reply = deploy_container_inner(ctx, request_id, id, spec, mesh).await;
 
-    if matches!(
-        reply,
-        KamajiToYubaba::Ack { kind: kamaji_proto::AckKind::Deploy, .. }
-    ) {
+    if matches!(reply, KamajiToYubaba::DeployAck { .. }) {
         if let Err(message) = crate::tail::spawn(ctx, id, spec).await {
             // Preflight already cleared the declared-but-unconfigured case, so
             // reaching here means the helper would not spawn. Stop what we just
@@ -2039,11 +2122,12 @@ async fn deploy_container_inner(
     // workload can dodge by setting `yah.exec = native` is not a guard. This is
     // inert for every spec that declares nothing, which is every spec in the
     // tree today (`hydrate::plan` → `NotDeclared`).
-    match crate::hydrate::run(ctx.hydrate_helper.as_deref(), spec).await {
+    let hydrate = match crate::hydrate::run(ctx.hydrate_helper.as_deref(), spec).await {
         Ok(crate::hydrate::HydrateResult::Proceed(line)) => {
-            if let Some(line) = line {
+            if let Some(line) = &line {
                 info!(id = %id.0, outcome = %line, "hydrate-on-place");
             }
+            line
         }
         Err(message) => {
             return KamajiToYubaba::Error {
@@ -2052,8 +2136,55 @@ async fn deploy_container_inner(
                 message,
             }
         }
-    }
+    };
 
+    // R850-T4: carry that line back on the reply. The `info!` above stays — a
+    // node's own journal is where an operator debugging THIS node looks — but a
+    // log line is not a measurement anyone can plan against: reaching it means
+    // knowing which node ran the restore and shelling in, which is exactly the
+    // manual step that leaves `yah cloud topology` reporting an extrapolation
+    // forever.
+    attach_hydrate(
+        deploy_container_backend(ctx, request_id, id, spec, mesh).await,
+        hydrate,
+    )
+}
+
+/// Put the hydrate-on-place measurement on a successful deploy reply.
+///
+/// Only a [`KamajiToYubaba::DeployAck`] takes it, and that is the point: a
+/// restore that happened in front of a deploy that then FAILED is not a
+/// measurement of anything recoverable — the volume it filled belongs to a
+/// workload that is not running. Every other reply shape passes through
+/// untouched, so an error keeps naming what went wrong rather than gaining a
+/// field about what went right first.
+fn attach_hydrate(reply: KamajiToYubaba, hydrate: Option<String>) -> KamajiToYubaba {
+    match reply {
+        KamajiToYubaba::DeployAck { request_id, id, .. } => KamajiToYubaba::DeployAck {
+            request_id,
+            id,
+            hydrate,
+        },
+        other => other,
+    }
+}
+
+/// The backend half of [`deploy_container_inner`] — admission and
+/// hydrate-on-place have already run, so this only picks a backend and
+/// dispatches.
+///
+/// Split out so the hydrate measurement has somewhere to be attached: the four
+/// arms below each build their own `DeployAck` deep inside a backend that knows
+/// nothing about durability, and threading an `Option<String>` through all of
+/// them would put a parameter no backend reads into four signatures.
+#[allow(unused_variables)]
+async fn deploy_container_backend(
+    ctx: &Arc<ServerCtx>,
+    request_id: kamaji_proto::RequestId,
+    id: &WorkloadId,
+    spec: &workload_spec::WorkloadSpec,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
+) -> KamajiToYubaba {
     if spec.wants_native_exec() {
         return deploy_native_exec(ctx, request_id, id, spec, mesh).await;
     }
@@ -2079,10 +2210,16 @@ async fn deploy_container_inner(
                 };
             }
         };
-        return match backend.deploy(id, spec, netns.as_deref()).await {
-            Ok(_pid) => KamajiToYubaba::Ack {
+        // R908-T1: the address yubaba placed the workload at reaches the process
+        // as `YAH_MESH_IP`, so a host-networked workload binds its node's mesh
+        // address without naming it. A Deploy that carried no assignment gets
+        // the same loopback sentinel the docker arm's `runtime_mesh` uses.
+        let mesh_ip = mesh.map_or(std::net::Ipv4Addr::LOCALHOST, |m| m.mesh_ip);
+        return match backend.deploy(id, spec, netns.as_deref(), mesh_ip).await {
+            Ok(_pid) => KamajiToYubaba::DeployAck {
                 request_id,
-                kind: kamaji_proto::AckKind::Deploy,
+                id: id.clone(),
+                hydrate: None,
             },
             Err(crate::containerd::BackendError::InvalidSpec(msg)) => KamajiToYubaba::Error {
                 request_id: Some(request_id),
@@ -2114,9 +2251,10 @@ async fn deploy_container_inner(
                     pid = result.task_pid,
                     "docker container deployed"
                 );
-                KamajiToYubaba::Ack {
+                KamajiToYubaba::DeployAck {
                     request_id,
-                    kind: kamaji_proto::AckKind::Deploy,
+                    id: id.clone(),
+                    hydrate: None,
                 }
             }
             Err(e) => KamajiToYubaba::Error {
@@ -2158,7 +2296,8 @@ async fn build_container_netns(
     if spec.wants_host_network() {
         return Ok(None);
     }
-    let Some(plan) = net.plan(id.as_str(), mesh.mesh_ip) else {
+    let tenancy = kamaji::container_net::Tenancy::of(spec);
+    let Some(plan) = net.plan(id.as_str(), mesh.mesh_ip, &tenancy) else {
         tracing::debug!(
             id = %id.0,
             mesh_ip = %mesh.mesh_ip,
@@ -2168,11 +2307,26 @@ async fn build_container_netns(
         return Ok(None);
     };
 
+    if plan.tenant_isolated {
+        warn_on_a_resolver_inside_the_denied_mesh_pool(id);
+    }
+
+    // Held from the first `ip link add` to the last grant write, so the GC pass
+    // a concurrent Stop runs cannot delete a bridge this deploy has created and
+    // not yet enslaved a veth to (R895-T5).
+    let lock = kamaji::container_net::lock_node_state().await;
     let mut cmds = net.bridge_commands(&plan);
     cmds.extend(net.setup_commands(&plan));
+    cmds.extend(kamaji::container_net::grant_commands(&plan));
     kamaji::container_net::apply(&cmds)
         .await
         .map_err(|e| format!("container networking for {}: {e:#}", id.as_str()))?;
+    // Reads back the mangle rules applied above; a no-op for a workload that
+    // neither carries a cross-tenant grant nor is named by one (R895-F4).
+    kamaji::container_net::apply_grant_neighbours(&plan, &lock)
+        .await
+        .map_err(|e| format!("cross-tenant grants for {}: {e:#}", id.as_str()))?;
+    drop(lock);
 
     let path = plan.netns_path();
     tracing::info!(
@@ -2183,6 +2337,54 @@ async fn build_container_netns(
         "container network namespace wired"
     );
     Ok(Some(path))
+}
+
+/// R895-T5 (3): a tenant workload's own isolation denies the mesh pool, so a
+/// node that resolves through tailscale MagicDNS hands it a nameserver it
+/// cannot reach — `100.100.100.100` is a tailnet address, and therefore inside
+/// `100.64.0.0/10` by construction.
+///
+/// A warning rather than a refused deploy, which is the opposite of what this
+/// function's caller does for an unreachable workload. The asymmetry is
+/// deliberate: a workload with no DNS still serves every request that does not
+/// need a name, and turning "tenant workloads on this node have broken DNS"
+/// into "this node runs no tenant workloads" is an operator's call, not a
+/// deploy's. What the operator gets is the sentence at the moment it becomes
+/// true, instead of a DNS timeout to work backwards from.
+///
+/// The real fix, the day a node does resolve this way, is to teach
+/// [`kamaji_containerd_core::resolver_mount_source`] that a tenant-isolated
+/// namespace cannot reach the mesh pool, so it ranks such a file out the way it
+/// already ranks out the all-loopback stub. That wants the isolation fact
+/// plumbed through `PodOptions` and `ContainerdBackend::deploy`, which is not
+/// worth carrying while no fleet node collides — measured 2026-09-15, see
+/// [`kamaji::container_net::mesh_pool_nameservers`].
+#[cfg(feature = "containerd-integration")]
+fn warn_on_a_resolver_inside_the_denied_mesh_pool(id: &WorkloadId) {
+    use kamaji_containerd_core::{HostResolvers, SYSTEMD_RESOLVED_UPSTREAM, resolver_mount_source};
+
+    let hosts = HostResolvers::read();
+    // `false`: this path is only ever reached for a workload with a namespace
+    // of its own, which is the case the ranking is about.
+    let Some(path) = resolver_mount_source(false, &hosts) else {
+        return;
+    };
+    let contents = match path {
+        SYSTEMD_RESOLVED_UPSTREAM => hosts.systemd_upstream.as_deref(),
+        _ => hosts.etc.as_deref(),
+    };
+    let denied = kamaji::container_net::mesh_pool_nameservers(contents.unwrap_or_default());
+    if denied.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        id = %id.0,
+        resolver = %path,
+        nameservers = ?denied,
+        pool = %kamaji::container_net::MESH_NODE_POOL,
+        "this node's resolver sits inside the mesh pool a tenant workload is denied; the \
+         workload gets an address and egress and will time out on every DNS lookup"
+    );
 }
 
 /// Run a native-marked container workload on the node's own userland
@@ -2242,9 +2444,10 @@ async fn deploy_native_exec(
                         .await
                         .insert_probe(id.clone(), ProbeTarget::control(sock));
                 }
-                KamajiToYubaba::Ack {
+                KamajiToYubaba::DeployAck {
                     request_id,
-                    kind: kamaji_proto::AckKind::Deploy,
+                    id: id.clone(),
+                    hydrate: None,
                 }
             }
             Err(e) => KamajiToYubaba::Error {
@@ -2319,9 +2522,10 @@ async fn deploy_microvm(
                     vmm_pid = result.task_pid,
                     "microVM booted"
                 );
-                KamajiToYubaba::Ack {
+                KamajiToYubaba::DeployAck {
                     request_id,
-                    kind: kamaji_proto::AckKind::Deploy,
+                    id: id.clone(),
+                    hydrate: None,
                 }
             }
             Err(e) => KamajiToYubaba::Error {
@@ -2531,6 +2735,24 @@ fn validate_native_exec_spec(spec: &workload_spec::WorkloadSpec) -> Result<(), S
         ));
     }
 
+    // R885-B11: the writable-path declaration is the *only* thing that tells
+    // kamaji what a native workload may write, and `kamaji::sandbox` confines
+    // the workload to exactly it. A value nobody can parse therefore has two
+    // possible readings — run unconfined, or refuse — and the first is the
+    // silent-downgrade failure this function already refuses twice above. The
+    // guard lives here rather than in `validate::shape` because the annotation
+    // has no effect on a container spec: only the native backend reads it.
+    if let Err(e) = spec.writable_paths() {
+        return Err(format!(
+            "workload requests native host execution ({}={}) with an unreadable {} \
+             declaration: {e}. kamaji confines a native workload's writes to the paths it \
+             declares, so this cannot be ignored (R885-B11)",
+            workload_spec::NATIVE_EXEC_ANNOTATION,
+            workload_spec::NATIVE_EXEC_VALUE,
+            workload_spec::WRITABLE_PATHS_ANNOTATION,
+        ));
+    }
+
     Ok(())
 }
 
@@ -2565,7 +2787,6 @@ fn runtime_mesh(mesh: Option<&kamaji_proto::MeshAssignment>) -> kamaji::MeshAssi
                 allowed_ips: p.allowed_ips.clone(),
             })
             .collect(),
-        netns_name: mesh.netns_name.clone(),
     }
 }
 
@@ -2722,9 +2943,10 @@ async fn deploy_mesofact_bundle(
 
         spawn_bundle_run(ctx, record).await;
 
-        KamajiToYubaba::Ack {
+        KamajiToYubaba::DeployAck {
             request_id,
-            kind: kamaji_proto::AckKind::Deploy,
+            id: id.clone(),
+            hydrate: None,
         }
     }
     #[cfg(not(feature = "bundle-serving"))]
@@ -3193,10 +3415,9 @@ fn bundle_workload_spec(
 ) -> workload_spec::WorkloadSpec {
     use workload_spec::{
         ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits,
-        RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+        RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
     };
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: id.0.clone(),
         image: ImageRef {
             // Identity metadata only — nothing is pulled for a native workload.
@@ -3240,7 +3461,10 @@ fn bundle_workload_spec(
         resources: ResourceLimits {
             memory_mb: 128,
             cpu_millis: 256,
-            ephemeral_storage_mb: 128,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -3277,6 +3501,7 @@ fn bundle_workload_spec(
             operator: None,
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
         files: Vec::new(),
     }
@@ -3671,6 +3896,13 @@ fn liveness_rank(e: &WorkloadEntry) -> (u8, u8) {
         WireState::Draining => 3,
         WireState::Pending => 2,
         WireState::Failed => 1,
+        // Exactly as live as `Failed`, because it *is* a `Failed` that names its
+        // cause (R885-T6). Without this arm it would fall to the `_` below and
+        // rank 2 — above `Failed` and level with `Pending` — so an OOM-killed
+        // row would win the dedupe against a genuinely more informative one.
+        // The catch-all is right for a state this build has never heard of and
+        // wrong for one it ships.
+        WireState::OomKilled => 1,
         WireState::Exited => 0,
         // `WorkloadState` is #[non_exhaustive]: a state added by a newer peer
         // ranks with Pending — "a record exists, nothing more is known". It can
@@ -3765,7 +3997,17 @@ fn runtime_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
         WorkloadStatus::Stopping => WireState::Draining,
         WorkloadStatus::Stopped => WireState::Exited,
         WorkloadStatus::Restarting { .. } => WireState::Starting,
-        WorkloadStatus::Failed { .. } => WireState::Failed,
+        // R885-T6: the native backend is the one that can tell an OOM kill from
+        // an ordinary crash (R885-F3 reads `memory.events` at the settle seam),
+        // and this is where that verdict finally crosses the UDS. Before V11
+        // both arrived at yubaba as the same `Failed` byte.
+        WorkloadStatus::Failed { oom_killed, .. } => {
+            if *oom_killed {
+                WireState::OomKilled
+            } else {
+                WireState::Failed
+            }
+        }
     };
     let pid = s
         .container_id
@@ -3823,7 +4065,18 @@ fn docker_workload_to_entry(w: kamaji::docker::DockerWorkload) -> WorkloadEntry 
         // Docker's own restart-policy engine is re-launching the container —
         // it is coming up, not down. Matches the bundle mapping.
         WorkloadStatus::Restarting { .. } => WireState::Starting,
-        WorkloadStatus::Failed { .. } => WireState::Failed,
+        // Same mapping as `runtime_state_to_entry`. Docker's own status strings
+        // carry no OOM distinction, so `oom_killed` is always `false` on this
+        // path today — the arm is written out rather than collapsed to `Failed`
+        // so that a backend which later learns to set the bit reports it without
+        // anyone having to remember this second site exists.
+        WorkloadStatus::Failed { oom_killed, .. } => {
+            if *oom_killed {
+                WireState::OomKilled
+            } else {
+                WireState::Failed
+            }
+        }
     };
     WorkloadEntry {
         id: WorkloadId(w.workload_id),
@@ -4007,11 +4260,31 @@ pub(crate) async fn stop_workload(
         // deliberately not fatal: every command in it is best-effort, so a
         // workload that never had a namespace stops exactly as it did before.
         #[cfg(feature = "containerd-integration")]
-        if ctx.container_net.is_some() {
+        if let Some(net) = ctx.container_net.as_ref() {
+            let lock = kamaji::container_net::lock_node_state().await;
             let cmds = kamaji::container_net::teardown_by_workload(id.as_str());
             if let Err(e) = kamaji::container_net::apply(&cmds).await {
                 tracing::warn!(id = %id.0, error = %format!("{e:#}"),
                     "container network teardown failed; the namespace may have leaked");
+            }
+            // R895-T5: everything the teardown above cannot address, because a
+            // Stop carries an identity and no address — this workload's host
+            // route, prohibit, mangle chains and grant ARP state, and its
+            // tenant's bridge once it was the last workload on it. Deliberately
+            // AFTER the teardown, which is what makes the address read as free,
+            // and deliberately not fatal: a node that cannot be swept keeps a
+            // stale rule, which is worse than a workload that cannot stop only
+            // if you have never had to stop a workload.
+            match kamaji::container_net::reconcile(net, &lock).await {
+                Ok(swept) if swept.is_empty() => {}
+                Ok(swept) => tracing::info!(
+                    id = %id.0,
+                    bridges = ?swept.bridges,
+                    addresses = ?swept.addresses,
+                    "container network state garbage-collected"
+                ),
+                Err(e) => tracing::warn!(id = %id.0, error = %format!("{e:#}"),
+                    "container network GC failed; stale bridges or rules may remain"),
             }
         }
     }
@@ -4121,12 +4394,13 @@ pub(crate) async fn stop_workload(
             };
         }
     }
-    // R852-B4: and the spec digest. Unconditional (not per-backend) because
+    // R852-B4: and the spec record. Unconditional (not per-backend) because
     // `Stop` is: whatever held this id, nothing holds it now, so a later
     // redeploy of the identical spec must NOT be skipped as unchanged. A
     // record that outlived its workload is the one way this field could cause
-    // a missing deploy rather than a redundant one.
-    ctx.registry.lock().await.remove_spec_digest(&id);
+    // a missing deploy rather than a redundant one — and, since R870-B24, the
+    // one way `Describe` could report a spec nothing is running.
+    ctx.registry.lock().await.remove_deployed_spec(&id);
     KamajiToYubaba::Ack {
         request_id,
         kind: kamaji_proto::AckKind::Stop,
@@ -4232,6 +4506,133 @@ mod tests {
                 assert!(entries.is_empty());
             }
             other => panic!("expected WorkloadList, got {other:?}"),
+        }
+    }
+
+    /// A `Workload` carrying an env variable, so a round-trip through
+    /// `Describe` proves the *contents* survive rather than only the shape.
+    fn env_carrying_workload(var: &str) -> workload_spec::Workload {
+        let mut spec = workload_spec::WorkloadSpec::for_forge(
+            "passway-ingress",
+            workload_spec::ImageRef {
+                registry: "localhost".into(),
+                repository: "passway".into(),
+                tag: "r870b24".into(),
+                digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+            },
+            workload_spec::TierTag("infra".to_string()),
+            vec![],
+        );
+        spec.env.push(workload_spec::EnvVar {
+            name: var.into(),
+            value: workload_spec::EnvValue::Literal {
+                value: "/run/secrets/cheers-verify.key".into(),
+            },
+        });
+        workload_spec::Workload::container(spec)
+    }
+
+    /// R870-B24 — `Describe` is the read half of `Deploy`: a caller about to
+    /// replace a workload it did not author can see what the replacement would
+    /// drop. `List` cannot answer that (status and ports, no env) and
+    /// `spec_digest` cannot either (it only confirms a spec you already hold).
+    #[tokio::test]
+    async fn describe_returns_the_workload_the_deploy_recorded() {
+        let ctx = Arc::new(ServerCtx::new());
+        let id = WorkloadId::new("passway-ingress");
+        let declared = env_carrying_workload("PASSWAY_AUTH_PUBLIC_KEY_FILE");
+        ctx.registry
+            .lock()
+            .await
+            .set_deployed_spec(id.clone(), declared.clone());
+
+        match handle_message(
+            YubabaToKamaji::Describe {
+                request_id: RequestId(11),
+                id: id.clone(),
+            },
+            &ctx,
+        )
+        .await
+        {
+            KamajiToYubaba::WorkloadDescription {
+                request_id,
+                id: answered,
+                spec,
+            } => {
+                assert_eq!(request_id, RequestId(11));
+                assert_eq!(answered, id);
+                assert_eq!(
+                    spec.as_ref(),
+                    Some(&declared),
+                    "the whole envelope comes back, env included — a guard reading it for one \
+                     variable is the point of the verb"
+                );
+            }
+            other => panic!("expected WorkloadDescription, got {other:?}"),
+        }
+    }
+
+    /// No record is reported as `spec: None`, NOT as an error — a caller
+    /// guarding a destructive redeploy has to tell "kamaji answered and holds
+    /// nothing" apart from "the call failed", and only one of those is worth
+    /// retrying. Both still mean unknown.
+    #[tokio::test]
+    async fn describe_reports_no_record_as_a_none_rather_than_an_error() {
+        let ctx = Arc::new(ServerCtx::new());
+        match handle_message(
+            YubabaToKamaji::Describe {
+                request_id: RequestId(12),
+                id: WorkloadId::new("never-deployed"),
+            },
+            &ctx,
+        )
+        .await
+        {
+            KamajiToYubaba::WorkloadDescription { spec, .. } => assert!(spec.is_none()),
+            other => panic!("expected WorkloadDescription, got {other:?}"),
+        }
+    }
+
+    /// A `Stop` takes the spec record with the workload. Describing a workload
+    /// that is gone would hand a guard evidence about a door nothing is
+    /// serving — worse than no evidence, because it reads as authoritative.
+    #[tokio::test]
+    async fn stop_drops_the_spec_so_describe_stops_answering_for_it() {
+        let ctx = Arc::new(ServerCtx::new());
+        let id = WorkloadId::new("passway-ingress");
+        ctx.registry
+            .lock()
+            .await
+            .set_deployed_spec(id.clone(), env_carrying_workload("PASSWAY_AUTH_KID"));
+
+        assert!(matches!(
+            handle_message(
+                YubabaToKamaji::Stop {
+                    request_id: RequestId(13),
+                    id: id.clone(),
+                },
+                &ctx,
+            )
+            .await,
+            KamajiToYubaba::Ack { .. }
+        ));
+
+        match handle_message(
+            YubabaToKamaji::Describe {
+                request_id: RequestId(14),
+                id,
+            },
+            &ctx,
+        )
+        .await
+        {
+            KamajiToYubaba::WorkloadDescription { spec, .. } => assert!(
+                spec.is_none(),
+                "a stopped workload's spec must not survive it"
+            ),
+            other => panic!("expected WorkloadDescription, got {other:?}"),
         }
     }
 
@@ -4376,7 +4777,7 @@ mod tests {
     // lint doesn't trip when handlers don't ack yet.
     #[test]
     fn ack_kind_is_addressable() {
-        let _ = AckKind::Deploy;
+        let _ = AckKind::Stop;
     }
 
     // ── R406-T9: deploy dispatch ─────────────────────────────────────────────
@@ -4387,11 +4788,10 @@ mod tests {
     #[tokio::test]
     async fn deploy_mesofact_static_is_rejected_as_invalid_spec() {
         use workload_spec::{
-            BuildConfig, BuildMode, MesofactStaticWorkload, SchemaVersion, Workload,
+            BuildConfig, BuildMode, MesofactStaticWorkload, Workload,
         };
         let ctx = Arc::new(ServerCtx::new());
         let workload = Workload::MesofactStatic(MesofactStaticWorkload {
-            schema_version: SchemaVersion::V1,
             build: BuildConfig {
                 command: Some("bun run build".into()),
                 out_dir: std::path::PathBuf::from("dist"),
@@ -4440,11 +4840,10 @@ mod tests {
     async fn deploy_serve_bundle_mesofact_static_is_admitted_not_invalid_spec() {
         use workload_spec::{
             BlakeHash, BuildConfig, BuildMode, BundleLifecycle, MesofactServeBundle,
-            MesofactStaticWorkload, SchemaVersion, Workload,
+            MesofactStaticWorkload, Workload,
         };
         let ctx = Arc::new(ServerCtx::new());
         let workload = Workload::MesofactStatic(MesofactStaticWorkload {
-            schema_version: SchemaVersion::V1,
             build: BuildConfig {
                 command: Some("bun run build".into()),
                 out_dir: std::path::PathBuf::from("dist"),
@@ -4626,10 +5025,7 @@ mod tests {
         assert!(
             matches!(
                 reply,
-                KamajiToYubaba::Ack {
-                    kind: kamaji_proto::AckKind::Deploy,
-                    ..
-                }
+                KamajiToYubaba::DeployAck { .. }
             ),
             "native deploy should Ack, got {reply:?}"
         );
@@ -4746,10 +5142,7 @@ mod tests {
         assert!(
             matches!(
                 reply,
-                KamajiToYubaba::Ack {
-                    kind: kamaji_proto::AckKind::Deploy,
-                    ..
-                }
+                KamajiToYubaba::DeployAck { .. }
             ),
             "native deploy should Ack, got {reply:?}"
         );
@@ -4839,10 +5232,7 @@ mod tests {
         assert!(
             matches!(
                 reply,
-                KamajiToYubaba::Ack {
-                    kind: kamaji_proto::AckKind::Deploy,
-                    ..
-                }
+                KamajiToYubaba::DeployAck { .. }
             ),
             "native forge deploy should Ack, got {reply:?}"
         );
@@ -4993,6 +5383,52 @@ mod tests {
             KamajiToYubaba::Error { code, message, .. } => {
                 assert_eq!(code, ErrorCode::InvalidSpec, "got: {message}");
                 assert!(message.contains("mutually exclusive"), "got: {message}");
+            }
+            other => panic!("expected Error(InvalidSpec), got {other:?}"),
+        }
+    }
+
+    /// R885-B11: a native spec whose `yah.writable-paths` declaration cannot be
+    /// read is refused at admission rather than started unconfined.
+    ///
+    /// The declaration is the *whole* input to `kamaji::sandbox`'s landlock
+    /// policy. Absent, it means "this workload has never described its writes"
+    /// and the workload runs unconfined by rule; malformed, it means somebody
+    /// tried to describe them and the description does not parse — and resolving
+    /// that to the same outcome as saying nothing is exactly the silent
+    /// downgrade the two refusals above exist to prevent.
+    #[tokio::test]
+    async fn a_native_spec_with_an_unreadable_writable_paths_declaration_is_refused() {
+        let ctx = Arc::new(ServerCtx::new());
+        let mut inner = make_minimal_container_spec("forge-mistyped");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        // Relative: there is no directory on the node for it to be relative to.
+        inner.annotations.insert(
+            workload_spec::WRITABLE_PATHS_ANNOTATION.to_string(),
+            "var/lib/yah/qed".to_string(),
+        );
+
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(82),
+                id: WorkloadId::new("forge-mistyped"),
+                spec: workload_spec::Workload::container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+
+        match reply {
+            KamajiToYubaba::Error { code, message, .. } => {
+                assert_eq!(code, ErrorCode::InvalidSpec, "got: {message}");
+                assert!(
+                    message.contains(workload_spec::WRITABLE_PATHS_ANNOTATION),
+                    "the refusal must name the annotation it could not read: {message}"
+                );
             }
             other => panic!("expected Error(InvalidSpec), got {other:?}"),
         }
@@ -5332,15 +5768,16 @@ mod tests {
             },
             target: "/var/lib/app".into(),
             read_only: false,
+            from_secret_mount: false,
         }];
-        for (k, v) in [
-            ("yah.durability.tier", "stream"),
-            ("yah.durability.engine", "turso"),
-            ("yah.durability.store", "s3://yah-backups/acct"),
-            ("yah.durability.subjects", "accounts.db"),
-        ] {
-            spec.annotations.insert(k.into(), v.into());
-        }
+        spec.durability = Some(workload_spec::Durability {
+            tier: workload_spec::DurabilityTier::Stream,
+            engine: Some(workload_spec::DurabilityEngine::Turso),
+            store: Some("s3://yah-backups/acct".into()),
+            subjects: vec!["accounts.db".into()],
+            rpo_seconds: None,
+            state_mb: None,
+        });
         let reply = handle_message(
             YubabaToKamaji::Deploy {
                 request_id: RequestId(77),
@@ -5474,6 +5911,80 @@ mod tests {
         assert_eq!(entry.state, kamaji_proto::WorkloadState::Running);
     }
 
+    /// R885-T6 acceptance, both directions: an OOM kill reaches the wire as
+    /// `OomKilled` and a plain SIGKILL still reaches it as `Failed`.
+    ///
+    /// This is the assertion the whole V11 bump exists for. R885-F3 built the
+    /// classification inside kamaji and it stopped dead at this function, which
+    /// flattened every `WorkloadStatus::Failed` to one wire byte — so yubaba
+    /// could not tell a workload that blew its `memory.max` from one that
+    /// segfaulted. The negative half matters as much as the positive one: a
+    /// classifier that called everything an OOM would send an operator to raise
+    /// a ceiling that was never the problem, which is the expensive direction
+    /// and the one R590-B10 already paid for once.
+    #[cfg(any(
+        feature = "bundle-serving",
+        feature = "microvm",
+        feature = "tenant-passway",
+        feature = "native-exec"
+    ))]
+    #[test]
+    fn an_oom_kill_reaches_the_wire_distinct_from_a_plain_failure() {
+        fn entry_for(oom_killed: bool) -> WorkloadEntry {
+            runtime_state_to_entry(kamaji::WorkloadState {
+                ident: workload_spec::MeshIdent("svc.oom".into()),
+                container_id: "native-4242".into(),
+                status: kamaji::WorkloadStatus::Failed {
+                    reason: "killed by signal 9".into(),
+                    oom_killed,
+                },
+                mesh_ip: None,
+                ports: Default::default(),
+            })
+        }
+
+        assert_eq!(
+            entry_for(true).state,
+            WireWorkloadState::OomKilled,
+            "an OOM-killed workload must be distinguishable on the wire"
+        );
+        assert_eq!(
+            entry_for(false).state,
+            WireWorkloadState::Failed,
+            "a plain SIGKILL must NOT be reported as an OOM"
+        );
+        assert_ne!(entry_for(true).state, entry_for(false).state);
+    }
+
+    /// `OomKilled` must rank exactly like `Failed` in the List dedupe.
+    ///
+    /// Not hypothetical: `liveness_rank` ends in a `_ => 2` catch-all for states
+    /// a newer peer might send, and a variant added without this arm falls into
+    /// it and ranks *above* `Failed`. An OOM-killed row would then win the
+    /// dedupe against a more informative row for the same workload id.
+    #[test]
+    fn an_oom_killed_row_ranks_with_failed_not_with_the_unknown_catch_all() {
+        fn row(state: WireWorkloadState) -> WorkloadEntry {
+            WorkloadEntry {
+                id: WorkloadId::new("svc"),
+                state,
+                pid: None,
+                mesh_ident: None,
+                ports: Default::default(),
+                named_ports: Default::default(),
+                spec_digest: None,
+            }
+        }
+        assert_eq!(
+            liveness_rank(&row(WireWorkloadState::OomKilled)),
+            liveness_rank(&row(WireWorkloadState::Failed))
+        );
+        assert!(
+            liveness_rank(&row(WireWorkloadState::OomKilled))
+                < liveness_rank(&row(WireWorkloadState::Pending))
+        );
+    }
+
     /// Docker's restart-policy engine re-launching a container means it is
     /// coming UP, so the wire state is `Starting`, not `Failed` — a supervisor
     /// that read it as failed would tear down a container that is recovering.
@@ -5503,11 +6014,10 @@ mod tests {
     fn make_minimal_container_spec(name: &str) -> workload_spec::WorkloadSpec {
         use workload_spec::{
             EnvValue, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits,
-            RestartPolicy, SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+            RestartPolicy, StopPolicy, TierTag, WorkloadSpec,
         };
         let _ = EnvValue::Literal { value: "x".into() };
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.into(),
             image: ImageRef {
                 registry: "ghcr.io".into(),
@@ -5529,7 +6039,10 @@ mod tests {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -5550,6 +6063,7 @@ mod tests {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -5576,7 +6090,6 @@ mod tests {
             wg_private_key: String::new(),
             wg_listen_port: 0,
             peers: vec![],
-            netns_name: None,
         }
     }
 
@@ -5939,7 +6452,7 @@ mod tests {
         use std::sync::Arc;
         use workload_spec::{
             BlakeHash, BuildConfig, BuildMode, BundleLifecycle, MesofactServeBundle,
-            MesofactStaticWorkload, Millis, SchemaVersion, Workload,
+            MesofactStaticWorkload, Millis, Workload,
         };
         use yah_mesofact_bundle::{
             publish_bundle, BundleHash, BundleManifest, BundleRuntime, SCHEMA_VERSION,
@@ -6076,7 +6589,6 @@ mod tests {
             port: Option<u16>,
         ) -> Workload {
             Workload::MesofactStatic(MesofactStaticWorkload {
-                schema_version: SchemaVersion::V1,
                 build: BuildConfig {
                     command: Some("bun run build".into()),
                     out_dir: std::path::PathBuf::from("dist"),
@@ -6207,7 +6719,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -6226,7 +6738,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
             await_deploy_ok(&ctx, "yah-marketing").await;
 
             // The asset landed at the namespaced node path, outside bundles/.
@@ -6309,7 +6824,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -6329,7 +6844,10 @@ mod tests {
                     &ctx,
                 )
                 .await;
-                assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+                assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
                 await_deploy_ok(&ctx, id).await;
             }
 
@@ -6363,7 +6881,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             let reply = handle_message(
@@ -6381,7 +6899,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
 
             let (state, detail) = await_deploy(&ctx, "yah-marketing").await;
             assert_eq!(state, WorkloadState::Failed);
@@ -6487,7 +7008,7 @@ mod tests {
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(
-                BundleBackend::new(Arc::clone(&node), cache.path(), state.path())
+                BundleBackend::new(Arc::clone(&node), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                     .with_bind_port(0),
             ));
 
@@ -6509,7 +7030,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
             await_deploy_ok(&ctx, "noisetable-marketing").await;
 
             // The tenant's content came from the tenant's origin…
@@ -6552,7 +7076,7 @@ mod tests {
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(
-                BundleBackend::new(Arc::clone(&node), cache.path(), state.path())
+                BundleBackend::new(Arc::clone(&node), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                     .with_bind_port(0),
             ));
 
@@ -6571,7 +7095,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
 
             let (state, detail) = await_deploy(&ctx, "noisetable-marketing").await;
             assert_eq!(state, WorkloadState::Failed);
@@ -6588,7 +7115,7 @@ mod tests {
             node.put("blobs/x", b"node".to_vec()).unwrap();
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&node), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&node), cache.path(), state.path(), kamaji::observe::Collector::disabled());
 
             let plain = backend.store_for(None).await.unwrap();
             assert!(
@@ -6641,6 +7168,7 @@ mod tests {
                 Arc::clone(&store),
                 cache.path(),
                 state.path(),
+                kamaji::observe::Collector::disabled(),
             )));
 
             for (rid, id) in [(1_844u64, "yah-marketing"), (1_845, "noisetable-com")] {
@@ -6658,7 +7186,10 @@ mod tests {
                     &ctx,
                 )
                 .await;
-                assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+                assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
                 await_deploy_ok(&ctx, id).await;
             }
 
@@ -6721,6 +7252,7 @@ mod tests {
                 Arc::clone(&store),
                 cache.path(),
                 state.path(),
+                kamaji::observe::Collector::disabled(),
             )));
 
             let reply = handle_message(
@@ -6737,7 +7269,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
 
             let (state, detail) = await_deploy(&ctx, "yah-marketing").await;
             assert_eq!(state, WorkloadState::Failed);
@@ -6762,6 +7297,7 @@ mod tests {
                 Arc::clone(&store),
                 cache.path(),
                 state.path(),
+                kamaji::observe::Collector::disabled(),
             )));
 
             let reply = handle_message(
@@ -6774,7 +7310,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
             await_deploy_ok(&ctx, "yah-marketing").await;
 
             let entries = match handle_message(
@@ -6844,6 +7383,7 @@ mod tests {
                 Arc::clone(&store),
                 cache.path(),
                 state.path(),
+                kamaji::observe::Collector::disabled(),
             )));
             let reply = handle_message(
                 YubabaToKamaji::Deploy {
@@ -6855,7 +7395,10 @@ mod tests {
                 &first,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
             await_deploy_ok(&first, "yah-marketing").await;
             let before = listed_port(&first).await;
             assert_eq!(before.len(), 1);
@@ -6877,6 +7420,7 @@ mod tests {
                 Arc::clone(&store),
                 cache.path(),
                 state.path(),
+                kamaji::observe::Collector::disabled(),
             )));
             assert_eq!(second.resume_bundle_workloads().await, 1);
             await_deploy_ok(&second, "yah-marketing").await;
@@ -6901,7 +7445,7 @@ mod tests {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
             let state = tempfile::tempdir().unwrap();
             let cache = tempfile::tempdir().unwrap();
-            let pinned = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let pinned = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(9100);
             let bundle = workload_spec::MesofactServeBundle {
                 digest: workload_spec::BlakeHash("0".repeat(64)),
@@ -6922,7 +7466,7 @@ mod tests {
             assert!(err.contains("9100") && err.contains("\"http\""), "got: {err}");
 
             // And with nothing written down, allocation takes over — no 8080.
-            let unpinned = BundleBackend::new(store, cache.path(), state.path());
+            let unpinned = BundleBackend::new(store, cache.path(), state.path(), kamaji::observe::Collector::disabled());
             assert_eq!(
                 unpinned.declared_pin(&bundle),
                 None,
@@ -6937,6 +7481,88 @@ mod tests {
                 .unwrap();
             assert_ne!(port, 0);
             assert_ne!(port, DEFAULT_BUNDLE_PORT);
+        }
+
+        /// R885-B12 — the cgroup-resolving runtime census, pinned.
+        ///
+        /// kamaji logs exactly one `<backend> backend: confining workloads to
+        /// cgroup leaves under the delegated root` per constructed runtime, and
+        /// on us-east-001 (2026-09-11, kamaji 0.8.39-h1) that came out **native
+        /// twice, jit once**. That read as a double-construction bug, because
+        /// R885-B10's note says the *jit* line is the doubled one. Neither
+        /// runtime is duplicated: there are FOUR construction sites and the
+        /// fleet's configuration reaches exactly three of them.
+        ///
+        /// | site | field | label |
+        /// |---|---|---|
+        /// | `--native-exec-dir` (main.rs) | `ServerCtx::native` | `native` |
+        /// | `BundleBackend::new` | `BundleBackend::native` | `native` |
+        /// | `BundleBackend::new` | `BundleBackend::jit` | `jit` |
+        /// | `--tenant-passway-dir` (main.rs) | `ServerCtx::tenant_passway` | `jit` |
+        ///
+        /// The fourth is opt-in and `app/yah/cli/resources/kamaji.service`
+        /// does not pass its flag, so no fleet node constructs it — which is
+        /// the half that made the live count look inverted.
+        ///
+        /// Pinned because a census is exactly what drifts back silently: a
+        /// fifth site, or a `BundleBackend` that stopped building its own
+        /// native supervisor, would change the journal and fail nothing else.
+        #[cfg(feature = "native-exec")]
+        #[test]
+        fn the_cgroup_resolving_runtime_census_is_two_native_and_one_jit() {
+            use std::path::Path;
+
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let cache = tempfile::tempdir().unwrap();
+            let bundle_state = tempfile::tempdir().unwrap();
+            let native_exec = tempfile::tempdir().unwrap();
+
+            let ctx = ServerCtx::new()
+                .with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(
+                    native_exec.path(),
+                )))
+                .with_bundle_backend(BundleBackend::new(
+                    Arc::clone(&store),
+                    cache.path(),
+                    bundle_state.path(),
+                    kamaji::observe::Collector::disabled(),
+                ));
+
+            let bundle = ctx.bundle.as_ref().expect("bundle backend attached");
+            let ctx_native = ctx.native.as_ref().expect("native-exec attached");
+
+            // `(label, state_dir)` is the pair each startup line prints since
+            // R885-B12, and the pair that has to be unique. `label` alone is
+            // not — two of these are `native`. Nor is `state_dir` alone: the
+            // bundle backend hands ONE dir to both of its runtimes.
+            let census: Vec<(&str, &Path)> = vec![
+                ("native", ctx_native.exec_dir()),
+                ("native", bundle.native.exec_dir()),
+                ("jit", bundle.jit.state_dir()),
+            ];
+
+            assert_eq!(
+                census.iter().filter(|(b, _)| *b == "native").count(),
+                2,
+                "two native backends is the designed count, not a bug"
+            );
+            assert_eq!(census.iter().filter(|(b, _)| *b == "jit").count(), 1);
+
+            for (i, a) in census.iter().enumerate() {
+                for b in &census[i + 1..] {
+                    assert_ne!(a, b, "two startup lines would be indistinguishable");
+                }
+            }
+
+            // The bundle backend's two runtimes deliberately share a state dir
+            // — that is why the label is still needed alongside it.
+            assert_eq!(bundle.native.exec_dir(), bundle.jit.state_dir());
+
+            #[cfg(feature = "tenant-passway")]
+            assert!(
+                ctx.tenant_passway.is_none(),
+                "the fourth site is opt-in; nothing here configured it"
+            );
         }
 
         /// R746-F6, the node-side backstop. A bundle requiring a contract
@@ -6964,7 +7590,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             let reply = handle_message(
@@ -6982,7 +7608,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
 
             let (state, detail) = await_deploy(&ctx, "yah-marketing").await;
             assert_eq!(state, WorkloadState::Failed);
@@ -7014,7 +7643,7 @@ mod tests {
             let digest = publish_vanilla_bundle(store.as_ref(), "<html>home</html>");
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             let _ = handle_message(
@@ -7080,7 +7709,7 @@ mod tests {
             });
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(store, cache.path(), state.path());
+            let backend = BundleBackend::new(store, cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             let started = std::time::Instant::now();
@@ -7097,8 +7726,8 @@ mod tests {
             let ack_took = started.elapsed();
 
             assert!(
-                matches!(reply, KamajiToYubaba::Ack { .. }),
-                "expected an admission Ack, got {reply:?}"
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "expected an admission DeployAck, got {reply:?}"
             );
             // The bundle has at least two objects to fetch, so a synchronous
             // deploy could not possibly have returned inside one delay.
@@ -7166,7 +7795,7 @@ mod tests {
             let digest = publish_self_bundle(store.as_ref(), true);
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             handle_message(
@@ -7219,7 +7848,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             let reply = handle_message(
@@ -7233,11 +7862,10 @@ mod tests {
             )
             .await;
             match reply {
-                KamajiToYubaba::Ack { request_id, kind } => {
+                KamajiToYubaba::DeployAck { request_id, .. } => {
                     assert_eq!(request_id, RequestId(101));
-                    assert_eq!(kind, kamaji_proto::AckKind::Deploy);
                 }
-                other => panic!("expected Ack, got {other:?}"),
+                other => panic!("expected DeployAck, got {other:?}"),
             }
             // R330-F33: the Ack is admission; the fork happens after it.
             await_deploy_ok(&ctx, "yah-marketing").await;
@@ -7285,7 +7913,7 @@ mod tests {
 
             let first = Arc::new(
                 ServerCtx::new().with_bundle_backend(
-                    BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                    BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                         .with_bind_port(0),
                 ),
             );
@@ -7299,7 +7927,10 @@ mod tests {
                 &first,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
             await_deploy_ok(&first, "yah-marketing").await;
             let record = state.path().join("deploys/yah-marketing.json");
             assert!(record.is_file(), "admission must leave a record at {}", record.display());
@@ -7329,7 +7960,7 @@ mod tests {
             // The restarted daemon.
             let second = Arc::new(
                 ServerCtx::new().with_bundle_backend(
-                    BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+                    BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                         .with_bind_port(0),
                 ),
             );
@@ -7366,6 +7997,7 @@ mod tests {
                     Arc::clone(&store),
                     cache.path(),
                     state.path(),
+                    kamaji::observe::Collector::disabled(),
                 )),
             );
             assert_eq!(third.resume_bundle_workloads().await, 0);
@@ -7383,6 +8015,7 @@ mod tests {
                 Arc::clone(&store),
                 cache.path(),
                 state.path(),
+                kamaji::observe::Collector::disabled(),
             )));
             assert_eq!(ctx.resume_bundle_workloads().await, 0);
         }
@@ -7421,7 +8054,7 @@ mod tests {
             std::fs::write(&stale, b"stale").unwrap();
             std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let record = BundleDeployRecord {
                 id: "yah-marketing".to_string(),
                 bundle: MesofactServeBundle {
@@ -7478,6 +8111,7 @@ mod tests {
                 feed_interval_secs: 300,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
 
             let spec = bundle_workload_spec_revalidate(
@@ -7631,6 +8265,7 @@ mod tests {
                 feed_interval_secs: 300,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
 
             let spec = bundle_workload_spec_feed_tier(
@@ -7662,6 +8297,7 @@ mod tests {
                 feed_interval_secs: 300,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
 
             let spec = bundle_workload_spec_revalidate(
@@ -7694,6 +8330,7 @@ mod tests {
                 feed_interval_secs: 300,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
 
             let spec = bundle_workload_spec_revalidate(
@@ -7741,6 +8378,7 @@ mod tests {
                 feed_interval_secs: 60,
                 feed_project_prefix: Some("app/yah/web/marketing".into()),
                 feed_runtime: None,
+                secrets: vec![],
             };
 
             let spec = bundle_workload_spec_feed_tier(
@@ -7833,6 +8471,7 @@ mod tests {
                 feed_interval_secs: 300,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
 
             let receiver_spec = bundle_workload_spec_revalidate(
@@ -7883,7 +8522,7 @@ mod tests {
             let digest = publish_self_bundle(store.as_ref(), true);
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -7901,6 +8540,7 @@ mod tests {
                 feed_interval_secs: 60,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
             let spec = match serve_bundle_workload(&digest, BundleLifecycle::KeepAlive) {
                 Workload::MesofactStatic(mut w) => {
@@ -7924,7 +8564,7 @@ mod tests {
             // has been materialized, so it can no longer fail the Deploy —
             // it fails the deploy's *poll*, with the same message.
             assert!(
-                matches!(reply, KamajiToYubaba::Ack { .. }),
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
                 "expected admission Ack, got {reply:?}"
             );
             let (state, detail) = await_deploy(&ctx, "yah-marketing").await;
@@ -7947,7 +8587,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -7963,6 +8603,7 @@ mod tests {
                 feed_interval_secs: 60,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
             let spec = match serve_bundle_workload(&digest, BundleLifecycle::KeepAlive) {
                 Workload::MesofactStatic(mut w) => {
@@ -7983,7 +8624,7 @@ mod tests {
             )
             .await;
             assert!(
-                matches!(reply, KamajiToYubaba::Ack { .. }),
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
                 "deploy should Ack, got {reply:?}"
             );
             await_deploy_ok(&ctx, "yah-marketing").await;
@@ -8027,7 +8668,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -8043,6 +8684,7 @@ mod tests {
                 feed_interval_secs: 60,
                 feed_project_prefix: None,
                 feed_runtime: Some(FEED_RUNTIME.to_string()),
+                secrets: vec![],
             };
             let spec = match serve_bundle_workload_with_runtime(
                 &digest,
@@ -8067,7 +8709,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
             await_deploy_ok(&ctx, "yah-marketing").await;
 
             // All three tiers forked, from a bundle that carries no binary.
@@ -8134,7 +8779,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -8150,6 +8795,7 @@ mod tests {
                 feed_interval_secs: 60,
                 feed_project_prefix: None,
                 feed_runtime: Some("almanac-feed/9.9.9".to_string()),
+                secrets: vec![],
             };
             let spec = match serve_bundle_workload_with_runtime(
                 &digest,
@@ -8174,7 +8820,10 @@ mod tests {
                 &ctx,
             )
             .await;
-            assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "got {reply:?}");
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "got {reply:?}"
+            );
             let (state, detail) = await_deploy(&ctx, "yah-marketing").await;
             assert_eq!(state, WorkloadState::Failed);
             let message = detail.expect("a failed deploy must carry its reason");
@@ -8211,7 +8860,7 @@ mod tests {
             let state = tempfile::tempdir().unwrap();
             // Ephemeral bind port ⇒ the receiver's port (bind_port==0) is also
             // ephemeral, so neither child contends on a fixed port.
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -8226,6 +8875,7 @@ mod tests {
                 feed_interval_secs: 300,
                 feed_project_prefix: None,
                 feed_runtime: None,
+                secrets: vec![],
             };
             let spec = match serve_bundle_workload(&digest, BundleLifecycle::KeepAlive) {
                 Workload::MesofactStatic(mut w) => {
@@ -8246,11 +8896,10 @@ mod tests {
             )
             .await;
             match reply {
-                KamajiToYubaba::Ack { request_id, kind } => {
+                KamajiToYubaba::DeployAck { request_id, .. } => {
                     assert_eq!(request_id, RequestId(131));
-                    assert_eq!(kind, kamaji_proto::AckKind::Deploy);
                 }
-                other => panic!("expected Ack, got {other:?}"),
+                other => panic!("expected DeployAck, got {other:?}"),
             }
             await_deploy_ok(&ctx, "yah-marketing").await;
 
@@ -8301,7 +8950,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -8321,11 +8970,10 @@ mod tests {
             )
             .await;
             match reply {
-                KamajiToYubaba::Ack { request_id, kind } => {
+                KamajiToYubaba::DeployAck { request_id, .. } => {
                     assert_eq!(request_id, RequestId(111));
-                    assert_eq!(kind, kamaji_proto::AckKind::Deploy);
                 }
-                other => panic!("expected Ack (bound+armed), got {other:?}"),
+                other => panic!("expected DeployAck (bound+armed), got {other:?}"),
             }
             await_deploy_ok(&ctx, "yah-marketing").await;
 
@@ -8371,7 +9019,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             let reply = handle_message(
@@ -8385,10 +9033,10 @@ mod tests {
             )
             .await;
             match reply {
-                KamajiToYubaba::Ack { request_id, .. } => {
+                KamajiToYubaba::DeployAck { request_id, .. } => {
                     assert_eq!(request_id, RequestId(121));
                 }
-                other => panic!("expected admission Ack, got {other:?}"),
+                other => panic!("expected admission DeployAck, got {other:?}"),
             }
             // R330-F33: resolving the serve binary needs the materialized tree,
             // so this is now a failed deploy rather than a refused one. The
@@ -8421,7 +9069,6 @@ mod tests {
                 wg_private_key: String::new(),
                 wg_listen_port: 0,
                 peers: vec![],
-                netns_name: None,
             };
             assert_eq!(
                 native_bind_ip(Some(&assigned)),
@@ -8467,7 +9114,7 @@ mod tests {
                 br#"{"version":2,"ports":{"yah-marketing":{"http":{"port":8443}}}}"#,
             )
             .unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path())
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled())
                 .with_bind_port(0);
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
@@ -8481,14 +9128,13 @@ mod tests {
                         wg_private_key: String::new(),
                         wg_listen_port: 0,
                         peers: vec![],
-                        netns_name: None,
                     }),
                 },
                 &ctx,
             )
             .await;
             assert!(
-                matches!(reply, KamajiToYubaba::Ack { .. }),
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
                 "expected Ack, got {reply:?}"
             );
             await_deploy_ok(&ctx, "yah-marketing").await;
@@ -8536,7 +9182,7 @@ mod tests {
 
             let cache = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path());
+            let backend = BundleBackend::new(Arc::clone(&store), cache.path(), state.path(), kamaji::observe::Collector::disabled());
             let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
 
             // R844-F14: neither bundle names a number — that IS the co-tenancy
@@ -8557,7 +9203,7 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    matches!(reply, KamajiToYubaba::Ack { .. }),
+                    matches!(reply, KamajiToYubaba::DeployAck { .. }),
                     "deploying {name} failed: {reply:?}"
                 );
                 await_deploy_ok(&ctx, name).await;
@@ -8650,12 +9296,33 @@ mod tests {
         /// ephemeral port out twice in the microseconds between drop and
         /// re-bind, and every alternative (a fixed port) is *reliably* flaky on
         /// a machine running a dozen concurrent test binaries.
+        /// An ephemeral port no other test in this binary has been handed.
+        ///
+        /// `bind(:0)` and drop is the only way to ask the kernel for a free
+        /// port, and the port returns to the reuse pool the instant the
+        /// listener drops — so two of this module's five concurrent callers
+        /// can be handed the same one, and the second test's workload then
+        /// binds the port the first is asserting about. Measured 2026-09-15
+        /// (R895-T5): this module failed 3 full `-p kamaji-bin --lib` runs in 4
+        /// and passed every time its test ran alone, which is the signature of
+        /// a collision between tests rather than a bug in either.
+        ///
+        /// Cross-process collisions are still possible and not worth guarding:
+        /// nothing here can reserve a port it does not hold.
         fn free_port() -> u16 {
-            std::net::TcpListener::bind("127.0.0.1:0")
-                .expect("bind an ephemeral port")
-                .local_addr()
-                .expect("read it back")
-                .port()
+            static ISSUED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+                std::sync::Mutex::new(std::collections::BTreeSet::new());
+            for _ in 0..64 {
+                let port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .expect("bind an ephemeral port")
+                    .local_addr()
+                    .expect("read it back")
+                    .port();
+                if ISSUED.lock().expect("issued ports").insert(port) {
+                    return port;
+                }
+            }
+            panic!("the kernel handed back only already-issued ephemeral ports 64 times");
         }
 
         fn deploy_msg(listen: &str) -> YubabaToKamaji {
@@ -8690,10 +9357,7 @@ mod tests {
             assert!(
                 matches!(
                     reply,
-                    KamajiToYubaba::Ack {
-                        kind: AckKind::Deploy,
-                        ..
-                    }
+                    KamajiToYubaba::DeployAck { .. }
                 ),
                 "expected a Deploy Ack, got {reply:?}"
             );
@@ -8731,8 +9395,25 @@ mod tests {
                 matches!(stopped, KamajiToYubaba::Ack { .. }),
                 "expected a Stop Ack, got {stopped:?}"
             );
+            // Bounded retry rather than one shot. The Ack is sent once teardown
+            // is *ordered*; the custodian's fd is closed as its owning task
+            // unwinds, which is a scheduler tick or two later, so a single bind
+            // straight after the Ack is racing a release that has not happened
+            // yet. Measured 2026-09-15 under R895-T5: one shot failed 3 full
+            // `-p kamaji-bin --lib` runs in 4 on a busy machine and passed
+            // every time the test ran alone, which is what made it look like a
+            // port collision. A retry keeps the assertion honest — a release
+            // that never comes still fails, half a second later.
+            let mut released = false;
+            for _ in 0..50 {
+                if std::net::TcpListener::bind(&listen).is_ok() {
+                    released = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             assert!(
-                std::net::TcpListener::bind(&listen).is_ok(),
+                released,
                 "Stop must release the held socket, or the port leaks for the node's lifetime"
             );
         }
@@ -8797,7 +9478,7 @@ mod tests {
 
             assert!(matches!(
                 handle_message(deploy_msg(&listen), &ctx).await,
-                KamajiToYubaba::Ack { .. }
+                KamajiToYubaba::DeployAck { .. }
             ));
 
             let entry = list_one(&ctx, "passway.shop.tenant.io").await;
@@ -8813,7 +9494,7 @@ mod tests {
             let moved = format!("127.0.0.1:{}", free_port());
             assert!(matches!(
                 handle_message(deploy_msg(&moved), &ctx).await,
-                KamajiToYubaba::Ack { .. }
+                KamajiToYubaba::DeployAck { .. }
             ));
             let after = list_one(&ctx, "passway.shop.tenant.io").await;
             assert_ne!(after.spec_digest, entry.spec_digest);
@@ -8850,7 +9531,7 @@ mod tests {
             let listen = format!("127.0.0.1:{}", free_port());
             assert!(matches!(
                 handle_message(deploy_msg(&listen), &ctx).await,
-                KamajiToYubaba::Ack { .. }
+                KamajiToYubaba::DeployAck { .. }
             ));
             assert!(list_one(&ctx, "passway.shop.tenant.io").await.spec_digest.is_some());
 

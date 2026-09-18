@@ -122,7 +122,16 @@ fn custodian_holds_a_netns_scoped_listener() {
         .expect("custodian binds+holds a netns-scoped listener");
     assert!(cust.holds("ingress"));
     assert_eq!(cust.held_binds("ingress").unwrap(), vec!["0.0.0.0:0"]);
+    // R895-F1: the custodian is what keeps this namespace alive, so it is what a
+    // later generation of the same workload asks which namespace to join —
+    // rather than re-deriving a name for a namespace it did not create.
+    assert_eq!(
+        cust.held_netns("ingress").as_deref(),
+        Some(Path::new(&netns.path)),
+        "the custodian must report the namespace it bound in"
+    );
 
     cust.release("ingress");
     assert!(!cust.holds("ingress"));
+    assert_eq!(cust.held_netns("ingress"), None);
 }

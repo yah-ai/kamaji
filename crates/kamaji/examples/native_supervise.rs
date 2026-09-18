@@ -20,7 +20,7 @@ use kamaji::native::NativeRuntime;
 use kamaji::{Kamaji, MeshAssignment, WorkloadStatus};
 use workload_spec::{
     EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId,
-    ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+    ResourceLimits, RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
 };
 
 fn usage() -> ! {
@@ -71,7 +71,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let spec = WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: name.clone(),
         tenant: TenantId::singleton(),
         namespace: NamespaceId::singleton(),
@@ -93,7 +92,10 @@ async fn main() -> anyhow::Result<()> {
         resources: ResourceLimits {
             memory_mb: 512,
             cpu_millis: 512,
-            ephemeral_storage_mb: 512,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -114,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
             operator: None,
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
         files: Vec::new(),
     };

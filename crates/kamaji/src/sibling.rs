@@ -286,6 +286,35 @@ impl KamajiClient {
         }
     }
 
+    /// `YubabaToKamaji::Describe` — the `Workload` Kamaji last accepted for
+    /// `id` (R870-B24).
+    ///
+    /// `Ok(None)` is "Kamaji has no record": never admitted here, or admitted
+    /// before a Kamaji restart. **A caller must not read that as "nothing to
+    /// preserve"** — this exists so a destructive redeploy can check what it
+    /// is about to overwrite, and "I don't know" is not "it's empty". An `Err`
+    /// carries the same weight for the same reason (an older Kamaji fails the
+    /// frame outright, exactly as it does for [`Self::capabilities`]).
+    pub async fn describe(
+        &self,
+        id: &WorkloadId,
+    ) -> Result<Option<workload_spec::Workload>, ClientError> {
+        let request_id = self.next_request_id();
+        let reply = self
+            .request(
+                YubabaToKamaji::Describe {
+                    request_id,
+                    id: id.clone(),
+                },
+                request_id,
+            )
+            .await?;
+        match reply {
+            KamajiToYubaba::WorkloadDescription { spec, .. } => Ok(spec),
+            other => Err(ClientError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
     /// `YubabaToKamaji::Capabilities` — what this Kamaji can dispatch to
     /// (R858-T4).
     ///
@@ -327,12 +356,18 @@ impl KamajiClient {
     /// should send `None` instead.
     ///
     /// [`Kamaji::deploy_workload`]: crate::Kamaji::deploy_workload
+    /// Returns the hydrate-on-place measurement kamaji ran in front of this
+    /// deploy (R850-T4) — `turso-backup-hydrate`'s own JSON line, verbatim —
+    /// or `None`, which is every deploy of a workload that declares no
+    /// durability tier and every restart of one whose volume was already
+    /// populated. Attribution ({workload, node}) is the caller's: this client
+    /// knows the [`WorkloadId`] and nothing about which machine it is dialing.
     pub async fn deploy_envelope(
         &self,
         id: &WorkloadId,
         workload: &workload_spec::Workload,
         mesh: Option<&crate::MeshAssignment>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Option<String>, ClientError> {
         let request_id = self.next_request_id();
         let reply = self
             .request(
@@ -346,10 +381,7 @@ impl KamajiClient {
             )
             .await?;
         match reply {
-            KamajiToYubaba::Ack {
-                kind: kamaji_proto::AckKind::Deploy,
-                ..
-            } => Ok(()),
+            KamajiToYubaba::DeployAck { hydrate, .. } => Ok(hydrate),
             other => Err(ClientError::Unexpected(format!("{other:?}"))),
         }
     }
@@ -619,11 +651,23 @@ fn proto_state_to_status(s: ProtoWorkloadState) -> crate::WorkloadStatus {
         ProtoWorkloadState::Exited => crate::WorkloadStatus::Stopped,
         ProtoWorkloadState::Failed => crate::WorkloadStatus::Failed {
             reason: "workload exited with failure".into(),
+            oom_killed: false,
+        },
+        // R885-T6: the return leg of the OOM distinction. The sibling told us
+        // *why* it died, so the bit survives the round trip instead of being
+        // flattened back into a plain failure one hop after it crossed.
+        ProtoWorkloadState::OomKilled => crate::WorkloadStatus::Failed {
+            reason: "workload was OOM-killed — it exceeded its memory.max, \
+                     not an ordinary crash (R885-F3)"
+                .into(),
+            oom_killed: true,
         },
         // `#[non_exhaustive]` — map unknown future variants to Failed so
-        // callers never silently treat an unknown state as healthy.
+        // callers never silently treat an unknown state as healthy. `false` is
+        // the honest bit here: an unrecognised state is not evidence of an OOM.
         _ => crate::WorkloadStatus::Failed {
             reason: "unknown proto WorkloadState variant".into(),
+            oom_killed: false,
         },
     }
 }
@@ -649,7 +693,6 @@ pub(crate) fn mesh_to_proto(mesh: &crate::MeshAssignment) -> kamaji_proto::MeshA
                 allowed_ips: p.allowed_ips.clone(),
             })
             .collect(),
-        netns_name: mesh.netns_name.clone(),
     }
 }
 
@@ -729,13 +772,17 @@ impl crate::Kamaji for KamajiClient {
     ) -> anyhow::Result<crate::DeployResult> {
         let id = WorkloadId::new(&spec.name);
         let workload_envelope = workload_spec::Workload::container(spec.clone());
-        self.deploy_envelope(&id, &workload_envelope, wire_mesh(mesh))
+        let hydrate = self
+            .deploy_envelope(&id, &workload_envelope, wire_mesh(mesh))
             .await
             .map_err(|e| anyhow::anyhow!("kamaji deploy_workload: {e}"))?;
         Ok(crate::DeployResult {
             container_id: id.0,
             mesh_ip: mesh.mesh_ip,
             task_pid: 0,
+            // R850-T4: the one impl that can carry a measurement — it came off
+            // the wire on the deploy reply. Every inlined backend reports None.
+            hydrate,
             // R844-F2: empty on purpose, and this is the load-bearing reason
             // the return path rides `list` rather than the deploy reply. A
             // sibling `Deploy` acks on *admission* (ProtocolVersion::V3) —
@@ -819,6 +866,7 @@ impl crate::Kamaji for KamajiClient {
                     container_id: id.0,
                     mesh_ip: mesh.mesh_ip,
                     task_pid: 0,
+                    hydrate: None,
                     // Same as `deploy_workload`: the ack carries no resolved
                     // port, and a graceful upgrade keeps the listener anyway.
                     ports: Default::default(),
@@ -912,6 +960,29 @@ impl KamajiSibling {
         let socket: Arc<Path> = socket.into().into();
         let (tx, rx) = tokio::sync::watch::channel(Some(Arc::new(client)));
         tokio::spawn(reconnect_watchdog(tx, socket.to_path_buf(), connect_timeout));
+        Self { socket, rx }
+    }
+
+    /// A sibling that is **configured but not currently reachable** — what a
+    /// fleet node holds while `kamaji.service` is down, wedged, or misframing
+    /// across a protocol-version skew (R881-B8).
+    ///
+    /// Test-only, and it exists because that state is otherwise unreachable
+    /// from inside one process: `kamaji_bin::serve_with_shutdown` spawns each
+    /// connection handler detached, so stopping its accept loop leaves an
+    /// established client connected and [`KamajiClient::is_dead`] false. A test
+    /// that "kills the sibling" by dropping the server therefore never reaches
+    /// the substituted state at all.
+    ///
+    /// No watchdog is spawned, so it stays disconnected for the life of the
+    /// test rather than racing a redial against the assertions.
+    #[cfg(feature = "testing")]
+    pub fn disconnected(socket: impl Into<PathBuf>) -> Self {
+        let socket: Arc<Path> = socket.into().into();
+        // The sender is dropped immediately; `watch::Receiver::borrow` keeps
+        // answering with the last published value, which is the `None` seeded
+        // here.
+        let (_tx, rx) = tokio::sync::watch::channel(None);
         Self { socket, rx }
     }
 

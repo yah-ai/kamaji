@@ -31,7 +31,6 @@ containerd-integration = [
     "dep:kamaji-containerd-core",
     "kamaji-containerd-core/containerd-integration",
     # Fleet cert-rotation zero-downtime (R600-F9): kamaji is the socket custodian.
-    "dep:kamaji",
     "kamaji/socket-custody",
 ]
 
@@ -42,7 +41,7 @@ containerd-integration = [
 # containerd. Shells out to `docker`, so it pulls in no extra Rust deps.
 # The two can be compiled together (containerd wins when both are configured);
 # when neither is, a Container deploy reports a build-aware BackendRefused.
-docker-integration = ["dep:kamaji", "kamaji/docker-integration"]
+docker-integration = ["kamaji/docker-integration"]
 
 # R599-F10: keep-alive native bundle backend. Wires the kamaji crate's native
 # (fork+exec) supervisor + the node bundle store into the UDS ServerCtx so a
@@ -61,7 +60,7 @@ docker-integration = ["dep:kamaji", "kamaji/docker-integration"]
 # Off by default (a Linux fleet node has no use for it); when off, a
 # native-marked deploy reports a build-aware BackendRefused rather than falling
 # back to a container, which would run the job against the wrong OS.
-native-exec = ["dep:kamaji", "kamaji/native-integration"]
+native-exec = ["kamaji/native-integration"]
 
 # R605-F8 / W325 §5: Firecracker microVM backend. Serves `Workload::Container`
 # specs carrying `yah.exec = microvm` — the third value on the same substrate
@@ -74,10 +73,9 @@ native-exec = ["dep:kamaji", "kamaji/native-integration"]
 # opts in by having those and passing --microvm-dir. When off, a microVM-marked
 # deploy reports a build-aware BackendRefused and does NOT fall back to a
 # container — falling back would hand the caller the one thing it declined.
-microvm = ["dep:kamaji", "kamaji/microvm-integration"]
+microvm = ["kamaji/microvm-integration"]
 
 bundle-serving = [
-    "dep:kamaji",
     "kamaji/native-integration",
     "dep:yah-object-store",
     "dep:yah-mesofact-bundle",
@@ -95,21 +93,21 @@ bundle-serving = [
 # domains needs no bundle store, and a bundle-serving node need not be a public
 # front door. When off, a tenant-passway deploy reports a build-aware
 # BackendRefused rather than being silently ignored.
-tenant-passway = ["dep:kamaji", "kamaji/native-integration"]
+tenant-passway = ["kamaji/native-integration"]
 
 [dependencies]
-kamaji-proto = { path = "../kamaji-proto", version = "0.8.37" }
+kamaji-proto = { path = "../kamaji-proto", version = "0.8.40" }
 # R555-F4 (W235 §(c)): `admission-verify` brings in the Ed25519 half of
 # `workload_spec::admission`. Not optional — deciding what is allowed to run
 # is kamaji's job description, and a build that could silently omit the
 # admission gate is a build an operator cannot tell apart from one that has it.
-workload-spec = { package = "yah-workload-spec", version = "0.8.37", features = ["admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.40", features = ["admission-verify"] }
 # R715-F3 / W315 — the process-control channel. `client` is the consumer half
 # the probe runner dials; `kamaji` gives it the ProcState -> WorkloadState
 # conversion as an exhaustive match, which is what keeps "believed verbatim"
 # true. Pure std + serde + tokio (already linked), so no RSS cost worth
 # weighing against W154's memory budget.
-kamaji-procctl = { path = "../procctl", version = "0.8.37", features = ["client", "kamaji"] }
+kamaji-procctl = { path = "../procctl", version = "0.8.40", features = ["client", "kamaji"] }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -134,27 +132,39 @@ containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.37", default-features = false }
-# Socket-custodian primitive (R599-F9 / R600-F9) — kamaji holds the passway
-# listen fd and hands it to each generation so a cert reload drops no
-# connections. Only the `socket-custody` feature of kamaji is pulled in (just
-# `nix`); gated behind containerd-integration since only the fleet backend uses it.
-kamaji = { path = "../kamaji", optional = true, default-features = false, version = "0.8.37" }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.40", default-features = false }
+# The kamaji library crate. NOT optional as of R885-B1: the cgroup v2 driver
+# moved into it (`kamaji::cgroup`) so the live `kamaji::native::NativeRuntime`
+# could reach it, and this crate re-exports it unconditionally. With
+# default-features off that costs nothing a kamaji-bin build did not already
+# link — the backend-bearing features below each turn on the one they need
+# (socket-custody for the passway fd handoff, native-integration for fork+exec,
+# and so on).
+kamaji = { path = "../kamaji", default-features = false, version = "0.8.40" }
 
 # R599-F10 node bundle backend (only linked with the `bundle-serving` feature).
 # yah-object-store is the R2/in-memory blob store; yah-mesofact-bundle (store
 # feature) materializes a W272 bundle from it into the node cache. Both live in
 # oss/yah-base, redirected to path by the root [patch.crates-io] block.
-yah-object-store = { version = "0.8.37", optional = true }
-yah-mesofact-bundle = { version = "0.8.37", optional = true }
+yah-object-store = { version = "0.8.40", optional = true }
+yah-mesofact-bundle = { version = "0.8.40", optional = true }
 
 # Linux-only syscall surface used by the native driver (R406-T5).
-# All three are permissive (MIT / Apache-2.0). The `landlock` crate is a thin
-# wrapper over the kernel API; `caps` is the standard cap-juggling crate.
+# All permissive (MIT / Apache-2.0). The `landlock` crate is a thin wrapper over
+# the kernel API.
+#
+# R885-B9 dropped `caps = "0.5"`: the capability drop now lives on the live fork
+# paths as `kamaji::sandbox::drop_caps_at_exec`, which speaks `prctl`/`capset`
+# directly because it runs post-fork in a child of a multi-threaded process and
+# `caps`'s set-at-a-time API allocates.
+#
+# R885-B11 dropped `landlock = "0.4"` for the same two reasons, one ticket
+# later: the filesystem confinement now lives on the live fork paths as
+# `kamaji::sandbox::confine_fs_at_exec`, and the crate's builder API allocates
+# while the only work that must happen post-fork is a `prctl` plus a
+# `landlock_restrict_self` on an fd the parent already opened.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["fs", "process", "user", "signal"] }
-landlock = "0.4"
-caps = "0.5"
 libc = "0.2"
 
 [dev-dependencies]

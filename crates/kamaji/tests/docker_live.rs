@@ -54,7 +54,10 @@ fn sleeper_spec(id: &str) -> WorkloadSpec {
     spec.resources = ResourceLimits {
         memory_mb: 64,
         cpu_millis: 250,
-        ephemeral_storage_mb: 64,
+        memory_request_mb: None,
+        cpu_limit_millis: None,
+        pids_max: None,
+        scratch_floor_mb: None,
     };
     spec
 }
@@ -168,7 +171,7 @@ async fn exited_container_reports_failed_with_no_pid() {
 
     let got = rt.get_workload(&ident).await.unwrap().expect("inspectable");
     match &got.status {
-        WorkloadStatus::Failed { reason } => {
+        WorkloadStatus::Failed { reason, .. } => {
             assert!(reason.contains('3'), "expected exit code 3 in {reason:?}");
         }
         other => panic!("expected Failed, got {other:?}"),

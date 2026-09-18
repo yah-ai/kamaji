@@ -13,6 +13,41 @@
 //! @yah:gotcha("Tier: Warrior — clear root cause + two concrete fix options, but touches the yubaba↔kamaji wire boundary (postcard DTO) with real blast-radius; needs careful implementation, not a rote edit.")
 //! @yah:gotcha("Surfaced by the R590-F2 live dogfood: deploying a real WorkloadSpec to us-west-002's yubaba returns HTTP 500 'kamaji deploy_workload: kamaji error: Internal: decode failed: postcard error: This is a feature that PostCard will never implement'. R406-T9's original 'smoke' only did curl GET /workloads (empty list) — a real deploy carrying an ImageRef through the postcard UDS was NEVER exercised, so this has been latent since kamaji's Deploy arm landed.")
 //! @yah:handoff("DONE (Option 3, operator-chosen), verify-clean. The ticket's root cause was INCOMPLETE: it was not just ImageRef's untagged Deserialize. The whole workload_spec::Workload graph was postcard-decode-incompatible via TWO mechanisms, and a regression test (Workload::Container through postcard) surfaced both:\n(1) INTERNAL serde tagging on Workload + 11 nested enums (EnvValue/SecretRef/SecretTarget/VolumeSource/HealthProbe/RestartPolicy/PublicTls/BuildMode/AlmanacTarget/NotReadyPolicy/Cadence) -> #[serde(tag=...)] forces deserialize_any -> postcard WontImplement.\n(2) ~29 skip_serializing_if attrs -> postcard is positional, so an omitted None/empty field shifts every later field and decode dies with DeserializeBadOption. This one only bites when optionals are None; a full-spec test hid it, a for_forge (real forge deploy) spec exposes it.\nImageRef's untagged Deserialize was a third instance.\n\nFIX (postcard-native end-to-end): flipped all 12 enums to external tagging; stripped all 29 skip_serializing_if (kept #[serde(default)] so hand-authoring can still omit fields; only machine-emitted JSON gains explicit null/[]); ImageRef Deserialize now branches on is_human_readable (string-form in TOML/JSON, plain struct in postcard). Regenerated TS (oss/packages/yah/workload-spec/index.ts) and JSON schema (.yah/schema/workload.toml.schema.json). Migrated every fixture: workload-spec crate (self) + oss/yubaba/cloud (16 reconciler tests, via a Sonnet subagent).\n\nVERIFY (all green): workload-spec full suite (incl. new round_trip postcard tests: full spec + all-None minimal spec + Workload::Container); kamaji-proto codec::deploy_container_round_trip (the exact wire path, was DeserializeBadOption); kamaji full workspace; yubaba --lib (cloud 486 pass); yah-base; schema_drift gate (2 pass). The live_deploy_smoke acceptance still needs the mesh + a FLEET REDEPLOY (old binary on us-west-002) -- the wire decode is proven here; the on-box green is the redeploy step (ties to the warden->yubaba on-box redeploy gap).\n\nNOT-MINE pre-existing blockers found while verifying (each unrelated to this change): oss/qed test build fails on .unwrap() over impl Future (missing .await) in scryer/task_runs; oss/yubaba ServiceComponent missing field 'git' blocks whisper_derive_e2e + mesofact_static_e2e from compiling (whisper's static-asset tagging was migrated but is unverifiable until that lands); root yah lib missing warden_client module file (warden->yubaba rename in flight). None block R590-B3.\n\nCascades: R592-T4 and R592-T5 (depends_on R590-B3) are now unblocked.")
+//!
+//! @yah:ticket(R896-S1, "Design the evolvable payload: versioned tagged spec section vs reserved extension record")
+//! @yah:status(review)
+//! @yah:at(2026-09-13T19:51:24Z)
+//! @yah:kind(spike)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R896)
+//! @yah:next("Tier: Wizard — a wire-format decision the whole fleet rolls on. Time-boxed investigation, outcome is a decision table (diligence shape) not code. Candidates: (a) keep postcard framing, move the WorkloadSpec payload to a self-describing/tagged encoding inside the frame; (b) postcard with an explicit schema_version plus one reserved trailing extension record that old decoders skip; (c) protocol-negotiated dual-decode during rolls only. Evaluate each against: can a single-node hotship cross a field ADDITION; a field DELETION; what R590-B3 (untagged-enum postcard failure) implies about option (a); decode cost on the hot deploy path; and the migration story for moving yah.limits.* / yah.durability.* back into typed fields once the envelope permits it (that migration is this relay's second child, filed after the spike settles the shape). ProtocolVersion already exists (kamaji-proto/src/version.rs) — establish what it currently gates and whether it is the natural carrier before inventing a new one.")
+//! @yah:handoff("SETTLED — operator chose (a), the self-describing payload. Decision doc: .yah/docs/working/W349-evolvable-kamaji-wire-envelope.md. Measurement harness checked in at oss/kamaji/crates/kamaji-proto/tests/envelope_spike.rs (3 tests, green) so the evidence cannot rot. HEADLINE: classified all 11 ProtocolVersion bumps — 7 of the last 10 (V2,V4,V5,V6,V8,V9,V11a) are byte-layout accidents a name-keyed codec absorbs; only V3 and V10 are genuine semantic breaks where a handshake refusal is correct; V7 (a retype) downgrades from silent misread to a clean typed error. TWO FINDINGS THE TICKET'S FRAMING MISSED: (1) only 3 of 10 bumps touch WorkloadSpec — FOUR touch kamaji-proto's own message structs (WorkloadEntry x3, NodeCapabilities), so a fix scoped to 'the spec payload' addresses a minority of the pain and the envelope must cover the message structs too; (2) the wire bump is only HALF the cost of a field — the other half is Rust-side, WorkloadSpec has no Default and R860's verify records 35 exhaustive call sites across SIX cargo workspaces (root --workspace cannot see app/yah/desktop or the oss/* workspaces). A wire envelope does nothing for that half. Operator was offered it as option B and chose A only, so it is NOT filed.")
+//! @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-proto --test envelope_spike -- --nocapture: 3 passed, 0 failed. MEASURED, not argued: old_decoder_vs_a_new_field shows postcard returning a value that was never sent (old decoder read the NEW field's payload as the field it already knew: tail=[\"/etc/app.toml\"] instead of [\"sentinel\"]), while the named codec preserves both directions. Size/cost on a real Deploy(Workload::Container) from WorkloadSpec::for_forge: postcard 209 B / json 809 B (3.9x, 0.08% of MAX_FRAME_BYTES); decode 4022 ns vs 18464 ns per msg — DEBUG BUILD ON A LOADED MACHINE (camp.machine quiet:false, load 30.6/15 cpus, 9 rustc/cargo procs, foreign camp live), so treat the ratio as indicative and the absolutes as contaminated; the byte sizes are exact and load-independent. which_top_level_deletions_a_named_codec_can_cross enumerates the real WorkloadSpec: 25 top-level fields, 16 deletion-crossable (carry a serde default), 9 not (expose, image, name, replicas, resources, restart_policy, schema_version, stop_policy, tier).")
+//! @yah:gotcha("THE HANDSHAKE DOC LIES AND THE CODE IS RIGHT: kamaji-proto/src/lib.rs:13-15 says peers exchange Hello/Welcome so 'the receiver picks the highest version it supports that the sender also offers'. It does not — server.rs:1409 refuses any version != ProtocolVersion::CURRENT, exact equality, no negotiation. Every operational note in the tree (hotship.sh, R876's service_records.rs:351) describes the exact-equality behaviour, so the code is the truth and the crate doc is the stale one. Anyone reasoning about roll safety from that doc comment will get it wrong.")
+//! @yah:assumes("The rmp-serde/MessagePack row in W349's codec comparison is UNMEASURED — no msgpack crate is in this workspace's lock, so the 'roughly half the bytes' claim is from the format, not from a run here. JSON was recommended over it on zero-new-dependency plus the is_human_readable() convergence (ImageRef string-form and SchemaVersion bare-integer branches light up, making the UDS bytes the same shape as the control plane's JSON), not on a size comparison.")
+//!
+//! @yah:ticket(R896-F2, "Land the named-payload wire envelope: Tolerant codec, ProtocolVersion V13, digest domain v2")
+//! @yah:status(review)
+//! @yah:at(2026-09-14T21:02:28Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R896)
+//! @yah:next("THE DEFAULTS POLICY, AND THE TENSION W349 UNDERWEIGHTS: a tolerated field must have a default equal to the PRE-FIELD behaviour, or tolerance converts a wire break into a silent semantic skew. But #[serde(default)] on a wire-carried type also loosens the TOML/JSON AUTHORING parse of the same type — defaulting image/name/tier would make a malformed workload.toml parse silently, which is the loudness R658-B1 deliberately bought. Resolve by putting defaults only on fields whose absence is genuinely meaningful and moving required-field enforcement into validate.rs; do NOT blanket-default the 9 fields S1 listed as non-crossable.")
+//! @yah:verify("Extend oss/kamaji/crates/kamaji-proto/tests/envelope_spike.rs from local stand-in structs to the REAL types: a Deploy frame encoded with an extra field must decode on a peer that lacks it, with every later field intact. Then the six-workspace sweep R860 names (root --workspace has a blind spot the size of app/yah/desktop and each oss/*): cargo check for root, oss/kamaji, oss/yubaba, oss/yah-base, app/yah/desktop.")
+//! @yah:gotcha("SHIPPING THIS IS A PAIRED FLEET SHIP. ProtocolVersion V12 means hotship.sh refuses a lone --binaries yubaba or --binaries kamaji, correctly. Plus one 'redeploy everything once' per node from the digest domain bump. The fleet is already skewed three ways as of 2026-09-11 (tree V11, release v0.8.37 V9, us-east-001 a matched V10 pair) — see R876's gotchas at oss/yubaba/crates/yubaba/src/service_records.rs:351.")
+//! @arch:see(.yah/docs/working/W349-evolvable-kamaji-wire-envelope.md)
+//! @yah:handoff("MECHANISM LANDED AND PROVEN ON REAL TYPES. New oss/kamaji/crates/kamaji-proto/src/tolerant.rs: a serde `with` module encoding a field as a length-prefixed JSON blob inside the postcard frame, so a decoder matches BY NAME and skips what it does not know. Applied via #[serde(with = \"crate::tolerant\")] to the five accreting payload fields — Deploy.spec, GracefulUpgrade.spec, WorkloadDescription.spec, WorkloadList.entries, CapabilitiesReport.capabilities. ZERO CALL-SITE CHURN: the field types are unchanged, only their encoding, so nothing in kamaji-bin or yubaba needed touching (kamaji + yubaba workspaces both check clean unmodified). serde_json moved from dev-dependency to dependency.")
+//! @yah:verify("cargo test -p kamaji-proto (oss/kamaji): 39 lib + 4 integration passed, 0 failed — including every pre-existing round-trip test unmodified (deploy_container_round_trip, deploy_every_workload_variant_round_trips, workload_list_round_trip). cargo test workload-spec: 310 passed, 0 failed. cargo check oss/kamaji --all-targets --all-features: exit 0. cargo check oss/yubaba --all-targets: exit 0 (advisory skew note on that run: a peer touched oss/yubaba/Cargo.lock mid-build, not my change).")
+//! @yah:handoff("DISCOVERED WORK, wider than the title — three fixes the envelope forced, each with its reason at the code site. (1) MAX_FRAME_BYTES raised 1 MiB -> 4 MiB (kamaji-proto/src/codec.rs). The encoding got 3.9x bigger and the ceiling did not move with it, and WorkloadSpec::files carries inline file CONTENT — so a workload shipping a few hundred kB of config sat under 1 MiB as postcard and would have crossed it as JSON, i.e. a deploy that used to work failing with FrameTooLarge because of an encoding change rather than anything its author did. Checked nothing else depends on the old value: yubaba's push_dispatch::MAX_FRAME_BYTES (16 KB) is an unrelated constant, and every other 1048576 in the tree is a historical log quote in an annotation. (2) deny_unknown_fields removed from TenantPasswayWorkload and TenantPasswayTls (workload-spec/src/lib.rs) — R658-B1's note that it is \"inert for the postcard kamaji wire\" was TRUE while that wire was positional and stops being true here; both types are wire-carried (TenantPassway is a Workload variant) so the attribute would have refused a peer's added field, defeating the envelope on the workload kind yubaba::tenant_passway reconciles most often. BuildConfig keeps its copy — authoring-only, and its loudness is the point. (3) The crate doc in kamaji-proto/src/lib.rs claimed Hello/Welcome negotiate (\"the receiver picks the highest version it supports that the sender also offers\"). It never did — server.rs refuses anything != CURRENT. Corrected in place, because roll-safety reasoning was being done from that sentence.")
+//! @yah:gotcha("ROOT WORKSPACE IS RED, AND IT IS NOT THIS TICKET — attributed, not assumed. `cargo check --workspace --all-targets` exits 101 with exactly two errors, both peer work in flight: (a) crates/yah/cloud-admin/src/lib.rs:1557 missing field `health` in `yah_fleet_metrics::WorkloadEntry` — note that is fleet-metrics' WorkloadEntry, a DIFFERENT type from kamaji-proto's, and this change adds no field to either; (b) crates/yah/agent-tools non-exhaustive match on `YahMcpClass::SandboxedWrite` (R897 territory, @Miravel:spade was running agent-tools tests at the time). Neither touches workload-spec or kamaji-proto, and the build got past both crates' workload-spec dependencies to reach them. My own blast radius is green: oss/kamaji and oss/yubaba both check clean and workload-spec's 310 tests pass.")
+//! @yah:verify("Cross-workspace sweep, the six-command radius R860 names. GREEN: oss/kamaji --all-targets --all-features exit 0; oss/yubaba --all-targets exit 0; workload-spec 310 tests exit 0; kamaji-proto 39 lib + 4 integration exit 0 (re-run after the MAX_FRAME_BYTES change). RED, BOTH PRE-EXISTING PEER WORK: root --workspace exit 101 on two errors in crates I never touched (cloud-admin missing `health` on yah_fleet_metrics::WorkloadEntry — a DIFFERENT type from kamaji-proto's; agent-tools non-exhaustive YahMcpClass::SandboxedWrite); app/yah/desktop exit 101 on R895-T2's LegacyServiceConfig deletion. NOT VERIFIED, and the one thing this ticket still owes: the schema regen, blocked on that same R895-T2 breakage (see notify_on).")
+//! @yah:gotcha("DESKTOP CHECK IS ALSO RED, ALSO NOT MINE, AND IT IS THE SAME CAUSE AS THE BLOCKED SCHEMA REGEN. `cargo check --manifest-path app/yah/desktop/Cargo.toml --no-default-features` exits 101 on E0432 `unresolved import config::LegacyServiceConfig` (oss/yubaba/crates/cloud/src/lib.rs:284) and E0425 (config.rs:1538) — R895-T2's in-flight deletion of the LegacyServiceConfig compose/Caddy generation, with four test constructors at config.rs:6635/6649/6656/6670 still referring to it. Attributed rather than assumed: nothing I edited mentions LegacyServiceConfig (grep over oss/kamaji + oss/yah-base returns nothing), and `cargo check --manifest-path oss/yubaba/Cargo.toml --all-targets` was exit 0 EARLIER IN THIS SESSION — the breakage appeared between the two runs, i.e. it landed under me. Coordinated directly with @Ashguard:blade (session:7ca0970b), who leads R895.")
+//! @yah:handoff("SESSION 2 (session:dc6af742) — both notify_on wakes acted on and removed from source. (1) Deploy.mesh now rides the tolerant envelope too (messages.rs), folded into V13 without a new bump: V13 first committed 2026-09-14 (bae81d65), CDN latest is 0.8.36, v0.8.38 prep carried V11, and hotship's pairing guard means any node running V13 got a matched pair. MeshAssignment wg_private_key/wg_listen_port/peers and WireguardPeer endpoint/allowed_ips gained #[serde(default)] (the no-WireGuard values); mesh_ip and public_key stay required. envelope_spike.rs's DeployFrameMirror wraps mesh to match. (2) Schema regen: workload.toml.schema.json was ALREADY correct in the tree (TenantPasswayTls has no additionalProperties; a sync commit picked it up). `scripts/check-schema-drift.sh --update` wrote one real drift, .yah/schema/qed-pipeline.toml.schema.json, from R906-F1's ManualAudience doc edit, not this ticket.")
+//! @yah:handoff("DEFAULTS POLICY RESOLVED as a frozen split, not a blanket default. New oss/kamaji/crates/kamaji-proto/tests/tolerant_field_policy.rs drops each top-level key of every wire-carried struct and freezes the set whose absence fails decode: WorkloadSpec's 9, TenantPasswayWorkload {domain,listen,tls}, TenantPasswayTls {cert,key}, WorkloadEntry {id,state}, NodeCapabilities {microvm,native_exec} (capabilities stay loud on purpose), MicroVmHealth {attached}, MeshAssignment {mesh_ip}, WireguardPeer {public_key}. A field added without deciding its default fails that test, with a message stating the rule. Nothing moved to validate.rs, so the TOML authoring parse is unchanged.")
+//! @yah:handoff("STALE DOCS CORRECTED, claims these changes falsified: WorkloadEntry.named_ports said a new field there is always a version bump; NodeCapabilities said adding a field IS a wire break; the Deploy variant doc; the V13 stanza (mesh now wrapped); tolerant.rs's wrapped-struct list; W349's Landed section (item 1 now done). Ticket title V12 -> V13.")
+//! @yah:handoff("Remaining relay work filed as children: R896-F3 (annotations -> typed WorkloadSpec fields, the migration W349 names) and R896-T4 (SchemaVersion adopt-or-delete, with a recommendation to delete and the roll hazard).")
+//! @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml --workspace --all-features --no-fail-fast: EXIT 0, zero failures (kamaji lib 324, kamaji-bin lib 298, kamaji-proto lib 39 + envelope_spike 4 + tolerant_field_policy 5, cheers_mock 18, rest smaller), no skew. The first run without --no-fail-fast hit server::tests::tenant_passway::deploy_arms_the_declared_socket_and_stop_releases_it once: the port TOCTOU flake R895-F1 already recorded, and it passed in the rerun.")
+//! @yah:verify("cargo check --manifest-path oss/yubaba/Cargo.toml --workspace --all-targets: EXIT 0, no skew. An earlier run was red only because R895-F3's in-flight tenant-isolation edit to oss/kamaji/crates/kamaji/src/container_net.rs was half-written (tenant_isolation / fnv1a32 / NetnsPlan.bridge); it cleared on its own, and I did not edit that file.")
+//! @yah:verify("NOT RUN: root --workspace and app/yah/desktop. This session's code changes are serde attributes plus docs in kamaji-proto, with no type or signature change, and hub/desktop reach MeshAssignment only via kamaji::MeshAssignment::inlined(). Last session's red on both was attributed to peer work.")
 
 use postcard::Error as PostcardError;
 use serde::{de::DeserializeOwned, Serialize};
@@ -20,9 +55,26 @@ use serde::{de::DeserializeOwned, Serialize};
 /// Maximum frame payload size the codec accepts.
 ///
 /// UDS control messages are tiny — workload specs are the largest realistic
-/// payload and they cap at the low-kB range. 1 MiB is a generous ceiling that
+/// payload and they cap at the low-kB range. This is a generous ceiling that
 /// still rejects framing bugs and hostile peers cheaply.
-pub const MAX_FRAME_BYTES: usize = 1 << 20;
+///
+/// **Raised 1 MiB → 4 MiB by R896-F2, and the ceiling had to move with the
+/// encoding.** The evolvable payload fields now ride name-keyed JSON rather than
+/// positional postcard ([`crate::tolerant`]), measured at **3.9×** the bytes for
+/// a realistic container spec (209 B → 809 B;
+/// `tests/envelope_spike.rs::encoded_size_and_decode_cost`). A typical spec is
+/// nowhere near either limit, but `WorkloadSpec::files` carries inline file
+/// *content*, so a workload shipping a few hundred kB of config sat comfortably
+/// under 1 MiB as postcard and would have crossed it as JSON — a deploy that
+/// used to work failing with `FrameTooLarge`, caused by an encoding change
+/// rather than by anything the author did. Scaling the ceiling by roughly the
+/// same factor keeps the pre-existing margin instead of silently narrowing it.
+///
+/// This is not a wire-compatibility concern in its own right: the limit is a
+/// local sanity check each side applies to what it reads, not a negotiated
+/// value. A smaller peer simply refuses sooner, which is the V13 handshake's
+/// problem and not this constant's.
+pub const MAX_FRAME_BYTES: usize = 4 << 20;
 
 /// Codec error surface.
 #[derive(Debug, thiserror::Error)]
@@ -477,11 +529,10 @@ mod tests {
         use workload_spec::{
             BackoffPolicy, EnvValue, EnvVar, ExposeSpec, HealthProbe, Healthcheck, ImageRef,
             LifecycleArchetype, MeshExpose, MeshIdent, MeshLookup, Millis, OperatorExpose,
-            PublicExpose, PublicTls, ResourceLimits, RestartPolicy, SchemaVersion, SecretMount,
+            PublicExpose, PublicTls, ResourceLimits, RestartPolicy, SecretMount,
             SecretRef, SecretTarget, StopPolicy, TierTag, VolumeMount, VolumeSource, WorkloadSpec,
         };
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: "noisetable-api".into(),
             image: ImageRef {
                 registry: "ghcr.io".into(),
@@ -546,6 +597,7 @@ mod tests {
                     },
                     target: PathBuf::from("/data"),
                     read_only: false,
+                    from_secret_mount: false,
                 },
                 VolumeMount {
                     source: VolumeSource::Bind {
@@ -553,17 +605,22 @@ mod tests {
                     },
                     target: PathBuf::from("/config"),
                     read_only: true,
+                    from_secret_mount: false,
                 },
                 VolumeMount {
                     source: VolumeSource::Tmpfs { size_mb: 128 },
                     target: PathBuf::from("/tmp"),
                     read_only: false,
+                    from_secret_mount: false,
                 },
             ],
             resources: ResourceLimits {
                 memory_mb: 512,
                 cpu_millis: 1024,
-                ephemeral_storage_mb: 256,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![MeshIdent("noisetable-db.pdx".into())],
             requires: vec![],
@@ -618,6 +675,7 @@ mod tests {
                 );
                 m
             },
+            durability: None,
             annotations: {
                 let mut m = HashMap::new();
                 m.insert("yah.created-by".into(), "agent:claude".into());
@@ -799,7 +857,7 @@ mod tests {
                 1,
                 KamajiToYubaba::Ack {
                     request_id: rid,
-                    kind: AckKind::Deploy,
+                    kind: AckKind::Stop,
                 },
             ),
             (
@@ -879,10 +937,25 @@ mod tests {
         });
 
         // Ack — every AckKind.
-        for kind in [AckKind::Deploy, AckKind::Stop, AckKind::Probe] {
+        for kind in [AckKind::Stop, AckKind::Probe, AckKind::GracefulUpgrade] {
             assert_constable_round_trips(KamajiToYubaba::Ack {
                 request_id: RequestId(10),
                 kind,
+            });
+        }
+
+        // DeployAck (R850-T4) — both hydrate shapes. The `Some` arm is the one
+        // worth round-tripping: an `Option<String>` is the first place a
+        // positional codec can silently lose a byte, and this line is what a
+        // measured restore is made of.
+        for hydrate in [
+            None,
+            Some(r#"{"outcome":"hydrated","restored":[{"subject":"main","source":{"snapshot":1},"bytes":4096,"seconds":1.5}]}"#.to_string()),
+        ] {
+            assert_constable_round_trips(KamajiToYubaba::DeployAck {
+                request_id: RequestId(10),
+                id: WorkloadId::new("yah-marketing"),
+                hydrate,
             });
         }
 
@@ -1034,6 +1107,15 @@ mod tests {
                     named_ports: Default::default(),
                     spec_digest: None,
                 },
+                WorkloadEntry {
+                    mesh_ident: None,
+                    id: WorkloadId::new("o"),
+                    state: WorkloadState::OomKilled,
+                    pid: None,
+                    ports: Vec::new(),
+                    named_ports: Default::default(),
+                    spec_digest: None,
+                },
             ],
         });
 
@@ -1045,6 +1127,7 @@ mod tests {
             WorkloadState::Starting,
             WorkloadState::Running,
             WorkloadState::Failed,
+            WorkloadState::OomKilled,
         ] {
             for detail in [None, Some("materialize bundle abc: blob 404".to_string())] {
                 assert_constable_round_trips(KamajiToYubaba::DeployStatusResult {
@@ -1068,8 +1151,7 @@ mod tests {
         use std::path::PathBuf;
         use workload_spec::{
             AlmanacManifest, AlmanacTarget, AssetEntry, BlakeHash, BuildConfig, BuildMode, Cadence,
-            ImageRef, MeshIdent, MesofactStaticWorkload, Millis, NotReadyPolicy, SchemaVersion,
-            StaticAssetWorkload, TierTag, Workload, WorkloadSpec,
+            ImageRef, MeshIdent, MesofactStaticWorkload, Millis, NotReadyPolicy,             StaticAssetWorkload, TierTag, Workload, WorkloadSpec,
         };
 
         let image = || ImageRef {
@@ -1101,7 +1183,6 @@ mod tests {
             (
                 "mesofact-static",
                 Workload::MesofactStatic(MesofactStaticWorkload {
-                    schema_version: SchemaVersion::V1,
                     build: BuildConfig {
                         command: Some("bun run build".into()),
                         out_dir: PathBuf::from("dist"),
@@ -1124,7 +1205,6 @@ mod tests {
             (
                 "almanac",
                 Workload::Almanac(AlmanacManifest {
-                    schema_version: SchemaVersion::V1,
                     command: "refresh-openrouter-cache".into(),
                     cadence: Cadence::Cron {
                         expression: "0 */6 * * *".into(),
@@ -1148,7 +1228,6 @@ mod tests {
             (
                 "static-asset",
                 Workload::StaticAsset(StaticAssetWorkload {
-                    schema_version: SchemaVersion::V1,
                     assets: vec![AssetEntry {
                         filename: "whisper/distil-large-v3.bin".into(),
                         source: Some(PathBuf::from("assets/model.bin")),
@@ -1221,5 +1300,43 @@ mod tests {
             .expect("string-authored ImageRef must survive the postcard wire");
         assert_eq!(decoded, msg);
         assert_eq!(consumed, bytes.len());
+    }
+
+    /// R885-T6: appending `WorkloadState::OomKilled` must not renumber any
+    /// existing variant.
+    ///
+    /// This is the load-bearing claim of the V11 stanza in `version.rs`, and it
+    /// is the one that is invisible in a diff — postcard encodes a unit-variant
+    /// discriminant as a varint, so *where* a variant is added decides whether
+    /// the change is additive or a silent renumbering of every state after it.
+    /// R850-T4 paid for the lesson from the other direction: removing
+    /// `AckKind::Deploy` renumbered its successors, and a `Stop` ack started
+    /// decoding as `Probe` with no error anywhere.
+    ///
+    /// Pinned against literal bytes rather than against `as usize`, because a
+    /// cast reads the Rust discriminant and this test is about the *wire*.
+    #[test]
+    fn appending_oom_killed_left_every_existing_discriminant_alone() {
+        for (state, want) in [
+            (WorkloadState::Pending, 0u8),
+            (WorkloadState::Starting, 1),
+            (WorkloadState::Running, 2),
+            (WorkloadState::Draining, 3),
+            (WorkloadState::Exited, 4),
+            (WorkloadState::Failed, 5),
+            // The new one, and the only byte an unbumped V10 peer cannot read.
+            (WorkloadState::OomKilled, 6),
+        ] {
+            let bytes = postcard::to_allocvec(&state)
+                .expect("a fieldless enum always encodes");
+            assert_eq!(
+                bytes,
+                vec![want],
+                "{state:?} must encode as the single byte {want}"
+            );
+            let back: WorkloadState =
+                postcard::from_bytes(&bytes).expect("and must decode back");
+            assert_eq!(back, state);
+        }
     }
 }

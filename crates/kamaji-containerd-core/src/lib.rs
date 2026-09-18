@@ -57,6 +57,34 @@
 //! @yah:next("Merge the image OCI config into the container process spec per docker/OCI convention: process.args = image.Entrypoint ++ (workload argv or image.Cmd); process.env = image.Env overlaid by workload env; honor image.WorkingDir. Then P018 runs as authored (single-string argv under the image's bash -c entrypoint) and image-baked build vars apply without the pipeline restating them.")
 //! @yah:verify("A container-run step with only `image` + a bare command (no explicit bash -c / env) runs with the image's entrypoint + env applied. .yah/qed/P018-rusty-v8-musl-verify.toml (the workaround that inlines both) can then be deleted and P018 runs green.")
 //! @yah:gotcha("kamaji-containerd-core parses the image config but reads ONLY rootfs.diff_ids (~line 239-249); sets entrypoint:None (~517) and builds container env solely from the workload spec (~367). So the builder image's `ENTRYPOINT [\"bash\",\"-c\"]` and baked ENV (PATH, V8_FROM_SOURCE, GN, NINJA, CLANG_BASE_PATH, RUSTC_BOOTSTRAP) are DROPPED. P018-rusty-v8-musl.toml was authored assuming ENTRYPOINT+ENV merge; container exec failed 'no such file or directory' on the one-string argv until worked around.")
+//!
+//! @yah:ticket(R881-B7, "Isolated-netns containers get the host's LOOPBACK resolver stub bind-mounted, so every DNS lookup inside them times out")
+//! @yah:status(review)
+//! @yah:at(2026-09-11T07:02:48Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R881)
+//! @yah:severity(high)
+//! @yah:gotcha("R881-T3'S PREMISE IS WRONG FOR A LOOPBACK STUB RESOLVER, AND THE TEST BESIDE IT ALREADY NAMES THE HAZARD. lib.rs:1145-1152 justifies widening the resolv.conf bind past wants_host_network() with: \"a workload joining a namespace kamaji wired has a default route and egress NAT, so the host's resolver is exactly as reachable from inside it as from the host.\" That holds only when the host's nameserver is a ROUTABLE address. On Debian/Ubuntu with systemd-resolved — the fleet's OS — /etc/resolv.conf is the stub `nameserver 127.0.0.53`, and loopback is PER-NETNS. Bind-mounting it into an isolated netns hands the container a 127/8 address with nothing listening behind it. The test docstring at lib.rs:1817-1820 states the exact failure mode it produces: \"a resolv.conf pointing at an unreachable nameserver turns an instant failure into a DNS timeout on every lookup.\" That is what shipped — through the loopback door the author did not check, not the empty-netns door they did.")
+//! @yah:gotcha("MEASURED LIVE, NOT INFERRED — us-east-001 (51.81.85.145), containerd ns `yah`, workload noisetable-account, pid 628063, 2026-09-10 by @Glimmerstone:griffin from the noisetable camp. Read-only; NOTHING was changed on the node and no file was edited in either repo. Inside the container's netns: `ip -4 addr` = lo + `eth0@if8 inet 10.128.3.2/24`, `ip route` = `default via 10.128.3.1 dev eth0` — so R881's addressing fix IS working and this is the next layer down, not a regression of it. Inside its mount ns: /etc/resolv.conf = `nameserver 127.0.0.53` + `search .`, i.e. the host's systemd-resolved stub-resolv.conf verbatim. Egress is FINE and that is the discriminator: from inside the netns, TCP connect to 34.149.236.64:587 (smtp.mailgun.org) SUCCEEDS, as does :443, and TCP 1.1.1.1:53 succeeds. Only name resolution fails. The user-visible symptom was `POST https://api.noisetable.com/api/v1/auth/magic-link/request` returning 502 {\"error\":\"mailer_transport\",\"message\":\"mailer transport: smtp: Connection error: failed to lookup address information: Try again\"} — EAI_AGAIN, the timeout shape, exactly as the test docstring predicts.")
+//! @yah:next("FIX SITE IS ONE `if`: oss/kamaji/crates/kamaji-containerd-core/src/lib.rs:1153-1159. Today it is `let has_ip_egress = spec.wants_host_network() || pod.join_netns.is_some();` then an unconditional bind of /etc/resolv.conf. The bind is right for a HOST-networked workload (loopback there IS the host's, so 127.0.0.53 resolves) and wrong for an isolated netns. Suggested shape, but the design is the picker-upper's: when NOT wants_host_network(), parse the host /etc/resolv.conf and if every `nameserver` line is in 127.0.0.0/8, do not bind it — bind /run/systemd/resolve/resolv.conf instead, which systemd-resolved maintains with the REAL upstream servers and which exists on every fleet node. Fall back to synthesizing a file under the workload's state dir if neither is usable. Do NOT simply hardcode 1.1.1.1: kamaji already has a resolver-selection precedent on the microVM path (MicroVmConfig.network.dns, default 1.1.1.1, oss/kamaji/crates/kamaji/src/microvm.rs) and the container path should reuse that policy rather than invent a second one — plausibly by making the resolver a field the spec can set, which is also what an air-gapped or split-horizon node will need.")
+//! @yah:verify("EXTEND THE EXISTING TEST RATHER THAN ADDING A PARALLEL ONE — `a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not` at lib.rs:1822 is the right home and its docstring already argues this ticket's case. It needs a third axis the OCI-spec-only assertion cannot reach today: WHICH file gets bound, given a host resolv.conf whose nameservers are all loopback. That means factoring the choice into a pure function (host resolv.conf contents + netns shape -> source path or None) so it is unit-testable without a node, then asserting: all-loopback + isolated netns -> /run/systemd/resolve/resolv.conf; all-loopback + host netns -> /etc/resolv.conf (unchanged, still correct); routable nameserver + isolated netns -> /etc/resolv.conf (unchanged); no usable source -> no mount, since runc refuses a missing source.")
+//! @yah:verify("LIVE ACCEPTANCE, END TO END, AND IT NEEDS THE noisetable CAMP: after redeploying kamaji to us-east-001, `sudo nsenter -t $(sudo ctr -n yah t ls | grep account | awk '{print $2}') -n getent hosts smtp.mailgun.org` returns an address, and then `curl -sS -X POST https://api.noisetable.com/api/v1/auth/magic-link/request -H 'Content-Type: application/json' -H 'Origin: https://noisetable.com' -d '{\"email\":\"<an address you can read>\"}'` returns 2xx instead of the 502 above AND the mail arrives. That last leg is the real oracle: the Mailgun event log for noisetable.com currently shows ZERO events ever, so a non-502 with no delivered event would mean this ticket moved the failure rather than fixed it. Node access is `ssh -i ~/.ssh/yah debian@51.81.85.145` — a bare `ssh debian@...` is publickey-denied.")
+//! @yah:verify("CROSS-REPO POINTER: the consumer-side ticket is noisetable R131-T12 (.yah/services/noisetable-api/mirrors/cloud.toml), currently in review believing the deploy is complete. It is not — sign-in is dead at the mail step for this reason. Whoever fixes this should say so there; that camp's operator was asking why no email had arrived when this was found.")
+//! @yah:gotcha("BLAST RADIUS IS EVERY ISOLATED-NETNS CONTAINER ON THE FLEET, not one noisetable service. Any workload that resolves a name — fetching from crates.io, calling an external API, reaching an SMTP relay, talking to another service by hostname — is broken the same way the moment it stops being host-networked, and it fails as a slow timeout rather than a clean error, so it will read as flakiness. noisetable-account is merely the first one deployed in that shape, exactly as it was the first to hit R881 itself. Tier: Warrior — the diagnosis is finished and the fix site is one branch, but it needs a real test seam, a kamaji cross-build and a fleet redeploy to prove.")
+//! @yah:handoff("CODE LANDED, ONE FILE, oss/kamaji/crates/kamaji-containerd-core/src/lib.rs. New pure `resolver_mount_source(host_networked, &HostResolvers) -> Option<&'static str>` plus `HostResolvers::read()` (the only IO) and consts HOST_RESOLV_CONF / SYSTEMD_RESOLVED_UPSTREAM. build_oci_spec_with's resolv.conf branch now binds whatever that returns instead of a hardcoded /etc/resolv.conf; `has_ip_egress` is unchanged. Candidates are RANKED, not first-hit: under host networking the host file always wins (its loopback IS the container's); in an isolated netns a file scores 2 when every nameserver is routable, 1 when only some are, and is discarded at 0 — so a mixed loopback+routable file loses to systemd-resolved's all-routable one, because each loopback entry costs a per-lookup timeout. Ties break on array order (/etc first). NOTHING IS SYNTHESIZED when no candidate is usable: no mount at all, which is a refused connection on the first lookup instead of a 5s timeout on every one. Deliberately did not invent a resolver address — that would be a second policy beside the microVM path's GuestNetwork::dns (kamaji/src/microvm.rs:553, default 1.1.1.1); if a node ever needs one (air-gapped, split-horizon) it belongs in the spec and both paths should read it from there, which is a workload-spec change this ticket does not need.")
+//! @yah:verify("cargo test -p kamaji-containerd-core --features containerd-integration --lib: 37 passed / 0 failed, including the extended a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not. NOTE the feature flag is load-bearing — the crate is `#![cfg(feature = \"containerd-integration\")]` in full, so a bare `cargo test -p kamaji-containerd-core` compiles it to nothing and reports `0 passed` while looking green. clippy -p kamaji-containerd-core --features containerd-integration --all-targets: 0 warnings (one pre-existing needless_lifetimes on the test helper network_ns was fixed in passing).")
+//! @yah:gotcha("TAILSCALE MAGICDNS IS THE ONE CASE THIS RANKING WAVES THROUGH ON REASONING RATHER THAN MEASUREMENT. oss/yubaba/crates/cloud/src/cloud_init.rs:454 notes that a node which accepts MagicDNS has tailscaled rewrite /etc/resolv.conf to 100.100.100.100 — not loopback, so it scores 2 and gets bound into the container unchanged. I believe it works: container_net's NAT rule (kamaji/src/container_net.rs:498-514) masquerades everything leaving the node that is not headed out the bridge, so a packet to 100.100.100.100 is SNATed to the host and tailscaled answers it on tailscale0. NOT MEASURED — us-east-001 is on the systemd stub, not MagicDNS, so no fleet node exercises it today. If a MagicDNS node ever shows container DNS timing out, this is the first thing to check.")
+//! @yah:verify("THE RANKING'S CHOSEN CANDIDATE IS CONFIRMED REACHABLE FROM INSIDE THE CONTAINER'S NETNS — measured 2026-09-10 by @Glimmerstone:griffin from the noisetable camp, read-only, BEFORE any redeploy, so the landed code's premise is evidence rather than reasoning. On us-east-001 AND us-west-001, identically: /etc/resolv.conf = `nameserver 127.0.0.53` (scores 0, discarded) and /run/systemd/resolve/resolv.conf = `nameserver 213.186.33.99`, OVH's resolver, single entry, all-routable (scores 2, wins). The file is -rw-r--r-- systemd-resolve:systemd-resolve, 788 bytes, so a read-only bind needs no privilege. THE DECISIVE LEG, which a unit test on the OCI spec cannot reach: a real UDP DNS query for smtp.mailgun.org sent to 213.186.33.99:53 from INSIDE the live noisetable-account netns (nsenter -t <pid> -n, containerd ns `yah`) returned rcode=0 with 1 answer. So the SNAT reasoning holds for a real resolver on a real node, and a redeploy should fix this outright rather than trading a loopback stub for an unreachable upstream.")
+//! @yah:gotcha("ALL THREE NODES NOW MEASURED — and south is the case that proves the ranking was the right design, not the binary is-it-loopback check the ticket originally suggested. My earlier \"south is unchecked\" gotcha is deleted rather than corrected beside itself; the ssh identity was fine, the USER was wrong — .yah/infra/machines/us-south-001.toml:97 says `ssh = \"root@45.32.194.254\"` (Vultr image), not the `debian@` that opens the two OVH boxes. Read as root 2026-09-10: south has NO /run/systemd/resolve/resolv.conf at all (ABSENT — systemd-resolved is not managing resolv.conf there), and /etc/resolv.conf carries four real nameservers: 108.61.10.10 (Vultr), 9.9.9.9 (Quad9), 2001:19f0:300:1704::6, 2620:fe::fe. No loopback stub anywhere. Under the landed ranking /etc/resolv.conf scores routable and systemd_upstream is None, so south correctly binds /etc/resolv.conf — the opposite candidate from east and west, chosen by the same rule. A binary loopback check would also have worked here; the ranking earns its keep on mixed files.")
+//! @yah:next("ONE REFINEMENT WORTH MAKING WHILE YOU ARE IN THE PREDICATE — THE ROUTABILITY TEST IS ADDRESS-FAMILY-BLIND. It excludes loopback (127/8, ::1) and unspecified, so a global-scope IPv6 nameserver scores as routable. But a container netns has NO IPv6 AT ALL: measured inside the live noisetable-account netns on us-east-001, `ip -6 addr` shows only `::1/128` on lo and `ip -6 route` is EMPTY — container_net.rs wires an IPv4 veth and IPv4 NAT and nothing else. So an IPv6 nameserver bound into a container's resolv.conf is unreachable by construction on every node today, and it is scored as healthy. This is LATENT, NOT LIVE, and does not block the redeploy: east and west are all-loopback so their /etc/resolv.conf loses regardless, and south's file leads with two IPv4 entries that glibc (MAXNS=3, tried in order) reaches first. It bites when a file is ordered IPv6-first or its leading IPv4 resolver fails — precisely the per-lookup-timeout cost the ranking exists to avoid, arriving through the family axis instead of the loopback axis. Cheapest fix: count an IPv6 nameserver as non-routable while the container path is IPv4-only, or better, pass the netns's actual address families into the predicate so it stops being a standing assumption. Same shape of mistake as R881-T3's original premise: a nameserver that is routable from the HOST is not automatically reachable from the CONTAINER.")
+//! @yah:next("LIVE ACCEPTANCE NEEDS A PAIRED SHIP, NOT A KAMAJI-ONLY ONE. kamaji and yubaba self-install as a pair (kamaji-proto version.rs says so: \"the skew window is a restart rather than a rolling fleet upgrade\"), and this tree's kamaji cannot talk to a released yubaba. So whoever finishes this either ships BOTH halves from a tree whose yubaba half is shippable (today it carries R850's in-flight recovery_journal and cloud-reconciler edits), or waits for the next release and verifies against that. The acceptance commands are unchanged and are in this ticket's verify list; the node-side checks that discriminate a real pass are `sudo nsenter -t $(sudo ctr -n yah t ls | grep account | awk '{print $2}') -m cat /etc/resolv.conf` showing a ROUTABLE nameserver (expect 213.186.33.99, us-east-001's upstream) instead of 127.0.0.53, and then `getent hosts smtp.mailgun.org` from inside.")
+//! @yah:handoff("LIVE ACCEPTANCE ATTEMPTED AND ROLLED BACK — the fix is NOT proven live, and the reason is a protocol skew that has nothing to do with the fix. `scripts/hotship.sh --nodes us-east-001 --binaries kamaji` put 0.8.38-h4 (this tree) beside the node's released yubaba 0.8.37. The tree carries an unreleased kamaji-proto bump to V10 (R850-T4, uncommitted in oss/kamaji/crates/kamaji-proto/src/version.rs) that removes AckKind::Deploy and renumbers the rest, so the two halves misframed (`decode failed: frame too large: 542393671 > 1048576`) and yubaba silently fell back to its in-process containerd runtime, which wires no netns — see R881-B8, filed from this session. RESTORED to published bytes with `scripts/roll-node.sh us-east-001 --to 0.8.37 --yes`, then one `yah cloud workload rolling noisetable-account`; the kamaji journal shows `container network namespace wired ... address=10.128.3.2 gateway=10.128.3.1` at 06:57:28 UTC and the container is back to eth0 10.128.3.2 with the loopback-stub resolv.conf, i.e. exactly the pre-session state this ticket describes. Net change to the node: none.")
+//! @yah:verify("HOST-SIDE PREMISE CONFIRMED ON THE REAL NODE, which is what makes the ranking correct rather than plausible: us-east-001's /etc/resolv.conf is a symlink to ../run/systemd/resolve/stub-resolv.conf carrying `nameserver 127.0.0.53` + `search .`, and /run/systemd/resolve/resolv.conf exists (root:systemd-resolve 0644) carrying `nameserver 213.186.33.99` + `search .`. So on this fleet the function's isolated-netns branch picks the upstream file and the host-networked branch keeps the stub — both exercised by the unit test, both grounded in a file I read on the node.")
+//! @yah:handoff("GUARD ADDED SO THIS CANNOT RECUR — scripts/hotship.sh now refuses to ship exactly one of {kamaji, yubaba} when the tree's kamaji_proto::ProtocolVersion has moved past the last `release v*` commit's (new `--allow-proto-skew` overrides; `--no-restart` downgrades it to a warning, since staged bytes only bite on the next restart). The comparison is local and node-free: highest `V<n>` variant in oss/kamaji/crates/kamaji-proto/src/version.rs, working tree vs `git show <release-commit>:`. Operator-approved 2026-09-11. Verified by running it: `scripts/hotship.sh --nodes us-east-001 --binaries kamaji --dry-run` now exits 1 with \"This tree speaks ProtocolVersion V10; the last release (release v0.8.37) speaks V9\" and suggests `--binaries kamaji,yubaba`; `bash -n` clean. Rationale is in the script's own header under \"kamaji/yubaba pairing\" — the point is that the failure it prevents is SILENT on both sides and presents as a networking bug.")
+//! @yah:handoff("PROVEN LIVE ON us-east-001, 2026-09-11 07:02 UTC, end to end. The operator authorized the paired ship after the kamaji-only attempt failed; `scripts/hotship.sh --nodes us-east-001 --binaries kamaji,yubaba` put 0.8.38-h5 on both halves (health reports version=0.8.38-h5 AND kamaji_version=0.8.38-h5, which is the tell that the sibling handshake agreed), then one `yah cloud workload rolling noisetable-account --path ~/ss/noisetable` redeployed the workload on the same pinned digest sha256:9237b7b1. NOTE the node now runs hotship bytes that are on no CDN manifest, and they carry other relays' in-flight work — R850's kamaji-proto V10 + recovery_journal and @Glimmerstone:polaris's native-exec cgroup confinement (native workloads on that box now get memory.max/cpu.max leaves). That is the operator's decision, recorded here so the next roll-node.sh run is understood as reverting it.")
+//! @yah:verify("NOT PROVEN BY ME, and it is the one leg the ticket called the real oracle: that the message ARRIVES. I cannot read human@yah.dev's mailbox and the Mailgun event log needs the noisetable camp's credential — its log showed zero events ever, so a non-502 with no delivered event would mean the failure moved rather than went away. The operator can settle it by looking for a noisetable sign-in mail sent at 07:0x UTC 2026-09-11; if none arrived, this ticket is not done and the next suspect is Mailgun-side (domain verification / From: header, per the noisetable mirror's own gotcha), not DNS.")
+//! @yah:gotcha("THE BUG WAS REAL AND THE FIX IS WHAT MOVED IT — the discriminator is that nothing else changed between the 502 and the 200: same image digest, same spec, same node, same Mailgun account. Only the bound resolver file differs.")
+//! @yah:verify("LIVE EVIDENCE, in the order it was taken. (1) OCI spec of the running container, read with `ctr -n yah c info noisetable-account`: mount `{destination: /etc/resolv.conf, type: bind, source: /run/systemd/resolve/resolv.conf, options: [rbind, ro, nosuid, nodev]}` — the new branch, naming the upstream file, where every previous deploy named /etc/resolv.conf. Network namespace entry carries `path: /var/run/netns/noisetable-account`. (2) Inside the container's mount ns: /etc/resolv.conf = `nameserver 213.186.33.99` + `search .`, where it was `nameserver 127.0.0.53` before. (3) Inside its netns: `getent hosts smtp.mailgun.org` returns `34.149.236.64` — this is the exact command the ticket named and it had never returned an address. (4) `curl -X POST https://api.noisetable.com/api/v1/auth/magic-link/request -H 'Origin: https://noisetable.com' -d '{\"email\":\"human@yah.dev\"}'` => HTTP 200 {\"ok\":true}, against a baseline of 502 {\"error\":\"mailer_transport\",\"message\":\"... failed to lookup address information: Try again\"}. The mailer submits synchronously, so a 200 means the SMTP transport resolved, connected and was accepted.")
 
 #![cfg(feature = "containerd-integration")]
 
@@ -806,6 +834,26 @@ pub struct PodOptions {
     /// outgoing + incoming passway containers so the `SIGQUIT`ed old process
     /// can reach the new one over the upgrade socket during the fd-handoff.
     pub shared_dir: Option<(String, String)>,
+    /// Staged [`WorkloadSpec::files`] for this generation, bind-mounted
+    /// read-only one file at a time (R870-F27). Always the return value of
+    /// [`stage_spec_files`] — never re-derived here from `spec.files`, so a
+    /// mount in this list is a file that is provably already on disk.
+    pub spec_files: Vec<SpecFileMount>,
+    /// `(host socket, container destination)` for the node's `yah-scryer`
+    /// ingestion socket (R893-B17) — the value of
+    /// `kamaji::observe::Collector::guest_bind`.
+    ///
+    /// A single FILE bind, not the socket's parent directory: `/run/yah` on a
+    /// fleet node is also [`UPGRADE_SHARE_ROOT`], so binding the directory
+    /// would hand every container every workload's pingora upgrade socket.
+    /// Read-write, because `connect(2)` on an `AF_UNIX` socket requires write
+    /// permission on the inode — a read-only bind would produce a reachable
+    /// path that refuses every connection, which reads as a broken collector
+    /// rather than as a wrong mount.
+    ///
+    /// `None` on a node with no collector configured, which is what every node
+    /// did before that ticket.
+    pub collector_socket: Option<(String, String)>,
 }
 
 // ── Graceful-upgrade pod planning (R600-F7) ─────────────────────────────────
@@ -932,6 +980,201 @@ pub fn upgrade_sock_basename(spec: &WorkloadSpec) -> Option<String> {
     })
 }
 
+// ── Spec-carried config files (R870-F27) ────────────────────────────────────
+//
+// `WorkloadSpec::files` is config the node writes out before the workload
+// starts — R870's inner door reads its *entire* mount table from one. The
+// native backend writes them straight onto the host filesystem the child
+// execs into. A container has no such filesystem until runc has assembled
+// one, and the rootfs is an overlay snapshot kamaji never mounts, so the
+// equivalent move is: stage each file in a per-generation host directory and
+// bind-mount it, one file at a time, at the path the spec names.
+//
+// Per *file* rather than per *directory* deliberately. A directory bind at
+// `/etc/passway` would replace whatever the image ships there, so a spec that
+// adds one file would silently delete the image's siblings — and a workload
+// whose files land in `/etc` would have its whole `/etc` replaced. A file
+// bind touches exactly the declared path. runc creates a missing destination
+// for a bind mount (it stats the source and touches a file or mkdirs a dir),
+// so the path need not exist in the image.
+
+/// Host directory holding one container generation's materialized
+/// [`WorkloadSpec::files`], before they are bind-mounted in (R870-F27).
+///
+/// Keyed by **container id**, not by mesh identity, and that is the whole
+/// reason it is not just `<ident>/files`: a graceful upgrade runs two
+/// generations at once ([`PodSlot`]), and the outgoing one must keep reading
+/// the table it was started against while the incoming one is staged with the
+/// new one.
+pub fn spec_files_hostdir(container_id: &str) -> std::path::PathBuf {
+    Path::new(UPGRADE_SHARE_ROOT)
+        .join(container_id)
+        .join("files")
+}
+
+/// One materialized [`workload_spec::InlineFile`] — where it was staged on the
+/// host, and where it is bind-mounted inside the container.
+///
+/// Produced only by [`stage_spec_files`], so a mount in this list is a file
+/// that is already on disk. [`build_oci_spec_with`] renders
+/// [`PodOptions::spec_files`] verbatim and never consults `spec.files` itself:
+/// that keeps "the file exists" and "the container mounts it" from being two
+/// independently-derived facts that can disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecFileMount {
+    /// Absolute host path of the staged copy.
+    pub host_path: String,
+    /// Absolute in-container path the spec declared.
+    pub container_path: String,
+}
+
+/// Where each of `spec`'s files is staged under `dir` — the pure half of
+/// [`stage_spec_files`], separated so the path rules are testable without
+/// touching a filesystem.
+///
+/// The staging layout mirrors the container tree (`/etc/passway/routes.json`
+/// → `<dir>/etc/passway/routes.json`) rather than flattening to basenames,
+/// which would collide two files named `config.json` in different
+/// directories into one host path and mount the same bytes at both.
+///
+/// Refuses any path that is not absolute or that contains a `..`. Not
+/// hygiene: `dir.join(relative)` with a `..` component escapes the staging
+/// directory, so a spec could otherwise name `/etc/../../../../root/.ssh/…`
+/// and have kamaji overwrite an arbitrary host file as root. `WorkloadSpec`
+/// documents the field as absolute but does not validate it, and this is the
+/// first backend for which the difference is exploitable.
+///
+/// A `.` component needs no refusal — path parsing drops it — but the
+/// returned `container_path` is the *normalized* path rather than the
+/// spec's literal spelling, so the bind's source and destination describe
+/// the same file name for a reader comparing them.
+pub fn plan_spec_files(dir: &Path, spec: &WorkloadSpec) -> Result<Vec<SpecFileMount>> {
+    use std::path::Component;
+
+    let mut out = Vec::with_capacity(spec.files.len());
+    for file in &spec.files {
+        let path = file.path.as_path();
+        let mut rel = std::path::PathBuf::new();
+        let mut components = path.components();
+        match components.next() {
+            Some(Component::RootDir) => {}
+            _ => bail!(
+                "workload {}: spec file path {} is not absolute; WorkloadSpec::files paths are \
+                 absolute in-container paths",
+                spec.name,
+                path.display()
+            ),
+        }
+        for component in components {
+            match component {
+                Component::Normal(part) => rel.push(part),
+                _ => bail!(
+                    "workload {}: spec file path {} contains a `.`, `..` or prefix component; \
+                     only plain absolute paths are materializable (a `..` would escape the \
+                     staging directory and write outside the container's view)",
+                    spec.name,
+                    path.display()
+                ),
+            }
+        }
+        if rel.as_os_str().is_empty() {
+            bail!(
+                "workload {}: spec file path {} names the root directory, not a file",
+                spec.name,
+                path.display()
+            );
+        }
+        let host_path = dir.join(&rel);
+        let container_path = Path::new("/").join(&rel);
+        let utf8 = |p: &Path| -> Result<String> {
+            p.to_str().map(str::to_string).ok_or_else(|| {
+                anyhow!(
+                    "workload {}: spec file path {} is not valid UTF-8",
+                    spec.name,
+                    path.display()
+                )
+            })
+        };
+        out.push(SpecFileMount {
+            host_path: utf8(&host_path)?,
+            container_path: utf8(&container_path)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Write `spec`'s [`WorkloadSpec::files`] into the staging directory `dir` and
+/// return the bind mounts that expose them (R870-F27).
+///
+/// `dir` is **emptied first**, so the staging tree is exactly what the current
+/// spec declares. That is the container-side counterpart of the native
+/// backend's whole-file writes: a redeploy that *drops* a file must not leave
+/// the previous deploy's copy on disk, both because a later spec re-declaring
+/// that path would otherwise race a stale inode and because these files are
+/// config, not scratch.
+///
+/// Failure is fatal to the deploy rather than logged and stepped over — a door
+/// started against an absent route table comes up healthy and routes wrongly,
+/// which is the outcome the whole mechanism exists to remove.
+///
+/// **Ownership is the kamaji process's**, not the container user's. The staged
+/// file carries the `mode` the spec asks for, and a bind mount preserves it,
+/// so a spec that pairs a restrictive `mode` with a non-root
+/// [`WorkloadSpec::user`] produces a file the workload cannot read. Same
+/// constraint as the native backend, deliberately: the backends diverging on
+/// who owns a materialized file is a worse trap than the one it would fix.
+pub async fn stage_spec_files(dir: &Path, spec: &WorkloadSpec) -> Result<Vec<SpecFileMount>> {
+    let planned = plan_spec_files(dir, spec)?;
+
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(
+                anyhow!(e).context(format!("clearing spec-file staging dir {}", dir.display()))
+            )
+        }
+    }
+    if planned.is_empty() {
+        return Ok(planned);
+    }
+
+    for (mount, file) in planned.iter().zip(&spec.files) {
+        let host_path = Path::new(&mount.host_path);
+        if let Some(parent) = host_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {} for a staged spec file", parent.display()))?;
+        }
+        tokio::fs::write(host_path, &file.content)
+            .await
+            .with_context(|| format!("staging spec file {}", host_path.display()))?;
+        #[cfg(unix)]
+        if let Some(mode) = file.mode {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(host_path, std::fs::Permissions::from_mode(mode))
+                .await
+                .with_context(|| {
+                    format!("chmod {mode:o} on staged spec file {}", host_path.display())
+                })?;
+        }
+    }
+    Ok(planned)
+}
+
+/// Remove a container generation's spec-file staging directory. Best-effort:
+/// called from teardown, where a missing directory is the ordinary case (most
+/// workloads declare no files) and a failure must not fail the teardown.
+pub async fn discard_spec_files(container_id: &str) {
+    let dir = spec_files_hostdir(container_id);
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    // The per-container parent is shared with the upgrade-sock dirs; it goes
+    // only when it is empty, which `remove_dir` gives us for free.
+    if let Some(parent) = dir.parent() {
+        let _ = tokio::fs::remove_dir(parent).await;
+    }
+}
+
 /// The literal env var naming passway's TLS listen address. kamaji binds this
 /// address once (custodian) and hands the fd to passway; the string must
 /// byte-match what passway configures pingora with, because pingora keys its
@@ -960,6 +1203,125 @@ pub fn passway_listen_addr(spec: &WorkloadSpec) -> String {
             }
         })
         .unwrap_or_else(|| DEFAULT_PASSWAY_LISTEN.to_string())
+}
+
+// ── Resolver selection (R881-B7) ────────────────────────────────────────────
+//
+// Which host file a container's `/etc/resolv.conf` is bound from is not a
+// constant, because `/etc/resolv.conf` on a systemd-resolved host — every
+// fleet node — is the *stub* file: `nameserver 127.0.0.53`. Loopback is
+// per-netns. Bound into a container that unshared its own network namespace,
+// that hands the workload an address with nothing listening behind it, and
+// glibc turns every lookup into a timeout rather than an error (measured on
+// us-east-001 against `noisetable-account`, 2026-09-10: egress to
+// 34.149.236.64:587 and to 1.1.1.1:53 both fine, every name EAI_AGAIN).
+//
+// systemd-resolved maintains a second file, `/run/systemd/resolve/resolv.conf`,
+// carrying the REAL upstream servers rather than the stub — routable from
+// anywhere the workload has egress. So the choice is a ranking over candidate
+// host files, not a single path.
+//
+// No resolver is ever *synthesized* here. A container with no usable host
+// source gets no mount at all, which is a refused connection on the first
+// lookup instead of a five-second timeout on every one. Picking an address
+// out of the air would be a second resolver policy beside the microVM path's
+// (`GuestNetwork::dns`, default 1.1.1.1, kamaji/src/microvm.rs:553) — if a
+// node ever needs one (air-gapped, split-horizon), the resolver belongs in
+// the spec and both paths should read it from there.
+
+/// The host's own resolver file. Correct for a host-networked workload by
+/// construction: it shares the host's loopback, so a stub nameserver resolves.
+pub const HOST_RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// systemd-resolved's upstream-server file — the same data the stub at
+/// [`HOST_RESOLV_CONF`] proxies, but as routable addresses.
+pub const SYSTEMD_RESOLVED_UPSTREAM: &str = "/run/systemd/resolve/resolv.conf";
+
+/// The candidate resolver files as read from the host, in preference order.
+/// Split from [`resolver_mount_source`] so the choice itself is a pure
+/// function and testable on a machine that is not a fleet node.
+#[derive(Debug, Default, Clone)]
+pub struct HostResolvers {
+    /// Contents of `/etc/resolv.conf`, or `None` if it does not exist.
+    pub etc: Option<String>,
+    /// Contents of `/run/systemd/resolve/resolv.conf`, or `None`.
+    pub systemd_upstream: Option<String>,
+}
+
+impl HostResolvers {
+    /// Read both candidates from the host. Unreadable is the same answer as
+    /// absent: runc refuses a mount with a missing source either way.
+    pub fn read() -> Self {
+        Self {
+            etc: std::fs::read_to_string(HOST_RESOLV_CONF).ok(),
+            systemd_upstream: std::fs::read_to_string(SYSTEMD_RESOLVED_UPSTREAM).ok(),
+        }
+    }
+}
+
+/// `(routable, total)` nameservers in a `resolv.conf`. A nameserver is
+/// routable from another netns when it is neither loopback (127/8, `::1` —
+/// the systemd-resolved stub's shape) nor unspecified.
+fn nameserver_counts(contents: &str) -> (usize, usize) {
+    let mut routable = 0;
+    let mut total = 0;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("nameserver") else {
+            continue;
+        };
+        let Some(addr) = rest.strip_prefix(char::is_whitespace) else {
+            continue;
+        };
+        // Strip an IPv6 zone index (`fe80::1%eth0`) — it names a host
+        // interface that does not exist in the container's namespace anyway.
+        let addr = addr.trim().split('%').next().unwrap_or("").trim();
+        total += 1;
+        if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                routable += 1;
+            }
+        }
+    }
+    (routable, total)
+}
+
+/// Which host file to bind at the container's `/etc/resolv.conf`, or `None`
+/// for no mount at all.
+///
+/// Under host networking the host's own file is always right — the container
+/// shares the host's loopback, so even a stub nameserver resolves. In an
+/// isolated namespace a file is ranked by how many of its nameservers survive
+/// the namespace boundary: all-routable beats partly-routable beats none, and
+/// a file whose every nameserver is loopback is not a resolver at all from in
+/// there. See the module note above this function for why nothing is
+/// synthesized when no candidate is usable.
+pub fn resolver_mount_source(host_networked: bool, hosts: &HostResolvers) -> Option<&'static str> {
+    let candidates = [
+        (HOST_RESOLV_CONF, hosts.etc.as_deref()),
+        (SYSTEMD_RESOLVED_UPSTREAM, hosts.systemd_upstream.as_deref()),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|(path, contents)| {
+            let contents = contents?;
+            if host_networked {
+                return Some((2, path));
+            }
+            let (routable, total) = nameserver_counts(contents);
+            match routable {
+                0 => None,
+                n if n == total => Some((2u8, path)),
+                _ => Some((1u8, path)),
+            }
+        })
+        // `min_by_key` keeps the FIRST of equally-ranked candidates, so the
+        // array's preference order breaks ties.
+        .min_by_key(|(rank, _)| std::cmp::Reverse(*rank))
+        .map(|(_, path)| path)
 }
 
 /// Standalone-workload OCI spec — the common case (no pod placement). Thin
@@ -1150,12 +1512,22 @@ pub fn build_oci_spec_with(
     // inside it as from the host. Without this, such a workload gets an address
     // and IP egress and still cannot resolve a name — which reads as a
     // networking bug and is a missing file.
+    //
+    // R881-B7: *which* host file, though, depends on the namespace. The host's
+    // `/etc/resolv.conf` is the systemd-resolved stub (`nameserver 127.0.0.53`)
+    // on every fleet node, and loopback does not survive the netns boundary —
+    // binding it into an isolated namespace is what turned every lookup into a
+    // timeout. [`resolver_mount_source`] ranks the candidates instead.
     let has_ip_egress = spec.wants_host_network() || pod.join_netns.is_some();
-    if has_ip_egress && std::path::Path::new("/etc/resolv.conf").exists() {
-        mounts.push(serde_json::json!({
-            "destination": "/etc/resolv.conf", "type": "bind", "source": "/etc/resolv.conf",
-            "options": ["rbind","ro","nosuid","nodev"]
-        }));
+    if has_ip_egress {
+        if let Some(source) =
+            resolver_mount_source(spec.wants_host_network(), &HostResolvers::read())
+        {
+            mounts.push(serde_json::json!({
+                "destination": "/etc/resolv.conf", "type": "bind", "source": source,
+                "options": ["rbind","ro","nosuid","nodev"]
+            }));
+        }
     }
     for volume in &spec.volumes {
         let rw_opt = if volume.read_only { "ro" } else { "rw" };
@@ -1200,6 +1572,38 @@ pub fn build_oci_spec_with(
             "type": "bind",
             "source": host_dir,
             "options": ["rbind", "rw", "nosuid", "nodev"],
+        }));
+    }
+
+    // The node's scryer ingestion socket (R893-B17), so a containerized
+    // workload's `YAH_SCRYER_SOCKET` names a path that exists inside its own
+    // mount namespace. See `PodOptions::collector_socket` for why this is a
+    // file bind rather than a directory one, and why it is read-write.
+    if let Some((host_socket, container_socket)) = &pod.collector_socket {
+        mounts.push(serde_json::json!({
+            "destination": container_socket,
+            "type": "bind",
+            "source": host_socket,
+            "options": ["rbind", "rw", "nosuid", "nodev"],
+        }));
+    }
+
+    // Spec-carried config files (R870-F27), staged on the host by
+    // [`stage_spec_files`]. LAST in the list on purpose: runc mounts in
+    // order, so a file declared *inside* a directory this workload also
+    // mounts (a volume at `/etc/passway`, the shared upgrade-sock dir) has to
+    // land after its parent or the parent mount buries it.
+    //
+    // Read-only. These are the deployed spec's bytes; the node rewrites them
+    // on every deploy and every respawn, so a workload that edited one would
+    // have its edit reverted underneath it at an unpredictable moment. `ro`
+    // turns that silent surprise into an `EROFS` at the write.
+    for file in &pod.spec_files {
+        mounts.push(serde_json::json!({
+            "destination": file.container_path,
+            "type": "bind",
+            "source": file.host_path,
+            "options": ["rbind", "ro", "nosuid", "nodev"],
         }));
     }
 
@@ -1384,12 +1788,11 @@ mod tests {
     use super::*;
     use workload_spec::{
         ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits,
-        RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+        RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
     };
 
     fn test_spec(name: &str) -> WorkloadSpec {
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             image: ImageRef {
                 registry: "docker.io".to_string(),
@@ -1411,7 +1814,10 @@ mod tests {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -1432,6 +1838,7 @@ mod tests {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -1771,7 +2178,7 @@ mod tests {
         }
     }
 
-    fn network_ns<'a>(oci: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    fn network_ns(oci: &serde_json::Value) -> Option<&serde_json::Value> {
         oci["linux"]["namespaces"]
             .as_array()
             .unwrap()
@@ -1818,36 +2225,154 @@ mod tests {
     /// namespace must still not get the file: there is no route to the resolver
     /// there, and a resolv.conf pointing at an unreachable nameserver turns an
     /// instant failure into a DNS timeout on every lookup.
+    ///
+    /// R881-B7 adds the axis the OCI spec alone cannot reach: *which* file. The
+    /// premise above holds only for a routable nameserver, and every fleet node
+    /// runs systemd-resolved, whose `/etc/resolv.conf` is the loopback stub —
+    /// so the bind this test was written to demand shipped the very timeout its
+    /// last sentence warns about. The choice is a pure function so the loopback
+    /// case is assertable without a node.
     #[test]
     fn a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not() {
-        fn binds_resolver(oci: &serde_json::Value) -> bool {
+        fn binds_resolver(oci: &serde_json::Value) -> Option<String> {
             oci["mounts"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|m| m["destination"] == "/etc/resolv.conf")
+                .find(|m| m["destination"] == "/etc/resolv.conf")
+                .map(|m| m["source"].as_str().unwrap().to_string())
         }
         let spec = test_spec("acct");
         assert!(
-            !binds_resolver(&build_oci_spec_with(
-                &spec,
-                &[],
-                None,
-                &PodOptions::default()
-            )),
+            binds_resolver(&build_oci_spec_with(&spec, &[], None, &PodOptions::default())).is_none(),
             "an empty namespace has no route to a resolver"
         );
+
+        // ── which file, given what the host has ──────────────────────────────
+        let stub = HostResolvers {
+            etc: Some("nameserver 127.0.0.53\nsearch .\n".into()),
+            systemd_upstream: Some("nameserver 213.186.33.99\nnameserver 1.1.1.1\n".into()),
+        };
+        assert_eq!(
+            resolver_mount_source(false, &stub),
+            Some(SYSTEMD_RESOLVED_UPSTREAM),
+            "a 127/8 stub is not a resolver from inside an isolated netns — \
+             systemd-resolved's upstream file is"
+        );
+        assert_eq!(
+            resolver_mount_source(true, &stub),
+            Some(HOST_RESOLV_CONF),
+            "host networking shares the host's loopback, so the stub resolves there"
+        );
+        let routable = HostResolvers {
+            etc: Some("# generated\nnameserver 213.186.33.99\n".into()),
+            systemd_upstream: None,
+        };
+        assert_eq!(
+            resolver_mount_source(false, &routable),
+            Some(HOST_RESOLV_CONF),
+            "a host file that is already routable is bound unchanged"
+        );
+        assert_eq!(
+            resolver_mount_source(
+                false,
+                &HostResolvers {
+                    etc: Some("nameserver ::1\n".into()),
+                    systemd_upstream: Some("nameserver 127.0.0.1\n".into()),
+                }
+            ),
+            None,
+            "no usable source means no mount — runc refuses a missing source, and \
+             an absent resolv.conf fails instantly where an unreachable one hangs"
+        );
+        // A file listing both survives the boundary, but every loopback entry in
+        // it costs a per-lookup timeout — so an all-routable candidate wins.
+        let mixed = HostResolvers {
+            etc: Some("nameserver 127.0.0.53\nnameserver 9.9.9.9\n".into()),
+            systemd_upstream: Some("nameserver 9.9.9.9\n".into()),
+        };
+        assert_eq!(
+            resolver_mount_source(false, &mixed),
+            Some(SYSTEMD_RESOLVED_UPSTREAM)
+        );
+        assert_eq!(
+            resolver_mount_source(
+                false,
+                &HostResolvers {
+                    etc: mixed.etc.clone(),
+                    systemd_upstream: None
+                }
+            ),
+            Some(HOST_RESOLV_CONF),
+            "partly routable still beats no resolver at all"
+        );
+
         // Host-dependent by construction — the production condition is "the host
-        // has a resolv.conf to bind", since runc refuses a mount with a missing
-        // source. Asserting the condition rather than the outcome keeps this
-        // honest on a machine that has no /etc/resolv.conf.
+        // has a usable resolver file to bind", since runc refuses a mount with a
+        // missing source. Asserting the condition rather than the outcome keeps
+        // this honest on a machine that has neither candidate.
         let pod = PodOptions {
             join_netns: Some("/var/run/netns/acct".into()),
             ..Default::default()
         };
         assert_eq!(
-            binds_resolver(&build_oci_spec_with(&spec, &[], None, &pod)),
-            std::path::Path::new("/etc/resolv.conf").exists()
+            binds_resolver(&build_oci_spec_with(&spec, &[], None, &pod)).as_deref(),
+            resolver_mount_source(false, &HostResolvers::read())
+        );
+    }
+
+    /// R893-B17. The env half of the collector contract is useless without
+    /// this: `YAH_SCRYER_SOCKET=/run/yah/scryer.sock` inside a container names
+    /// nothing at all unless the host socket is bound there.
+    #[test]
+    fn the_collector_socket_is_a_single_rw_file_bind() {
+        let pod = PodOptions {
+            collector_socket: Some((
+                "/run/yah/scryer.sock".into(),
+                "/run/yah/scryer.sock".into(),
+            )),
+            ..Default::default()
+        };
+        let oci = build_oci_spec_with(&test_spec("inner-door"), &[], None, &pod);
+        let mounts = oci["mounts"].as_array().unwrap();
+        let sock = mounts
+            .iter()
+            .find(|m| m["destination"] == "/run/yah/scryer.sock")
+            .expect("the collector socket must be bind-mounted into the container");
+        assert_eq!(sock["type"], "bind");
+        assert_eq!(sock["source"], "/run/yah/scryer.sock");
+        let opts: Vec<&str> = sock["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_str().unwrap())
+            .collect();
+        // `connect(2)` needs write permission on the socket inode; `ro` here
+        // would produce a reachable path that refuses every connection.
+        assert!(opts.contains(&"rw"), "a read-only socket bind cannot be connected to");
+        assert!(opts.contains(&"rbind"));
+        // The bind must NOT be the parent directory: /run/yah also holds
+        // UPGRADE_SHARE_ROOT, i.e. every workload's pingora upgrade socket.
+        assert!(
+            !mounts.iter().any(|m| m["destination"] == "/run/yah"),
+            "binding the socket's parent directory would expose UPGRADE_SHARE_ROOT"
+        );
+    }
+
+    #[test]
+    fn a_node_without_a_collector_gets_no_extra_mount() {
+        let oci = build_oci_spec_with(
+            &test_spec("inner-door"),
+            &[],
+            None,
+            &PodOptions::default(),
+        );
+        assert!(
+            !oci["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["destination"] == "/run/yah/scryer.sock")
         );
     }
 
@@ -1879,6 +2404,210 @@ mod tests {
             opts.contains(&"rw"),
             "pingora unlinks+rebinds the upgrade sock, so the dir must be writable"
         );
+    }
+
+    /// R870-F27 — the staging layout mirrors the container tree, so two files
+    /// sharing a basename cannot collide onto one host path.
+    #[test]
+    fn staged_spec_files_mirror_the_container_tree() {
+        let mut spec = test_spec("inner-door");
+        spec.files = vec![
+            workload_spec::InlineFile {
+                path: "/etc/passway/routes.json".into(),
+                content: "{}".into(),
+                mode: Some(0o600),
+            },
+            workload_spec::InlineFile {
+                path: "/etc/other/routes.json".into(),
+                content: "[]".into(),
+                mode: None,
+            },
+        ];
+        let planned = plan_spec_files(Path::new("/run/yah/kamaji/inner-door/files"), &spec).unwrap();
+        assert_eq!(
+            planned,
+            vec![
+                SpecFileMount {
+                    host_path: "/run/yah/kamaji/inner-door/files/etc/passway/routes.json".into(),
+                    container_path: "/etc/passway/routes.json".into(),
+                },
+                SpecFileMount {
+                    host_path: "/run/yah/kamaji/inner-door/files/etc/other/routes.json".into(),
+                    container_path: "/etc/other/routes.json".into(),
+                },
+            ],
+            "same basename in two directories must stage to two host paths"
+        );
+    }
+
+    /// A `.` component is dropped by path parsing rather than refused, and
+    /// both halves of the bind report the normalized path.
+    #[test]
+    fn a_dot_component_normalizes_rather_than_refusing() {
+        let mut spec = test_spec("inner-door");
+        spec.files = vec![workload_spec::InlineFile {
+            path: "/etc/./passway/routes.json".into(),
+            content: "{}".into(),
+            mode: None,
+        }];
+        let planned = plan_spec_files(Path::new("/run/yah/kamaji/inner-door/files"), &spec).unwrap();
+        assert_eq!(planned[0].container_path, "/etc/passway/routes.json");
+        assert_eq!(
+            planned[0].host_path,
+            "/run/yah/kamaji/inner-door/files/etc/passway/routes.json"
+        );
+    }
+
+    /// The path rule that is a security boundary, not tidiness: `dir.join()`
+    /// on a `..` component escapes the staging dir and has kamaji (root) write
+    /// wherever the spec points.
+    #[test]
+    fn a_traversing_or_relative_spec_file_path_is_refused() {
+        for bad in [
+            "/etc/../../../../root/.ssh/authorized_keys",
+            "/etc/passway/../../root/.ssh/authorized_keys",
+            "etc/passway/routes.json",
+            "",
+            "/",
+        ] {
+            let mut spec = test_spec("inner-door");
+            spec.files = vec![workload_spec::InlineFile {
+                path: bad.into(),
+                content: String::new(),
+                mode: None,
+            }];
+            assert!(
+                plan_spec_files(Path::new("/run/yah/kamaji/inner-door/files"), &spec).is_err(),
+                "{bad} must be refused, not staged"
+            );
+        }
+    }
+
+    /// The whole point of the ticket: the OCI spec a containerd deploy hands
+    /// runc carries one read-only file bind per declared spec file, and they
+    /// come after every other mount.
+    #[test]
+    fn staged_spec_files_become_trailing_read_only_file_binds() {
+        let pod = PodOptions {
+            shared_dir: Some((
+                "/run/yah/kamaji/inner-door/upgrade-a".into(),
+                "/run/passway".into(),
+            )),
+            spec_files: vec![SpecFileMount {
+                host_path: "/run/yah/kamaji/inner-door/files/etc/passway/routes.json".into(),
+                container_path: "/etc/passway/routes.json".into(),
+            }],
+            ..Default::default()
+        };
+        let oci = build_oci_spec_with(&test_spec("inner-door"), &[], None, &pod);
+        let mounts = oci["mounts"].as_array().unwrap();
+        let last = mounts.last().unwrap();
+        assert_eq!(
+            last["destination"], "/etc/passway/routes.json",
+            "spec files mount last so a parent mount cannot bury them"
+        );
+        assert_eq!(last["type"], "bind");
+        assert_eq!(
+            last["source"],
+            "/run/yah/kamaji/inner-door/files/etc/passway/routes.json"
+        );
+        let opts: Vec<&str> = last["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_str().unwrap())
+            .collect();
+        assert!(opts.contains(&"rbind"));
+        assert!(
+            opts.contains(&"ro"),
+            "the node rewrites these every deploy; a container write would be silently reverted"
+        );
+    }
+
+    /// A spec that declares no files adds no mounts — the field is `default`
+    /// on every pre-R870 spec, so this is the overwhelmingly common shape.
+    #[test]
+    fn no_spec_files_means_no_extra_mounts() {
+        let spec = test_spec("plain");
+        let before = build_oci_spec_with(&spec, &[], None, &PodOptions::default());
+        assert!(plan_spec_files(Path::new("/run/yah/kamaji/plain/files"), &spec)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            before["mounts"].as_array().unwrap().len(),
+            build_oci_spec_with(&spec, &[], None, &PodOptions::default())["mounts"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+    }
+
+    /// The staging directory is keyed by container id, so the two generations
+    /// of a graceful upgrade cannot overwrite each other's config.
+    #[test]
+    fn spec_files_hostdir_is_per_generation() {
+        assert_eq!(
+            spec_files_hostdir(&PodSlot::A.container_id("inner-door")),
+            Path::new("/run/yah/kamaji/inner-door/files")
+        );
+        assert_eq!(
+            spec_files_hostdir(&PodSlot::B.container_id("inner-door")),
+            Path::new("/run/yah/kamaji/inner-door.b/files")
+        );
+    }
+
+    /// `stage_spec_files` replaces the directory wholesale: a redeploy that
+    /// drops a file must not leave the previous deploy's copy behind, or a
+    /// later spec re-declaring that path races a stale inode.
+    #[tokio::test]
+    async fn staging_clears_the_previous_deploy_before_writing() {
+        let tmp = std::env::temp_dir().join(format!("kcc-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut spec = test_spec("inner-door");
+        spec.files = vec![
+            workload_spec::InlineFile {
+                path: "/etc/passway/routes.json".into(),
+                content: "first".into(),
+                mode: Some(0o600),
+            },
+            workload_spec::InlineFile {
+                path: "/etc/passway/gone.json".into(),
+                content: "stale".into(),
+                mode: None,
+            },
+        ];
+        let staged = stage_spec_files(&tmp, &spec).await.unwrap();
+        assert_eq!(staged.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&staged[0].host_path).unwrap(),
+            "first"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&staged[0].host_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "declared mode reaches the staged file");
+        }
+
+        let gone = staged[1].host_path.clone();
+        spec.files.pop();
+        spec.files[0].content = "second".into();
+        let restaged = stage_spec_files(&tmp, &spec).await.unwrap();
+        assert_eq!(restaged.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&restaged[0].host_path).unwrap(),
+            "second"
+        );
+        assert!(
+            !Path::new(&gone).exists(),
+            "a dropped spec file must not survive the redeploy"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2016,6 +2745,7 @@ mod tests {
             },
             target: "/usr/share/nginx/html".into(),
             read_only: true,
+            from_secret_mount: false,
         }];
         let oci = build_oci_spec(&spec, &[], None);
         let mounts = oci["mounts"].as_array().unwrap();

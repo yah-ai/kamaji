@@ -106,9 +106,126 @@ use serde::{Deserialize, Serialize};
 /// backend at all (unlike `native_exec`, already covered by
 /// [`crate::YubabaToKamaji::Capabilities`] / [`crate::NodeCapabilities`]).
 ///
+/// V10 (R850-T4) replaces the deploy ack. `AckKind::Deploy` is **removed** and
+/// [`crate::KamajiToYubaba::DeployAck`] answers
+/// [`crate::YubabaToKamaji::Deploy`] instead, carrying `hydrate:
+/// Option<String>` — the JSON line `turso-backup-hydrate` printed when
+/// hydrate-on-place restored the workload's volume, so a measured restore time
+/// reaches the recovery journal without an operator copying it out of a log.
+///
+/// This is the first bump in the list that is NOT a field appended to a struct,
+/// and it breaks the wire twice over, in two different ways worth naming
+/// separately. (a) The new reply is an appended *variant*, which would normally
+/// ride `#[non_exhaustive]` unbumped — but the rule that makes appended
+/// variants safe only covers a new peer sending an old one something it can
+/// still decode, and this replaces a reply an old peer expects: a V9 yubaba
+/// receiving `DeployAck` fails the frame *mid-deploy*, on the reply, after
+/// kamaji has already started the workload. (b) Deleting `AckKind::Deploy`
+/// renumbers every remaining [`crate::AckKind`] discriminant, so a V9 `Stop`
+/// ack decodes as `Probe` on a V10 peer and vice versa — a silent misread, not
+/// an error. Either alone earns the bump; (b) is the one that would have been
+/// easy to miss, because removing a variant looks like subtraction and postcard
+/// makes it renumbering.
+///
+/// V11 (R885-T6) carries **two** changes that had to ride one bump, which is
+/// the only reason this ticket waited on a sibling.
+///
+/// (a) `ResourceLimits::ephemeral_storage_mb` is **deleted** from
+/// [`workload_spec::WorkloadSpec`], which the `Deploy` frame carries. A field
+/// *removed* from a struct is the V2/V4/V5/V6/V8 situation run backwards and it
+/// is no safer for being subtraction: postcard is positional, so every byte
+/// after the hole shifts, and a V10 peer decoding a V11 spec misreads every
+/// field following `resources` — a wrong image or a wrong volume mount
+/// deployed, not an error. The field was deleted rather than kept because it
+/// **lied**: it documented itself as a cap on the writable layer, no backend
+/// ever enforced it as one, and its single live consumer read it as a floor.
+/// Its replacement is an annotation (`yah.limits.scratch-floor-mb`,
+/// [`workload_spec::WorkloadSpec::scratch_floor_mb`]), which costs no wire at
+/// all — the same trade [`workload_spec::WorkloadSpec::cpu_limit_millis`] made.
+///
+/// (b) [`crate::WorkloadState::OomKilled`] is **appended**, so kamaji can tell
+/// yubaba that a workload hit its `memory.max` rather than merely crashing.
+/// R885-F3 built that classification node-local and deliberately stopped at the
+/// UDS, leaving the upward report to this bump rather than spending a second
+/// one. On its own this half would be the *benign* kind of change — an appended
+/// variant on a `#[non_exhaustive]` enum, which only breaks a peer that is sent
+/// the new discriminant — but (a) is not benign, and once a bump is being spent
+/// the appended variant is free.
+///
 /// The blast radius is one node: this protocol runs over a node-local UDS, and
 /// yubaba and kamaji self-install as a pair, so the skew window is a restart
 /// rather than a rolling fleet upgrade.
+///
+/// V12 (R895-F1) **deletes** `netns_name` from [`crate::MeshAssignment`], which
+/// the `Deploy` frame carries. Same positional break as V11(a) run on a nested
+/// struct: postcard encodes every field, so a V11 peer decoding a V12
+/// `MeshAssignment` runs off the end of the assignment and into the frame's
+/// remaining bytes — and because the deleted field was the *last* one in the
+/// struct and typed `Option<String>`, the byte a V11 decoder reads as the
+/// option tag is whatever follows the assignment, which is a misread rather
+/// than a reliable error.
+///
+/// The field was deleted rather than repointed because **nothing ever set it**:
+/// both constructors ([`crate::MeshAssignment`]'s runtime twin `inlined`/`stub`)
+/// hardcoded `None`, no allocator, flag or config produced a name, and its two
+/// consumers — socket custody in `kamaji::containerd` and
+/// `kamaji::jit::JitRuntime::deploy_on_demand` — therefore always bound in the
+/// host namespace. It named a *yubaba-assigned per-workload WireGuard netns*,
+/// a thing W343's adopted data plane does not have: WireGuard stays strictly
+/// node-to-node and a workload's namespace is created node-locally by
+/// `kamaji::container_net`, which now names it. Socket custody takes that name
+/// from the site that created the namespace rather than deriving a second one.
+///
+/// Blast radius is the same one node as V11, for the same reason.
+///
+/// V13 (R896-F2) is **the bump that exists to stop most of the bumps above**,
+/// and it is the last one a field change should ever cost. The payload fields
+/// carrying a structure that accretes — `Workload` and `Option<MeshAssignment>`
+/// on [`crate::YubabaToKamaji::Deploy`], `Workload` on
+/// [`crate::YubabaToKamaji::GracefulUpgrade`]
+/// / [`crate::KamajiToYubaba::WorkloadDescription`], `Vec<WorkloadEntry>` on
+/// [`crate::KamajiToYubaba::WorkloadList`], `NodeCapabilities` on
+/// [`crate::KamajiToYubaba::CapabilitiesReport`] — now ride a length-prefixed
+/// JSON blob inside the frame rather than inline positional bytes
+/// ([`crate::tolerant`]). A peer one field behind matches by NAME and skips what
+/// it does not know, instead of consuming the wrong byte count and misreading
+/// every field after it.
+///
+/// R896-S1 classified every bump in this list: **seven of the last ten**
+/// (V2, V4, V5, V6, V8, V9, V11a) were byte-layout accidents this would have
+/// absorbed; V7, a retype, would have failed cleanly at the field instead of
+/// silently misdeploying; only V3 and V10 are semantic — a change in what an
+/// existing frame MEANS — where a handshake refusal is the right and only
+/// answer.
+///
+/// V12, landing beside this one, is an eighth of the same kind. It was not
+/// absorbed — V12 deleted a field from the positional `mesh` before anything
+/// wrapped it, so V12's own analysis stands. `Deploy.mesh` was wrapped
+/// afterwards, still inside V13 (no V13 binary had been released, and hotship's
+/// pairing guard means any node running one received it as a matched pair), so
+/// the next [`crate::MeshAssignment`] field change is free where V12's was not.
+///
+/// **The rule the V6 and V8 stanzas state is now scoped, not repealed.** It
+/// still holds verbatim for every field NOT wrapped: the frame header, the
+/// message enums, and the small control types. Those stay positional
+/// deliberately, and `Hello`/`Welcome` above all — a greeting a skewed peer
+/// cannot parse fails with a frame error instead of naming the two versions,
+/// which is the unreadable failure this enum exists to prevent. Leaving the
+/// greeting's bytes untouched is what keeps the refusal legible across V13.
+///
+/// So: **adding a field to a wrapped payload no longer needs a bump; adding one
+/// anywhere else still does.** What does still need a bump either way is a field
+/// whose absence would mean something the older peer does not already do —
+/// tolerance turns a loud break into a silent semantic skew, and only a default
+/// equal to the pre-field behaviour makes that safe. A deletion additionally
+/// needs the OLD peer's field to have carried `#[serde(default)]`, which is a
+/// property you cannot add retroactively.
+///
+/// Two consequences at the roll. `scripts/hotship.sh`'s pairing guard refuses a
+/// lone `--binaries yubaba` or `--binaries kamaji` across this bump, correctly —
+/// it is a paired ship. And [`crate::spec_digest`]'s basis moved with the
+/// encoding (domain prefix `v1` → `v2`), so every node reads its recorded
+/// digests as stale and redeploys everything once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ProtocolVersion {
@@ -121,6 +238,10 @@ pub enum ProtocolVersion {
     V7,
     V8,
     V9,
+    V10,
+    V11,
+    V12,
+    V13,
 }
 
 impl Default for ProtocolVersion {
@@ -131,5 +252,5 @@ impl Default for ProtocolVersion {
 
 impl ProtocolVersion {
     /// The version this build of `kamaji-proto` produces by default.
-    pub const CURRENT: Self = Self::V9;
+    pub const CURRENT: Self = Self::V13;
 }

@@ -74,13 +74,29 @@ impl OwnsClaim {
 }
 
 /// W159: `bootstrap` for tokens minted off a long-lived camp credential;
-/// `user-fresh` for tokens minted within N minutes of a passkey assertion.
+/// `user-fresh` for tokens minted within N minutes of a passkey assertion;
+/// `api-token` for a long-lived user API token (PAT, cheers R728-F1).
 /// Kamaji / downstream services MAY require `user-fresh` for specific ops.
+///
+/// **Must stay in sync with `cheers_core::AuthStrength`** — this is a
+/// deliberate copy (kamaji verifies cheers-minted tokens without depending on
+/// the cheers crates), and the two are joined only by the kebab-case wire
+/// strings. A variant cheers mints and this enum lacks does not degrade
+/// gracefully: serde fails the field, which fails the *whole* [`McpClaims`]
+/// deserialization, so the token is refused as malformed. Fail-closed, but
+/// indistinguishable from a forgery — add the variant here in the same breath
+/// as adding it there.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthStrength {
     Bootstrap,
     UserFresh,
+    /// A user API token: carries the user's identity and a subset of their
+    /// scopes, but no live ceremony stands behind it. Never treat it as
+    /// equivalent to [`UserFresh`](Self::UserFresh) — these are not ranked,
+    /// so an elevation check spells itself `matches!(s, UserFresh)` rather
+    /// than "at least".
+    ApiToken,
 }
 
 /// Principal kind, parsed from the `sub:` prefix.
@@ -160,6 +176,31 @@ mod tests {
         assert!(!owns.contains("service", "svc-zzz"));
         assert!(owns.contains("arch_doc", "doc-1"));
         // Round-trip preserves shape.
+        assert_eq!(serde_json::to_value(&c).unwrap(), wire);
+    }
+
+    /// A user API token (cheers R728-F1) must deserialize here, not merely
+    /// compile. Before the `ApiToken` variant existed, serde failed the
+    /// `auth_strength` field and took the whole claim set with it — every PAT
+    /// was refused as malformed. This pins the wire string, and pins that a
+    /// PAT is NOT `UserFresh`, which is the comparison every elevation check
+    /// on this side makes.
+    #[test]
+    fn api_token_strength_deserializes_and_is_not_user_fresh() {
+        let wire = json!({
+            "iss": "https://cheers.example",
+            "aud": "https://kamaji.example",
+            "exp": 1_700_000_900_i64,
+            "iat": 1_700_000_000_i64,
+            "jti": "01HPAT",
+            "sub": "user:alice",
+            "scope": ["cloud:read"],
+            "auth_strength": "api-token",
+        });
+        let c: McpClaims = serde_json::from_value(wire.clone()).expect("a PAT must parse");
+        assert_eq!(c.principal_kind(), Some(PrincipalKind::User));
+        assert_eq!(c.auth_strength, Some(AuthStrength::ApiToken));
+        assert_ne!(c.auth_strength, Some(AuthStrength::UserFresh));
         assert_eq!(serde_json::to_value(&c).unwrap(), wire);
     }
 

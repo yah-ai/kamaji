@@ -55,7 +55,10 @@ fn sleeper_spec(id: &str) -> WorkloadSpec {
     spec.resources = ResourceLimits {
         memory_mb: 64,
         cpu_millis: 250,
-        ephemeral_storage_mb: 64,
+        memory_request_mb: None,
+        cpu_limit_millis: None,
+        pids_max: None,
+        scratch_floor_mb: None,
     };
     spec
 }

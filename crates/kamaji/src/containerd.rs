@@ -21,6 +21,25 @@
 //! field in F1. Full WireGuard netns setup (creating a `wg0` interface inside
 //! the container netns) lands with the mesh module in R091-F6.
 //!
+//!
+//! @yah:ticket(R870-F27, "Containerd backend materializes WorkloadSpec::files so inner doors stop being native-only")
+//! @yah:status(review)
+//! @yah:at(2026-09-12T08:09:29Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R870)
+//! @yah:next("Tier: Warrior — the design is already decided by the R870 annotations; this is the implementation they name. Today only kamaji's native backend materializes WorkloadSpec::files; containerd/docker/microvm call reject_unmaterializable_files and refuse — correct refusal (a door started against an absent route table reports healthy and routes wrongly), wrong permanent state: it silently constrains every path-split service (inner doors, R870-F23) to native-capable nodes, a placement constraint hidden in a backend capability. Implement the write in the containerd backend — a pre-start write into the container rootfs or a per-file bind mount rendered from the spec — then narrow reject_unmaterializable_files to the backends that still cannot. Do NOT relax the guard without the write; the R870-F23 annotation in oss/yubaba/crates/cloud/src/config.rs (~:174) states that trade explicitly and is the provenance of this ticket — it was parked there as an unowned @yah:next, exactly the shape board doctrine says to file. Acceptance: an inner-door workload with an InlineFile route table deploys via the containerd backend and serves a routed request on a real node path, not a unit test of the file writer.")
+//! @yah:handoff("THE WRITE LANDED, in the shared core so BOTH containerd shapes get it. New surface in oss/kamaji/crates/kamaji-containerd-core/src/lib.rs: spec_files_hostdir(container_id) -> /run/yah/kamaji/<container_id>/files; SpecFileMount {host_path, container_path}; plan_spec_files(dir, spec) (pure, testable path rules); stage_spec_files(dir, spec) (async writes, returns the mount plan); discard_spec_files(container_id) (teardown). PodOptions gained spec_files: Vec<SpecFileMount>, and build_oci_spec_with renders one read-only FILE bind per entry. Per-FILE not per-directory on purpose: a directory bind at /etc/passway would replace whatever the image ships there, so adding one file would silently delete its siblings. Mounts are appended LAST because runc mounts in order and a spec file inside a directory the workload also mounts (a volume, the upgrade-sock share) has to land after its parent. Read-only because the node rewrites these on every deploy; a container edit would be reverted at an unpredictable moment, and EROFS at the write is the legible version of that.")
+//! @yah:handoff("CALL SITES, both of them, because there are two containerd deployment shapes and only fixing one is how R592-T1's drift came back: oss/kamaji/crates/kamaji/src/containerd.rs create_and_start (inlined) and oss/kamaji/crates/kamaji-bin/src/containerd.rs deploy_generation (sibling daemon). Each stages before building the OCI spec. The kamaji-bin one had NO guard at all before this — it neither wrote the files nor refused the spec, i.e. it was already in the silent-wrong-answer state reject_unmaterializable_files exists to prevent. DISCARD PLACEMENT IS LOAD-BEARING: in kamaji-bin it goes in the public teardown() and deliberately NOT in reap_container(), because reap_container also runs on the idempotent-redeploy path AFTER the incoming generation has been staged — discarding there would delete the files the deploy is about to mount. A redeploy needs no discard because stage_spec_files clears the directory itself before writing.")
+//! @yah:handoff("GUARD NARROWED, not relaxed. kamaji::Backend::materializes_files (oss/kamaji/crates/kamaji/src/lib.rs) is the new single fact: Native|Containerd true, Docker|MicroVm false. reject_unmaterializable_files reads it and returns Ok early for a writing backend, so the third state a per-call-site list allows — a backend that neither writes nor refuses, and therefore starts a workload against a file that is not there — is now unreachable by forgetting a call. The containerd call site was deleted rather than left as a no-op (pre-1.0: one owner of the fact). native.rs's negative test now uses Backend::Docker as the refusing stand-in and additionally asserts both writers accept, so the half that would otherwise rot into a guard nobody notices is pinned.")
+//! @yah:handoff("DISCOVERED WORK, wider than the title. (1) A PATH-TRAVERSAL HOLE that only becomes reachable with this ticket: WorkloadSpec documents files[].path as absolute but validate::shape never checks it, and dir.join(relative) with a `..` escapes the staging dir — so a spec naming /etc/../../../../root/.ssh/authorized_keys would have had kamaji (root, on a fleet node) overwrite an arbitrary host file. plan_spec_files refuses non-absolute paths, any `..`/prefix component, and bare `/`; a `.` is normalized rather than refused and BOTH halves of the bind report the normalized path. Test: a_traversing_or_relative_spec_file_path_is_refused. The native backend has the same hole and it is NOT closed here — it writes file.path straight to the host, so there the traversal target is the node filesystem directly. Worth a validate::shape rule so it is one refusal at admission instead of one per backend. (2) oss/kamaji/crates/kamaji-containerd-core/Cargo.toml: tokio gained the `fs` feature (was `time` only) for the staging writes. (3) oss/kamaji/crates/kamaji/src/containerd.rs:887 — a pre-existing clippy::useless_format in list()'s label filter, fixed. It was never in the recorded clippy baseline because every prior kamaji baseline ran --features native-integration, which does not compile containerd.rs.")
+//! @yah:verify("RUN BY ME, from oss/kamaji, on the final tree. cargo test -p kamaji-containerd-core --features containerd-integration = 44 passed / 0 failed (baseline 38; +6: staged_spec_files_mirror_the_container_tree, a_dot_component_normalizes_rather_than_refusing, a_traversing_or_relative_spec_file_path_is_refused, staged_spec_files_become_trailing_read_only_file_binds, no_spec_files_means_no_extra_mounts, spec_files_hostdir_is_per_generation, staging_clears_the_previous_deploy_before_writing). cargo test -p kamaji --features containerd-integration,native-integration --lib = 190 / 0. cargo test -p kamaji-bin --features containerd-integration --lib = 240 / 0. cargo check -p yubaba --features containerd-integration (from oss/yubaba, the only out-of-kamaji consumer of kamaji/containerd-integration) = Finished, exit 0. cargo zigbuild -p kamaji-bin --features containerd-integration,native-exec --target x86_64-unknown-linux-gnu --all-targets = Finished, exit 0, with only the pre-existing free_port dead_code that R876-B9 already records. CLIPPY on kamaji-containerd-core + kamaji with both features, --all-targets: one warning, the pre-existing too_many_arguments (9/7, jit.rs supervise_on_demand). RUSTFMT: --check is dirty tree-wide in this subtree (pre-existing, e.g. container_net.rs, microvm.rs, kamaji-bin/containerd.rs:657); zero diffs land inside any hunk of mine — I hand-applied my one and ran no blanket fmt.")
+//! @yah:verify("THE LIVE ACCEPTANCE THIS TICKET ASKS FOR IS NOT DONE, stated plainly rather than papered over with the unit tests. What is owed: an inner-door workload with an InlineFile route table, deployed through the containerd backend on a fleet node, serving a routed request. It cannot be reached from this Mac. There is no local containerd (no ~/.colima/default/containerd.sock, no /run/containerd/containerd.sock; docker here is OrbStack, which is the Docker backend and still refuses spec files by design). Starting colima --runtime containerd would give a real containerd but not a valid test: kamaji would stage under /run/yah/kamaji on the MAC while runc resolves the bind source inside the VM, so every file bind would miss — the same topology limit the existing shared_dir upgrade-sock mount already has, not a new constraint from this change. So the live leg needs a fleet node running these bytes, which means rolling an unreleased kamaji — an operator call, raised in chat.")
+//! @yah:gotcha("STAGED FILES ARE OWNED BY THE KAMAJI PROCESS, not by the container user. A bind mount preserves the host file's mode, so a spec pairing a restrictive mode (0o600) with a non-root user (spec.user = \"101\") produces a file the workload cannot read — it will look like a config bug. Left deliberately at parity with the native backend rather than chown'd: the two backends disagreeing about who owns a materialized file is a worse trap than the one a chown would fix, and it would add a root requirement on the deploy path.")
+//! @yah:cleanup("workload_spec::validate::shape has no rule for files[].path — it is documented absolute and never checked. plan_spec_files refuses the dangerous shapes at the containerd staging site, but the native backend writes file.path straight to the node filesystem with no check at all, so the traversal target there is the host directly. One admission-time rule would replace N per-backend refusals and catch it before a spec ever reaches a node.")
+//! @yah:verify("LIVE ACCEPTANCE DONE — us-east-001, real containerd, real runc, 2026-09-12. Operator authorised the paired hot ship. scripts/hotship.sh --nodes us-east-001,us-south-001,us-west-001 --binaries kamaji,yubaba shipped 0.8.40-h1 (kamaji sha256 47a44715b6f351294a583c1d96131677e0d4603e3d0ff928ab069aaa730f12dd, yubaba f280a9124a3d21694f659596a1f60f3bc7437c8f0d5214418da13a39648d7215); all three rejoined clustered with kamaji_version 0.8.40-h1, state_epoch 6. us-east-001's four natives came back (100.64.0.3:41507/:34759/:40995 all LISTEN). scripts/hotship-probe.sh across the whole ship: 125/125 HTTP 200 on the yah.dev apex, zero non-200. THE TEST: a throwaway container workload (nginxinc/nginx-unprivileged:alpine, user 101, yah.network=host, 127.0.0.1:18707) whose ENTIRE route table arrives as an InlineFile at /etc/nginx/conf.d/default.conf, plus a second InlineFile at /usr/share/nginx/html/r870f27.txt that the image does not ship. Results: GET /r870 -> 200 \"R870-F27 ROUTED OK\" (a route that exists only in the spec), GET /r870f27.txt -> 200 \"R870-F27 CREATED FILE OK\" (runc created a destination absent from the image — the assumption per-file binds rest on, now measured not reasoned). On-node: both files at /run/yah/kamaji/r870f27-filecheck/files/<container path> with mode 0644, and `ctr containers info` shows exactly two bind mounts with options [rbind, ro, nosuid, nodev] pointing at them. REDEPLOY replaced the staging tree (default.conf 222 -> 500 bytes after an edit). DESTROY (POST /workloads/<ident>/destroy) left /run/yah/kamaji/r870f27-filecheck absent — discard_spec_files, including the empty-parent remove_dir. nginx is a faithful stand-in for the inner door precisely because it comes up healthy either way: had the mount not landed it would have served its default page, which is the silent-wrong-answer outcome, so this is a discriminating test and not a liveness check.")
+//! @yah:gotcha("TWO THINGS THE LIVE RUN COST A PASS EACH, neither about spec files, both worth knowing before the next fleet acceptance. (1) `library/nginx` as root DIES on a yah container: `chown(\"/var/cache/nginx/client_temp\", 101) failed (Operation not permitted)` — a yah container holds CAP_NET_BIND_SERVICE and nothing else, and nginx-as-root chowns its temp dirs at startup. Use nginxinc/nginx-unprivileged + user = \"101\". That run still proved the mount, because nginx's entrypoint logged `can not modify /etc/nginx/conf.d/default.conf (read-only file system?)` — it was reading the bind. (2) `yah cloud workload deploy` was UNRUNNABLE from the repo root: it loads every .yah/services/*/mirrors/*.toml first, and a peer's in-flight .yah/services/scrabcake/mirrors/dev.toml carries a [providers.static] shape the installed yah binary cannot parse (\"data did not match any variant of untagged enum MirrorProviderSlot\"). Not mine to fix — their uncommitted Rust presumably accepts it. WORKAROUND that touches nothing: run the deploy with -p pointed at a scratch root holding an empty .yah/services and a symlink to the repo's .yah/infra.")
+//! @yah:cleanup("The three voters now run 0.8.40-h1, bytes that are on no CDN and match no release manifest — the hot ship's intended state, recorded here so it is not forgotten. That build also carries whatever was uncommitted in the tree at 2026-09-12T08:00Z, notably peers' in-flight yubaba reconciler work (mesofact_static.rs -963 lines, native_support.rs deleted, dev_door.rs / http_auth.rs / cloud-client coordinator.rs untracked) and R876-B17's env-refusal change. Operator accepted that explicitly when authorising the pair. Cut a real release before anyone depends on it.")
+//! @yah:handoff("Containerd materializes WorkloadSpec::files, so an inner door is no longer pinned to native-capable nodes. Staging + OCI rendering live in kamaji-containerd-core so both containerd shapes (kamaji inlined, kamaji-bin sibling) get it; the guard narrowed to Docker/MicroVm via the new Backend::materializes_files predicate rather than a per-call-site list. Verified locally (44+190+240 tests, Linux cross-compile, yubaba check) AND live on us-east-001 after a paired 0.8.40-h1 hot ship: a routed request served off a table that exists only in the spec, a file created at a path the image does not ship, redeploy replacing the staging tree, destroy removing it.")
 // Original ticket R091-F1 (status:review) lives in yubaba/src/runtime/mod.rs
 // — moved with the file but the @yah: annotation stays at the original source
 // so the board doesn't see a duplicate (one annotation per ID, R484-T2).
@@ -53,7 +72,7 @@ use tokio_stream::wrappers::LinesStream;
 use tokio_stream::StreamExt as TokioStreamExt;
 use workload_spec::{MeshIdent, WorkloadSpec};
 
-use crate::socket_custody::{self, SocketCustodian};
+use crate::socket_custody::SocketCustodian;
 use crate::{
     Backend, DeployResult, Kamaji, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
     RuntimeHealth, WorkloadState, WorkloadStatus,
@@ -111,6 +130,12 @@ pub struct ContainerdRuntime {
     /// socket is kamaji's property and outlives any single passway process.
     /// kamaji is the **sole** fd sender — passway never binds `:443` itself.
     custodian: Arc<SocketCustodian>,
+    /// This node's local `yah-scryer` ingestion socket, when one is configured
+    /// (R893-B17). A container has its own mount namespace, so this backend
+    /// both names the guest path in the workload's env and binds the host
+    /// socket there via [`kcc::PodOptions::collector_socket`]; doing either
+    /// without the other produces a workload pointed at nothing.
+    collector: crate::observe::Collector,
 }
 
 /// One container's restart history.
@@ -232,7 +257,18 @@ impl ContainerdRuntime {
             ledger: RestartLedger::new(),
             slots: Arc::new(Mutex::new(HashMap::new())),
             custodian: Arc::new(SocketCustodian::new()),
+            collector: crate::observe::Collector::disabled(),
         })
+    }
+
+    /// Point this backend's containers at the node's local collector
+    /// (R893-B17). The containerd twin of
+    /// [`crate::native::NativeRuntime::with_collector`] — same contract, and
+    /// the mount-namespace difference is handled inside
+    /// [`crate::observe::Collector`] rather than here.
+    pub fn with_collector(mut self, collector: crate::observe::Collector) -> Self {
+        self.collector = collector;
+        self
     }
 
     /// The container id currently backing `ident` — the bare ident until a
@@ -315,6 +351,13 @@ impl ContainerdRuntime {
         let rm_snap = with_namespace!(rm_snap, self.namespace);
         let _ = self.snapshots_client().remove(rm_snap).await;
 
+        // Drop this generation's staged `WorkloadSpec::files` (R870-F27).
+        // Nothing mounts them once the container is gone, but they are
+        // control-plane-derived config sitting on the node's disk, so they
+        // leave with the workload rather than accumulating one directory per
+        // dead generation.
+        kcc::discard_spec_files(container_id).await;
+
         // Drop any restart-loop bookkeeping for this container.
         self.ledger.forget(container_id);
 
@@ -353,33 +396,45 @@ impl ContainerdRuntime {
                 .await
                 .ok();
 
-        // Deployment env: the mesh IP (as before), the `PORT` / `PORT_<NAME>`
-        // contract (R844-T13), plus any caller extras (PASSWAY_UPGRADE on the
-        // incoming graceful-upgrade container).
+        // Deployment env: the mesh IP and the `PORT` / `PORT_<NAME>` contract
+        // (R844-T13), plus any caller extras (PASSWAY_UPGRADE on the incoming
+        // graceful-upgrade container).
         //
-        // A container gets its own network namespace, so the declared
-        // `expose.mesh.ports` *is* the bound port here — there is nothing to
-        // resolve, which is also why `DeployResult::ports` stays empty on this
-        // backend. Naming them through `name_anonymous_ports` anyway is what
-        // makes a workload read the same variable on a container as it does on
-        // the native backend, where the number really was allocated.
-        //
-        // Skipped where the spec already names the variable: `deploy_env` is
-        // applied *after* the spec's literal env (asserted by
-        // `oci_spec_injects_mesh_ip_after_literal_env`), so injecting
-        // unconditionally would make this the one backend where the contract
-        // overrides an explicit operator value instead of yielding to it.
-        let mut deploy_env = vec![format!("YAH_MESH_IP={}", mesh.mesh_ip)];
-        let spec_names: Vec<&str> = spec.env.iter().map(|e| e.name.as_str()).collect();
-        for (k, v) in crate::ports::port_env(&crate::declared_port_names(&spec.expose.mesh)) {
-            if !spec_names.contains(&k.as_str()) {
-                deploy_env.push(format!("{k}={v}"));
-            }
+        // The contract half is `crate::deploy_contract_env`, shared with
+        // kamaji-bin's containerd backend so the two cannot disagree about what
+        // a workload is told (R908-T1). It is applied *after* the spec's literal
+        // env (asserted by `oci_spec_injects_mesh_ip_after_literal_env`), and
+        // `DeployResult::ports` stays empty on this backend because a declared
+        // container port is already the bound one.
+        let mut deploy_env = crate::deploy_contract_env(spec, mesh.mesh_ip);
+        // R893-B17: the local collector. `env_for` does its own spec-wins
+        // filtering, so unlike the port block above this needs no skip here.
+        // MountNs::Own because the bind installed below is what makes the path
+        // it names resolve inside this container.
+        for (k, v) in self.collector.env_for(spec, crate::observe::MountNs::Own) {
+            deploy_env.push(format!("{k}={v}"));
         }
         deploy_env.extend(extra_env.iter().cloned());
 
+        // R870-F27: materialize `WorkloadSpec::files` for THIS generation and
+        // bind-mount each one in. Before the OCI spec is built, because the
+        // mounts are part of it, and before the container record exists, so a
+        // spec naming an unmaterializable path fails the deploy outright
+        // instead of leaving a half-created container behind.
+        let pod = kcc::PodOptions {
+            spec_files: kcc::stage_spec_files(&kcc::spec_files_hostdir(container_id), spec)
+                .await
+                .with_context(|| format!("staging spec files for {container_id}"))?,
+            // The other half of the env injected above (R893-B17) — set here
+            // rather than in `pod_options` so it reaches EVERY container this
+            // shape starts, including the graceful-upgrade generations that
+            // arrive with their own `pod`.
+            collector_socket: self.collector.guest_bind(),
+            ..pod.clone()
+        };
+
         // Build OCI spec (with pod placement) and wrap it as protobuf.Any.
-        let oci_spec = kcc::build_oci_spec_with(spec, &deploy_env, image_config.as_ref(), pod);
+        let oci_spec = kcc::build_oci_spec_with(spec, &deploy_env, image_config.as_ref(), &pod);
         let spec_bytes = serde_json::to_vec(&oci_spec).context("serializing OCI spec")?;
         let any_spec = prost_types::Any {
             type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
@@ -478,6 +533,7 @@ impl ContainerdRuntime {
             container_id: container_id.to_string(),
             mesh_ip: mesh.mesh_ip,
             task_pid,
+            hydrate: None,
             // R844-F2: a container gets its own network namespace, so its
             // declared `expose.mesh.ports` *is* the bound port — there is
             // nothing for this backend to resolve, and empty is the honest
@@ -549,20 +605,11 @@ impl ContainerdRuntime {
             // join_netns to a sandbox/pause container's netns path (deferred).
             join_netns: None,
             shared_dir: Some((host_dir.to_string_lossy().into_owned(), sock_dir)),
+            // `create_and_start` fills this from `stage_spec_files` — it is
+            // the only producer, and it knows the container id this
+            // generation stages under.
+            ..Default::default()
         })
-    }
-
-    /// The network namespace kamaji binds the custodial listener in. The F5
-    /// passway ingress is **host-networked**, so its listener lives in the host
-    /// netns (`None`) — the eternal custodian. An isolated-netns workload binds
-    /// inside its mesh netns so the fd is routable there; that path is
-    /// compile-checked here and E2E-owed (no in-tree isolated-netns passway).
-    fn custody_netns(spec: &WorkloadSpec, mesh: &MeshAssignment) -> Option<PathBuf> {
-        if spec.wants_host_network() {
-            None
-        } else {
-            mesh.netns_name.as_deref().map(socket_custody::netns_path)
-        }
     }
 
     /// Host-side path of the upgrade socket passway binds for `slot` — the
@@ -615,6 +662,15 @@ impl ContainerdRuntime {
     /// listen socket, starts passway in **upgrade mode** (so it never binds the
     /// address itself), and hands it the held fd. The started container lands in
     /// `slot` and becomes the live generation.
+    ///
+    /// The custodial listener is bound in the **host** netns, which is exactly
+    /// right for the F5 passway ingress — host-networked, and the only in-tree
+    /// custody consumer. A non-host-networked passway is refused rather than
+    /// quietly host-bound (R895-F1): this backend is the *inlined* shape, it
+    /// creates no network namespace of its own, and the namespace a workload
+    /// gets on a fleet node is created by [`crate::container_net`] on
+    /// `kamaji-bin`'s deploy path, which is where that custody bind lives. A
+    /// namespace nothing on this path created has no name this path may invent.
     async fn deploy_custody(
         &self,
         spec: &WorkloadSpec,
@@ -622,11 +678,19 @@ impl ContainerdRuntime {
         slot: kcc::PodSlot,
     ) -> Result<DeployResult> {
         let ident = spec.expose.mesh.identity.clone();
+        if !spec.wants_host_network() {
+            anyhow::bail!(
+                "passway custody workload {} is not host-networked; the inlined \
+                 containerd backend creates no network namespace, so it can only \
+                 bind the custodial listener in the host netns (isolated-netns \
+                 custody is wired on kamaji-bin's container_net deploy path)",
+                ident.0
+            );
+        }
         let bind_addr = kcc::passway_listen_addr(spec);
-        let netns = Self::custody_netns(spec, mesh);
 
-        // 1. kamaji binds the listen socket and holds the fd.
-        self.custody_bind_and_hold(&ident.0, &bind_addr, netns)
+        // 1. kamaji binds the listen socket (host netns) and holds the fd.
+        self.custody_bind_and_hold(&ident.0, &bind_addr, None)
             .await
             .with_context(|| format!("custody deploy of {}", ident.0))?;
 
@@ -753,11 +817,13 @@ impl ContainerdRuntime {
             // Failed, not a silent clean Stopped.
             3 if exit_status == 0 => WorkloadStatus::Stopped,
             3 => WorkloadStatus::Failed {
+                oom_killed: false,
                 reason: format!("exited with status {exit_status}"),
             },
             4 | 5 => WorkloadStatus::Stopping,
             1 => WorkloadStatus::Pending,
             _ => WorkloadStatus::Failed {
+                oom_killed: false,
                 reason: format!("unknown task status code {code}"),
             },
         }
@@ -783,10 +849,6 @@ impl Kamaji for ContainerdRuntime {
         // apply to a container instead of watching a named port silently fail
         // to appear in the service record.
         crate::reject_unresolved_ports(&spec.name, &spec.expose.mesh, crate::Backend::Containerd)?;
-
-        // R870-F23: same shape, for spec-carried config files this backend
-        // does not write. See `crate::reject_unmaterializable_files`.
-        crate::reject_unmaterializable_files(spec, crate::Backend::Containerd)?;
 
         // Host networking is a privileged escape hatch — it drops network
         // isolation so the container binds host ports directly. Guard it to the
@@ -856,7 +918,7 @@ impl Kamaji for ContainerdRuntime {
         let mut tasks = self.tasks_client();
 
         let req = ListContainersRequest {
-            filters: vec![format!("labels.\"yah.ident\"!=\"\"")],
+            filters: vec!["labels.\"yah.ident\"!=\"\"".to_string()],
         };
         let req = with_namespace!(req, self.namespace);
         let containers = ctrs
@@ -1273,7 +1335,7 @@ mod tests {
     use super::*;
     use workload_spec::{
         ExposeSpec, ImageRef, MeshExpose, Millis, NamespaceId, ResourceLimits, RestartPolicy,
-        SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+        StopPolicy, TenantId, TierTag, WorkloadSpec,
     };
 
     /// Returns `true` when a containerd socket is reachable. Used to skip
@@ -1284,7 +1346,6 @@ mod tests {
 
     fn test_spec(name: &str) -> WorkloadSpec {
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             image: ImageRef {
                 registry: "docker.io".to_string(),
@@ -1306,7 +1367,10 @@ mod tests {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -1327,6 +1391,7 @@ mod tests {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -1363,6 +1428,35 @@ mod tests {
             env.last().unwrap().as_str().unwrap(),
             "YAH_MESH_IP=10.64.0.9",
             "mesh ip must be appended after the spec's literal env vars"
+        );
+    }
+
+    /// R893-B17, same shape as the mesh-IP assertion above and for the same
+    /// reason: what needs pinning is the deploy-env this call site builds, not
+    /// `Collector` (which `observe`'s own tests cover).
+    ///
+    /// The container path, NOT the host path — `create_and_start` bind-mounts
+    /// the host socket at `GUEST_SOCKET_PATH`, so naming the host path here
+    /// would hand the workload a file that does not exist in its namespace.
+    #[test]
+    fn oci_spec_carries_the_collector_contract_as_the_container_sees_it() {
+        let spec = test_spec("svc");
+        let collector = crate::observe::Collector::at("/var/run/yah/scryer.sock");
+        let mut deploy_env = vec!["YAH_MESH_IP=10.64.0.9".to_string()];
+        for (k, v) in collector.env_for(&spec, crate::observe::MountNs::Own) {
+            deploy_env.push(format!("{k}={v}"));
+        }
+        let oci = kcc::build_oci_spec(&spec, &deploy_env, None);
+        let env: Vec<&str> = oci["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect();
+        assert!(env.contains(&"YAH_SERVICE_IDENT=svc"), "got {env:?}");
+        assert!(
+            env.contains(&"YAH_SCRYER_SOCKET=/run/yah/scryer.sock"),
+            "a container must read the guest path, never /var/run/yah/scryer.sock; got {env:?}"
         );
     }
 
@@ -1442,6 +1536,7 @@ mod tests {
         ledger.record_exit("c1", 1);
         let status = apply_ledger(
             WorkloadStatus::Failed {
+                oom_killed: false,
                 reason: "exit 1".into(),
             },
             ledger.get("c1"),

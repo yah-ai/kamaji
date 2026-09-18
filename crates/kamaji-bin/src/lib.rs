@@ -40,14 +40,18 @@
 
 pub mod audit;
 pub mod auth;
-pub mod cgroup;
+/// The cgroup v2 driver lives in the `kamaji` crate now (R885-B1) — it had to,
+/// because `kamaji-bin` depends on `kamaji` and the live native runtime is
+/// `kamaji::native::NativeRuntime`, so a driver homed here was permanently out
+/// of reach of the only path that runs workloads on the fleet. Re-exported
+/// under the old name so nothing outside has to care where it sits.
+pub use kamaji::cgroup;
 #[cfg(feature = "containerd-integration")]
 pub mod containerd;
 pub mod drain;
 /// R850-F1: run the declared restore before a stateful workload starts.
 pub mod hydrate;
 pub mod journal;
-pub mod native;
 pub mod pidfd;
 pub mod probe;
 pub mod server;
@@ -64,16 +68,24 @@ pub use auth::{
     OwnsClaim, VerifyError,
 };
 
-pub use cgroup::{CgroupError, CgroupHandle, CgroupV2, DEFAULT_SLICE_ROOT};
+pub use kamaji::cgroup::{CgroupError, CgroupHandle, CgroupV2, DEFAULT_SLICE_ROOT};
 pub use drain::{enforce_drain, DrainError, SIGKILL_SAFETY_WINDOW};
 pub use journal::{
     build_journal_payload, forward_reader, JournalSender, LogPriority, LogSink, Stream,
     JOURNALD_SOCKET, MAX_MESSAGE_LEN,
 };
-pub use native::{
-    spawn as spawn_native, LandlockAccess, LandlockPolicy, LandlockRule, NativeChild, SandboxPlan,
-    SpawnError, UserGroup,
-};
+/// R885-B11 deleted `kamaji_bin::native` — the `SandboxPlan` + fork/sync-pipe/
+/// `execvpe` spawner that carried `spawn_native`, `SandboxPlan`, `UserGroup`,
+/// `SpawnError` and the `Landlock*` types. It had been unreachable from any
+/// running binary since R406: the live native path is
+/// `kamaji::native::NativeRuntime`, built on `tokio::process::Child`. Its three
+/// boundary operations now live where that path can reach them —
+/// `kamaji::cgroup::CgroupHandle::attach_at_exec` (R885-B1/B10),
+/// `kamaji::sandbox::drop_caps_at_exec` (R885-B9) and
+/// `kamaji::sandbox::confine_fs_at_exec` (R885-B11) — each called from both
+/// `spawn_child` and `spawn_jit_child`. Nothing in or out of this crate used
+/// the re-exports; keeping a second fork path is what let the first one rot for
+/// two months.
 pub use pidfd::{pidfd_open, ExitEvent, PidfdError, PidfdReaper, PidfdReaperHandle};
 pub use probe::{run_probe, ProbeTarget};
 pub use server::{

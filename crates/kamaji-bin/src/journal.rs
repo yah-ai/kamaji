@@ -9,16 +9,26 @@
 //!
 //! ## Backends
 //!
-//! - **Native** (R406-T5/T6): [`crate::native::spawn`] creates pipes for
-//!   stdout and stderr in the parent before fork; the child dup2s the write
-//!   ends into fd 1 and 2 and the parent retains the read ends. Once the
-//!   native deploy path (R406-T8) lands, it spawns one [`forward_reader`]
-//!   per stream against the pipe.
+//! - **Native**: not a consumer of this module at all, and that is worth
+//!   stating because it used to be. The R406-T5 spawner this bullet described
+//!   (pipes in the parent, `dup2` in the child, one [`forward_reader`] per
+//!   stream) never reached a running binary and was deleted in R885-B11. The
+//!   live native path — `kamaji::native::spawn_child` — redirects the child's
+//!   fd 1 / 2 straight into `<state-dir>/<ident>/{stdout,stderr}.log` and
+//!   replays those files through its own `stream_logs`, so nothing forwards to
+//!   journald on that leg.
 //! - **Container** (R406-T9): [`crate::containerd::ContainerdBackend::deploy`]
 //!   creates FIFOs at predictable paths under `<log_base>/<namespace>/<id>/`
 //!   and points containerd's `CreateTaskRequest.stdout` / `.stderr` at them.
 //!   Kamaji opens the FIFOs with `O_RDWR` (keeps a writer side open so
 //!   EPOLLHUP doesn't fire on initial connect) and spawns forwarder tasks.
+//!   **The journal is this backend's only per-workload log** (R406-B14):
+//!   `sudo journalctl YAH_WORKLOAD_ID=<id>` (add `YAH_STREAM=stderr` to
+//!   narrow). No `stdout.log` is written beside the FIFOs; a relic one from a
+//!   pre-T10 kamaji is unlinked at deploy and the dir removed at teardown.
+//!   The inlined `kamaji::containerd` backend (desktop / yubaba's
+//!   `attach_runtime`) is different and does write `.log` files, which its
+//!   own `stream_logs` reads back.
 //!
 //! ## Sinks
 //!

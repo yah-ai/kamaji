@@ -16,7 +16,8 @@
 //! @yah:gotcha("Tier: Thief -- rote cross-file string rename of a single env-var token, no logic. The only care is atomicity across the 4 sites (binary reader + qed Dockerfile/script setters + service comment) so a deploy can't read one name while the image sets the other.")
 //!
 //! @yah:ticket(R605-T24, "Prove a real forge dispatch reaches a microVM guest through yubaba, closing the unproven half of F14's verify")
-//! @yah:at(2026-09-10T08:26:53Z)
+//! @yah:status(review)
+//! @yah:at(2026-09-11T00:46:43Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R605)
 //! @yah:verify("A forge dispatched through yubaba with the microvm annotation lands on us-west-003, boots a guest, and its artifacts appear under /var/lib/yah/qed/produced/<forge-id> on the host. That is the last unproven clause of R605-F14's verify criterion.")
@@ -27,6 +28,24 @@
 //! @yah:next("THE SERVICE-FLAG LEG IS DONE — R605-T15 LANDED IT 2026-09-10 AND THIS TICKET'S GATE IS OPEN. The retired next-step told you to do it and called it cheap; both corrections in the gotchas above were right and the leg turned out to need a rebuilt binary, a vmm_bin fix and a paired ship. What actually happened: us-west-003 now runs a tree build (0.8.38-h2) of yubaba+kamaji built WITH the microvm feature, and the backend is enabled through /etc/systemd/system/kamaji.service.d/10-microvm.conf setting Environment=KAMAJI_MICROVM_DIR=/var/lib/yah/kamaji/microvm — a drop-in, not an ExecStart edit, per the second correction. Verified by journal: 'microVM backend attached' at 23:27:20 with the right microvm_dir, both fatal strings absent, active with NRestarts=0 at +30s and +90s. There was never a pre-existing drop-in on that box (`systemctl show -p DropInPaths` was empty), which settles the unknown the gotcha flagged. Do NOT redo any of this.")
 //! @yah:next("SEQUENCE THE PROOF IN TWO STEPS SO A FAILURE HAS ONE CAUSE. This ticket's verify criterion is argv-level — a forge lands, a guest boots, artifacts appear under /var/lib/yah/qed/produced/<forge-id> — and needs NO compiler in the guest, so the currently deployed 0.8.38-h2 is sufficient for it. Prove THAT first: it isolates the one genuinely unproven question, which is whether a forge spec dispatched through yubaba with the microvm annotation reaches the node and selects the microVM backend at all. Only then consider shipping a newer pair to re-run it with a real build.")
 //! @yah:next("R605-F23 IS COMMITTED BUT NOT DEPLOYED, which matters if you want the stronger proof. 88533e01 added a third read-only drive carrying a 1166 MB Rust toolchain, folded into the guest overlay as a lower layer, with CARGO_HOME and TMPDIR defaulted onto the per-job scratch disk — so a guest booted from THAT tree can run a real cargo build, and one on us-west-003 already did (cargo 1.98.0 + rustc 1.98.0 + cc inside the guest, plus a live crates.io fetch over TLS). The kamaji RUNNING on the node predates it and still boots two-drive guests with no compiler. To prove a real BUILD forge step end to end you must first `scripts/hotship.sh --binaries yubaba,kamaji` from the current tree — NEVER kamaji alone, ProtocolVersion::CURRENT is V9 and a skewed pair fails every yubaba->kamaji call at connect with HandshakeRefused while still reporting active with NRestarts=0.")
+//! @yah:handoff("DONE, BOTH STEPS, ON REAL HARDWARE (us-west-003, 2026-09-11T00:20-00:40Z). STEP 1 — the dispatch path works and is now exercised by a checked-in recipe: new .yah/qed/microvm-dispatch-smoke.toml, step `identify-guest`, run as `yah qed run microvm-dispatch-smoke --where=node:us-west-003 --in-process`. The whole chain is live: a QedStep declaring runtime microvm resolves through execute_step_remote to TaskPlacement{Remote(node), MicroVm}, velveteen-exec's build_workload_spec/mark_microvm stamps yah.exec=microvm, yubaba admits and places it, and kamaji's deploy_container routes it to MicroVmRuntime. Proof at the far end is argv-level and cannot be faked by a container: the step asserts /proc/cmdline carries BOTH `virtio_mmio.device=` and `i8042.noaux`, which is the cmdline microvm.rs builds — a container shares the node's kernel and reads `BOOT_IMAGE=/boot/vmlinuz-6.12.107+deb13-amd64 root=/dev/mapper/yah-root ro quiet` instead. Guest kernel reads 6.1.187 against the node's 6.12.107+deb13-amd64. Journal: `microVM booted id=forge-<id>` then `microVM job finished status=Stopped`.")
+//! @yah:handoff("THE DISPATCH PATH WAS BROKEN AND THIS IS THE BUG IT WAS HIDING — kamaji could not WRITE the forge produced dir, so every microVM forge reported Failed after succeeding. Root cause: kamaji.service runs ProtectSystem=strict with ReadWritePaths=/sys/fs/cgroup /var/lib/yah/kamaji /var/lib/yah-cloud /run/yubaba — no /var/lib/yah/qed. The container backends never needed it because runc does their bind mount inside the container namespace and kamaji's own process never touches the host path; a guest cannot do that, so kamaji copies artifacts out after the guest halts (microvm::workspace::extract_disk) and THAT copy is a write by kamaji, to a path strict had made read-only. Measured failure: `cp: cannot create regular file '/var/lib/yah/qed/produced/<forge-id>/./guest-identity.txt': Read-only file system`. This is the THIRD round of the same EROFS failure — yubaba.service's own StateDirectory comment records R603-B6 (produced/) and R636-B1 (build-out/) and concludes that granting the ROOT is what stops a third round; it stopped a third round on yubaba's side only. FIXED in the tracked base unit app/yah/cli/resources/kamaji.service (ReadWritePaths gains /var/lib/yah/qed, StateDirectory becomes `yah/kamaji yah/qed`) and applied live on us-west-003 as /etc/systemd/system/kamaji.service.d/20-forge-state.conf — a drop-in, because both settings are list-valued and systemd APPENDS, so it adds the root without the re-declared-ExecStart trap. StateDirectory as WELL as ReadWritePaths because a ReadWritePaths entry that does not exist fails the whole mount namespace with 226/NAMESPACE, and that dir is absent on a node that has never run a forge. After the fix: active, NRestarts=0, ReadWritePaths and StateDirectory both show the appended value.")
+//! @yah:handoff("THAT BUG COST A DISK-FORENSICS PASS BECAUSE THE REASON WAS NEVER WRITTEN ANYWHERE, so the second fix is the one that makes the first findable. The microVM supervisor composes a careful reason string in all five of its terminal arms and then dropped every one of them on the floor: the reason travelled only inside WorkloadStatus::Failed, and runtime_state_to_entry flattens that to a bare `Failed` on the wire with no reason field, so the caller saw `status=Failed`, the node's journal said only `microVM booted` and `microVM torn down`, and the sentence explaining it existed nowhere. Added a terminal-status log at oss/kamaji/crates/kamaji/src/microvm.rs (end of the supervisor task, just before status_tx.send): `microVM job failed workload=<id> reason=<reason>` / `microVM job finished workload=<id> status=<status>`. INFO not WARN — a failing job is this backend's ordinary business. That line is what produced the cp/EROFS message above verbatim, within one run of shipping it; before it, three separate runs had to be characterised by reading console.log and the extracted workspace.out off the node by hand.")
+//! @yah:handoff("STEP 2 DONE TOO — a REAL BUILD, through the full dispatch path, not in process. Shipped the current tree first with `scripts/hotship.sh --nodes us-west-003 --binaries yubaba,kamaji` (the PAIR, never kamaji alone) as 0.8.38-h3, which is what put R605-F23's toolchain attach on the node: kamaji now logs `microVM guest toolchain image=/var/lib/yah/kamaji/microvm/toolchain.ext4 sha256=c23c534372d6acd7bad99309bf616cd39c49c5fc4e3c7744d9907dda793d83e3` at startup and the guest gets a fourth virtio device. Second pipeline step `build-in-guest` writes a crate into $TMPDIR (which kamaji-guest-init defaults onto the scratch DISK, not the overlay tmpfs) and runs cargo. Guest console, not an exit code: `cargo 1.98.0 (797e8a9bc 2026-08-05) | rustc 1.98.0 (88d9e12ae 2026-08-18) | cc (Debian 14.2.0-19) 14.2.0`, then `Updating crates.io index` -> `Downloaded itoa v1.0.18` -> `Compiling itoa` -> `Compiling guestbuild` -> `Finished release profile in 0.51s`, then the guest-built x86_64 binary is EXECUTED in the guest and its stdout asserted. The single `itoa` dependency is load-bearing, not decorative: resolving it forces a live registry index fetch and a crates.io download over the guest's TAP, so the step proves the network leg as well as the compiler.")
+//! @yah:gotcha("THE TOML TOKEN FOR THE THIRD SUBSTRATE WAS `micro_vm` AND NOTHING IN THE TREE EVER CALLED IT THAT — fixed here, and worth knowing because it is the first thing anyone authoring a microVM pipeline hits. TaskRuntime derives serde(rename_all = snake_case), which spells MicroVm as `micro_vm`, while every message an operator can reach says microvm: the qed runner's refusal (`step x declares runtime = microvm, which is remote-only`), velveteen_exec::local's (`runtime = microvm is remote-only`), admission's substrate rendering, and the annotation kamaji actually routes on (yah.exec = microvm). So writing the value the system tells you to write got `unknown variant 'microvm', expected one of 'native', 'container', 'micro_vm'` from the TOML parser, before any of those messages could be reached. RENAMED the variant to `microvm` (serde(rename) at oss/qed/crates/velveteen/src/lib.rs) rather than changing the messages, because the messages agree with the annotation and the annotation is the name of the thing; free to do, since `micro_vm` appeared in no pipeline, no persisted run record and no schema (check-schema-drift.sh still reports in sync). ALSO fixed the sibling gap it exposed: `yah qed run --runtime` was a hand-written match on native|container only, so the flag and the per-step TOML key disagreed about which substrates exist — microvm now parses there too (app/yah/cli/src/qed.rs), with remote-only-ness left to the runner's existing named refusal rather than duplicated.")
+//! @yah:verify("PASS ON REAL HARDWARE against a named baseline. BASELINE: before this ticket, zero forge dispatches had ever reached a microVM guest through yubaba — every R605 proof (F14 2 pass, F22 1 pass, F23 3 pass) drove MicroVmRuntime::deploy_workload in process on the node, and the first three dispatches attempted here FAILED (2 of them on the EROFS bug, 1 on my own wrong assertion). NOW: `yah qed run microvm-dispatch-smoke --where=node:us-west-003 --in-process` = 2 steps pass / 0 fail, run d6600e28-ed63-44e6-8940-082d55fd5640, re-run green after the runtime rename. THE TICKET'S OWN CRITERION MET LITERALLY, not inferred: a host-side poll watcher caught the artifacts in place mid-run at /var/lib/yah/qed/produced/68c3aa9f-2601-4bd5-8c0e-f41e7df4cae9/{guest-identity.txt (356B), dispatch-proof.txt (3B)} before yubaba's reap-on-destroy removed them — the window is ~1.4s, which is why a plain ls after the run always shows nothing. Regression suites unchanged and green: kamaji lib 115 passed / 0 failed (--features microvm-integration), velveteen + velveteen-exec 135 passed / 0 failed, camp_qed_admission_lanes 3 passed / 0 failed (the new pipeline satisfies the explicit-concurrency-key guard), check-schema-drift.sh in sync. yah-qed lib 983 passed / 1 failed — that one failure is tests::desktop_release_matrix_routes_each_row_to_its_own_platform, PRE-EXISTING and already documented as an R719-F7 gotcha on oss/qed/crates/qed/src/lib.rs (it loads `desktop-release`, which was renamed to `yah-desktop-release.toml` in commit 9e454f03); it is untouched by anything here.")
+//! @yah:gotcha("NODE STATE LEFT BEHIND, so nobody re-derives it. us-west-003 now runs yubaba+kamaji 0.8.38-h3 (hot ship from the working tree, NOT on the CDN, matches no release manifest) and carries TWO kamaji drop-ins: 10-microvm.conf (R605-T15, Environment=KAMAJI_MICROVM_DIR) and 20-forge-state.conf (this ticket, the ReadWritePaths/StateDirectory grant). The second becomes a redundant re-append once a roll carries the fixed base unit and is safe to delete then; the first is still the only thing enabling the backend. NOT DONE, and it is the one thing that would make this fix stick fleet-wide: the base-unit change has landed in the tree but no OTHER node has it, so the next node to run a microVM forge hits the identical EROFS failure until it is rolled. A published release carrying the microvm feature would also retire the hot ship — no published kamaji has it, which is why roll-node.sh is still fatal against this box.")
+//! @yah:handoff("LEADER SIGN-OFF (R605, session:d990eccb). THE LAST UNPROVEN CLAUSE OF R605-F14's VERIFY IS NOW CLOSED. Baseline: ZERO forge dispatches had ever reached a microVM guest through yubaba — F14, F22 and F23 all drove MicroVmRuntime in-process, so everything above kamaji was untested by construction. New .yah/qed/microvm-dispatch-smoke.toml runs 2 steps / 0 fail. Step 1 proves the yah.exec=microvm marker survives the full chain qed -> velveteen-exec -> yubaba -> kamaji, asserting on /proc/cmdline tokens A CONTAINER CANNOT FAKE — which matters, because the courier's FIRST predicate (/proc/1/comm == kamaji-guest-init) was wrong and passed for the wrong reason; it caught that itself and replaced it with something unfakeable. Step 2 runs a real cargo 1.98.0 build with a live crates.io fetch inside the guest and executes the resulting binary.")
+//! @yah:handoff("THE DISPATCH PATH WAS GENUINELY BROKEN AND THIS TICKET IS WHY WE KNOW. kamaji.service's ProtectSystem=strict never granted /var/lib/yah/qed, so kamaji's post-halt artifact copy-back failed with EROFS — and the failure was SILENT in the worst way: every successful microVM forge reported Failed with the reason dropped on the floor. A guest would boot, run, exit 0, produce artifacts, and yubaba would call it Failed. That is invisible to every in-process test F14/F22/F23 wrote, and it would have been blamed on the guest for a long time. Fixed in the tracked base unit plus a 20-forge-state.conf drop-in on the node (a drop-in that appends to list settings and CANNOT clobber ExecStart — the correct shape per R605-B26), and a terminal-status log added in microvm.rs so the reason is visible next time rather than swallowed.")
+//! @yah:handoff("SECOND DEFECT FIXED — A TOKEN MISMATCH BETWEEN CONFIG AND EVERY ERROR MESSAGE IN THE TREE. TaskRuntime::MicroVm serialised as 'micro_vm' while every doc, log line and error string says 'microvm', so an operator copying the token out of an error message into a pipeline TOML got a parse failure. Renamed via serde to 'microvm'. This is a breaking change to a config token and that is correct for a pre-1.0 workspace — the alternative was carrying an alias forever. The pipeline file was updated in the same pass and the whole chain re-verified end to end after the rename, not before.")
+//! @yah:handoff("PROCESS NOTE WORTH KEEPING, because it nearly corrupted a file: the courier ran `rg -r` believing it was a search flag. It is --replace. Earlier searches were rewriting OUTPUT rather than files, but the same reflex against a real path would have edited it. It caught this, verified the pipeline file was intact, and redid the search. Anyone reaching for `rg -r` to mean 'recursive' has the same bug.")
+//! @yah:handoff("SHARED-TREE DISCIPLINE HELD UNDER A LIVE COLLISION. A peer's in-flight change broke kamaji-proto mid-ticket; the courier checked ownership BEFORE touching anything, found @Ashguard:dove (session:1e4618c6) mid-edit and already running the check that surfaced it, verified its own changes in isolation while the peer landed theirs, and did not fix a peer's file. Separately it correctly attributed a yah-qed failure to the pre-existing R719-F7 desktop-release test (symptom recorded 2026-09-08) rather than to itself.")
+//! @yah:verify("ON REAL HARDWARE (us-west-003): .yah/qed/microvm-dispatch-smoke.toml = 2 steps / 0 fail, against a baseline of NEVER RUN — no forge dispatch had previously reached a microVM guest through yubaba at all.")
+//! @yah:verify("THE HOST-SIDE ARTIFACT WAS VERIFIED DIRECTLY, not inferred from an exit code: the copy-back -> reap window is only ~1.4s, so the courier ran a poll watcher during a live run to catch the artifact on the host under /var/lib/yah/qed/produced/<forge-id>. It also confirmed step 2's build genuinely COMPILED rather than no-op'ing from cache.")
+//! @yah:verify("REGRESSION SUITES GREEN: kamaji lib 115/115, velveteen 135/135, camp_qed_admission_lanes 3/3, schema in sync. The single yah-qed failure is the PRE-EXISTING R719-F7 desktop-release test, attributed and not caused here.")
+//! @yah:verify("UNCOMMITTED BY POLICY, not by omission. The camp git policy is 'defer', so the courier's changes sit in the working tree; e896d28a811c9815e22506d6994db27516815715 is the TREE ANCHOR it verified against, NOT a commit of its own work. Anyone diffing should not expect to find these changes in that SHA.")
+//! @yah:verify("CARRY THIS FORWARD: the ProtectSystem=strict fix landed BOTH in the tracked base unit and as a node drop-in. Any node that later gets the microVM backend needs the unit fix too, or it will reproduce the silent Failed-on-success behaviour. R605-T29 (the OVH voters) is the ticket that will hit this next.")
+//! @yah:gotcha("A SUCCESSFUL microVM FORGE COULD REPORT Failed WITH NO REASON ANYWHERE, and the mechanism is worth remembering even though it is fixed. kamaji.service's ProtectSystem=strict did not grant /var/lib/yah/qed, so the post-halt artifact copy-back hit EROFS; the guest had already booted, run, exited 0 and produced its artifacts. The terminal status was reported as Failed and the underlying reason was discarded rather than logged, so the evidence pointed at the guest while the fault was in the host unit's sandbox. Two lessons generalise past this fix: a systemd sandbox directive is part of a service's contract with the filesystem and belongs in the same review as the code that writes there, and a terminal-status path that drops its reason turns a one-line fix into a multi-session hunt. microvm.rs now logs the reason.")
 //!
 //! @yah:ticket(R605-B26, "No kamaji that exists anywhere is built with the microvm feature, so the entire microVM track is dead code on every node")
 //! @yah:status(review)
@@ -119,6 +138,18 @@ struct Args {
     /// declaring workload's state shipped to its store while it runs; `None`
     /// makes such a deploy fail loudly rather than run with nothing shipping.
     tail_helper: Option<PathBuf>,
+    /// Path of this node's `yah-scryer` ingestion socket (R893-B17). `Some`
+    /// makes every workload kamaji starts carry `YAH_SERVICE_IDENT` +
+    /// `YAH_SCRYER_SOCKET`, which is what arms `yah-log`'s service layer and
+    /// passway's span exporter; `None` leaves both unset and every workload
+    /// untraced, which is what every node did before that ticket.
+    ///
+    /// Opt-in rather than defaulted, for the reason
+    /// [`kamaji::observe::Collector::disabled`] gives: a workload pointed at a
+    /// socket nobody is listening on retries a refused connection forever,
+    /// which is worse than knowing it is untraced. Pair it with
+    /// `yah-scryer --ingest-socket <same path>`.
+    scryer_socket: Option<PathBuf>,
 }
 
 fn parse_args() -> std::result::Result<Args, ParseError> {
@@ -176,6 +207,17 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         std::env::var_os("KAMAJI_HYDRATE_HELPER").map(PathBuf::from);
     let mut tail_helper: Option<PathBuf> =
         std::env::var_os("KAMAJI_TAIL_HELPER").map(PathBuf::from);
+
+    // R893-B17: the node's local collector. Inheriting this from the
+    // environment is safe in the way KAMAJI_HYDRATE_HELPER is and the backend
+    // opt-ins are not — naming a socket grants kamaji no capability and starts
+    // no supervisor; it only changes what env a workload is handed. Named
+    // KAMAJI_* rather than YAH_SCRYER_SOCKET deliberately: the unprefixed name
+    // is what kamaji *emits* to its children, and a daemon that read the same
+    // variable it writes would silently self-propagate through any process
+    // tree that already had it set.
+    let mut scryer_socket: Option<PathBuf> =
+        std::env::var_os("KAMAJI_SCRYER_SOCKET").map(PathBuf::from);
 
     // R881-T3: container networking opt-in, same explicit-opt-in discipline as
     // the backends above. A supervisor must not start creating bridges and NAT
@@ -255,6 +297,13 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--tail-helper"))?,
                 );
             }
+            "--scryer-socket" => {
+                scryer_socket = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or(ParseError::MissingValue("--scryer-socket"))?,
+                );
+            }
             "--container-net" => {
                 container_net = Some(
                     iter.next()
@@ -294,6 +343,7 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         tail_helper,
         container_net,
         container_bridge,
+        scryer_socket,
     })
 }
 
@@ -312,7 +362,7 @@ fn print_help() {
         "Usage: kamaji [--socket PATH] [--containerd-socket PATH] [--docker | --docker-host URL]\n              \
          [--native-exec-dir PATH] [--microvm-dir PATH]\n              \
          [--tenant-passway-dir PATH] [--hydrate-helper PATH] [--tail-helper PATH]\n              \
-         [--container-net CIDR] [--container-bridge NAME]\n              \
+         [--container-net CIDR] [--container-bridge NAME] [--scryer-socket PATH]\n              \
          [--bundle-cache-dir PATH] [--bundle-origin URL] [--bundle-port PORT]"
     );
     println!();
@@ -349,6 +399,15 @@ fn print_help() {
     println!("                                the fleet's range is 10.128.0.0/9, see W343)");
     println!("      --container-bridge NAME   bridge those veths hang off (default:");
     println!("                                $KAMAJI_CONTAINER_BRIDGE, else yah0)");
+    println!("      --scryer-socket PATH      point every workload this node starts at the local");
+    println!("                                yah-scryer ingestion socket: each one is handed");
+    println!("                                YAH_SERVICE_IDENT (its mesh identity) and");
+    println!("                                YAH_SCRYER_SOCKET, which is what arms yah-log's");
+    println!("                                service layer and passway's span exporter. A");
+    println!("                                container gets the socket bind-mounted in and reads");
+    println!("                                the in-container path. Pair with");
+    println!("                                `yah-scryer --ingest-socket <same path>` (default:");
+    println!("                                $KAMAJI_SCRYER_SOCKET, else every workload is untraced)");
     println!("      --hydrate-helper PATH     restore a workload's named volume from its declared");
     println!("                                yah.durability.store before starting it, by running");
     println!("                                the turso-backup-hydrate binary at PATH (default:");
@@ -542,6 +601,25 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
     #[allow(unused_mut)]
     let mut ctx = kamaji_bin::ServerCtx::new().with_log_sink(log_sink.clone());
 
+    // R893-B17 — the deploy-time observability contract, resolved ONCE and
+    // handed to every backend below. One value, so a workload cannot learn
+    // whether it is traced from which backend happened to start it; that parity
+    // is the whole point of the ticket. The `#[allow]` is for builds that
+    // select no backend at all — then nothing reads it.
+    #[allow(unused_variables)]
+    let collector = kamaji::observe::Collector::from_option(args.scryer_socket.clone());
+    match &args.scryer_socket {
+        Some(path) => tracing::info!(
+            socket = %path.display(),
+            guest_path = kamaji::observe::GUEST_SOCKET_PATH,
+            "local collector configured; workloads get YAH_SERVICE_IDENT + YAH_SCRYER_SOCKET"
+        ),
+        None => tracing::debug!(
+            "no --scryer-socket; workloads start untraced (yah-log and passway both \
+             need YAH_SERVICE_IDENT + YAH_SCRYER_SOCKET before they emit anything)"
+        ),
+    }
+
     // ── containerd backend ───────────────────────────────────────────────────
     #[cfg(feature = "containerd-integration")]
     {
@@ -551,7 +629,8 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 .map_err(|e| {
                     anyhow::anyhow!("failed to connect to containerd at {}: {e}", sock.display())
                 })?
-                .with_log_sink(log_sink);
+                .with_log_sink(log_sink)
+                .with_collector(collector.clone());
             tracing::info!(
                 socket = %sock.display(),
                 "containerd backend attached"
@@ -608,7 +687,8 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 kamaji::docker::DockerRuntime::new()
             } else {
                 kamaji::docker::DockerRuntime::with_host(host.clone())
-            };
+            }
+            .with_collector(collector.clone());
             // Fail at startup, not on the first deploy: an operator who asked
             // for docker should learn immediately that the daemon is unreachable.
             let health = backend.health().await?;
@@ -664,7 +744,9 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 "native-exec backend attached; Container workloads marked yah.exec=native \
                  will be forked on this host"
             );
-            ctx.with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir)))
+            ctx.with_native_exec(Arc::new(
+                kamaji::native::NativeRuntime::new(dir).with_collector(collector.clone()),
+            ))
         } else {
             tracing::debug!(
                 "no --native-exec-dir; native-marked Container deploys will be refused"
@@ -695,7 +777,9 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 "per-tenant passway tier attached; each enrolled custom domain's TLS backend \
                  socket will be held here and forked on demand"
             );
-            ctx.with_tenant_passway(Arc::new(kamaji::jit::JitRuntime::new(dir)))
+            ctx.with_tenant_passway(Arc::new(
+                kamaji::jit::JitRuntime::new(dir).with_collector(collector.clone()),
+            ))
         } else {
             tracing::debug!("no --tenant-passway-dir; tenant-passway deploys will be refused");
             ctx
@@ -948,7 +1032,12 @@ async fn attach_bundle_backend(
     .context("building the read-only bundle origin store")?;
 
     let mut backend =
-        kamaji_bin::BundleBackend::new(std::sync::Arc::new(store), &cache_dir, &state_dir);
+        kamaji_bin::BundleBackend::new(
+            std::sync::Arc::new(store),
+            &cache_dir,
+            &state_dir,
+            kamaji::observe::Collector::from_option(args.scryer_socket.clone()),
+        );
     if let Some(port) = args.bundle_port {
         backend = backend.with_bind_port(port);
     }

@@ -50,7 +50,7 @@ mod imp {
     use kamaji::{MeshAssignment, WorkloadStatus};
     use workload_spec::{
         EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId,
-        ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+        ResourceLimits, RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
     };
 
     const PORT: &str = "127.0.0.1:39443";
@@ -290,7 +290,6 @@ mod imp {
     /// is expressed via env here (the real serve bin takes a CLI flag).
     fn jit_spec(name: &str, self_exe: &std::path::Path, _listen: &str) -> WorkloadSpec {
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
@@ -331,7 +330,10 @@ mod imp {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -352,6 +354,7 @@ mod imp {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
