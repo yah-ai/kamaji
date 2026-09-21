@@ -793,7 +793,21 @@ impl BundleBackend {
         std::fs::create_dir_all(&self.records_dir)?;
         std::fs::set_permissions(&self.records_dir, std::fs::Permissions::from_mode(0o700))?;
         let final_path = self.record_path(&WorkloadId::new(&record.id));
-        let tmp = self.records_dir.join(format!(".{}.json.tmp", record.id));
+        // R925 CONVERTED — `.{id}.json.tmp` was per-RECORD but not per-WRITER,
+        // which is a different and weaker thing. Every connection is handled on
+        // its own `tokio::spawn` (the accept loop), and nothing serializes two
+        // Deploys of the SAME workload id — a yubaba retry, or two controllers
+        // reconciling the same service, puts two handlers in here at once and
+        // both staged into the one file. Left hand-rolled rather than routed
+        // through `kamaji::atomic_file::write_atomic`: that helper writes with
+        // default permissions, and this record carries the deploy's `env`
+        // verbatim, which for the revalidate tier is live credential material
+        // (measured on us-east-001: `CLOUDFLARE_API_TOKEN` and two
+        // `MESOFACT_S3_*` keys, inline and in cleartext). Only the staging NAME
+        // is borrowed, so the 0600 reasoning below is untouched.
+        let tmp = kamaji::atomic_file::staging_path(
+            &self.records_dir.join(format!(".{}.json", record.id)),
+        );
         let bytes = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
         {
             let mut f = std::fs::OpenOptions::new()
@@ -802,14 +816,24 @@ impl BundleBackend {
                 .truncate(true)
                 .mode(0o600)
                 .open(&tmp)?;
-            // `.mode()` only applies when THIS call creates the file. A tmp
-            // left behind by an older kamaji that crashed mid-write is 0644
-            // and would be reused as-is, so tighten the open handle before any
-            // bytes land in it.
+            // `.mode()` only applies when THIS call creates the file, so it
+            // cannot be trusted alone on a path that might already exist —
+            // tighten the open handle before any bytes land in it. Since R925
+            // the staging name is unique per writer and this open effectively
+            // always creates, but the belt stays: it costs one syscall and it
+            // is what makes the 0600 claim true of the file rather than of the
+            // happy path.
             f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             f.write_all(&bytes)?;
         }
-        std::fs::rename(&tmp, &final_path)
+        // Remove the staging file if the rename fails. Load-bearing now that
+        // the name is unique per writer: nothing later reuses a leaked one, so
+        // without this they accumulate in `deploys/` without bound.
+        if let Err(e) = std::fs::rename(&tmp, &final_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Drop the record for `id` (R755-B5). Idempotent — a Stop for a workload
@@ -8044,9 +8068,10 @@ mod tests {
             let state = tempfile::tempdir().unwrap();
 
             // Pre-create the state an older kamaji leaves behind: a 0755 dir
-            // and a world-readable tmp from a crash mid-write. `.mode()` on
-            // OpenOptions does nothing when the file already exists, so this is
-            // the case that makes the explicit chmod load-bearing.
+            // and a world-readable tmp from a crash mid-write. Since R925 the
+            // staging name is unique per writer, so that file is no longer
+            // *reused* — it is simply never touched again, which is asserted
+            // below rather than assumed.
             let dir = state.path().join("deploys");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -8073,13 +8098,29 @@ mod tests {
             let written = dir.join("yah-marketing.json");
             assert_eq!(mode_of(&written), 0o600, "record must be 0600, not 0644");
             assert_eq!(mode_of(&dir), 0o700, "a pre-existing 0755 dir must be tightened");
-            assert!(!stale.exists(), "the tmp is renamed onto the final path, not left behind");
+
+            // R925: this write staged at its OWN name, so it left nothing
+            // behind, and it neither consumed nor published the older kamaji's
+            // stale tmp — a fixed staging name is exactly what let one writer's
+            // bytes be renamed into place by another.
+            let staged: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .filter(|n| n.to_string_lossy().contains(".json.tmp."))
+                .collect();
+            assert!(staged.is_empty(), "staging files left behind: {staged:?}");
+            assert_eq!(
+                std::fs::read(&stale).unwrap(),
+                b"stale",
+                "a predecessor's stale tmp is inert, never reused as this writer's staging file"
+            );
 
             // Restart-replay still works: same bytes back out.
             assert_eq!(backend.recorded_deploys(), vec![record.clone()]);
 
-            // And a second write over an existing 0600 record keeps it 0600
-            // (`.mode()` alone would not, since it does not create the tmp).
+            // And a second write over an existing 0600 record keeps it 0600.
+            // The mode rides in on the rename from a freshly created staging
+            // file, so an already-present final path never widens it.
             backend.record_deploy(&record).unwrap();
             assert_eq!(mode_of(&written), 0o600);
             assert_eq!(mode_of(&dir), 0o700);

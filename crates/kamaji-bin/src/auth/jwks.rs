@@ -166,6 +166,17 @@ impl JwksCache {
     /// Atomic persist: write to a sibling temp file, fsync, rename. A
     /// concurrent reader either sees the prior cache or the new one — never
     /// a torn key set.
+    ///
+    /// R925 CONVERTED — the staging file is per-writer, not per-path. Nothing
+    /// serializes two refreshes: [`AuthVerifier::refresh`] writes here *before*
+    /// it takes the `jwks` write lock, and it has two independent drivers — the
+    /// background ticker task and the kid-miss path. The kid-miss rate limiter
+    /// (`kid_miss_last`) suppresses concurrent *kid-misses* only; it does not
+    /// see the ticker, so a ticker refresh and a kid-miss refresh overlap
+    /// freely, and a fixed `jwks.json.tmp` was shared by both. A truncated
+    /// cache is not loud either: `load_from_disk` surfaces it as a parse error
+    /// that the boot path treats as "no cache", which turns a routine restart
+    /// into `BootFetchFatal` if the AS happens to be unreachable.
     pub async fn write_atomic(&self, path: &Path) -> Result<(), AuthError> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -191,12 +202,17 @@ impl JwksCache {
                 path: tmp.clone(),
                 source,
             })?;
-        tokio::fs::rename(&tmp, path)
-            .await
-            .map_err(|source| AuthError::Io {
+        // Remove the staging file if the rename fails. Load-bearing now that
+        // the name is unique per writer: a leaked one is never reused by a
+        // later refresh the way a fixed `jwks.json.tmp` was, so without this
+        // they accumulate beside the cache without bound.
+        if let Err(source) = tokio::fs::rename(&tmp, path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AuthError::Io {
                 path: path.to_path_buf(),
                 source,
-            })?;
+            });
+        }
         Ok(())
     }
 
@@ -220,15 +236,11 @@ struct StoredCache {
     last_refresh_secs: Option<u64>,
 }
 
+/// A staging path only this writer will use. Delegates to the kamaji crate so
+/// the port ledger, the deploy records and this cache share one disambiguation
+/// scheme rather than three that can drift (R925).
 fn tmp_sibling(path: &Path) -> std::path::PathBuf {
-    let mut tmp = path.to_path_buf();
-    let mut name = tmp
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("jwks.json"));
-    name.push(".tmp");
-    tmp.set_file_name(name);
-    tmp
+    kamaji::atomic_file::staging_path(path)
 }
 
 #[cfg(test)]
@@ -302,8 +314,16 @@ mod tests {
         let pubkey = [42u8; 32];
         let cache = JwksCache::from_doc(jwks_doc_with("ed-rt", &pubkey)).unwrap();
         cache.write_atomic(&path).await.unwrap();
-        // The .tmp sibling MUST be gone after rename succeeds.
-        assert!(!tmp.path().join("jwks.json.tmp").exists());
+        // The staging file MUST be gone after the rename succeeds. Asserted
+        // over the whole directory rather than against one literal name: since
+        // R925 the name carries a pid and a sequence number, so a leak would
+        // not land at any path this test could spell out.
+        let staged: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(staged.is_empty(), "staging files left behind: {staged:?}");
         let loaded = JwksCache::load_from_disk(&path).await.unwrap().unwrap();
         assert_eq!(loaded.get("ed-rt"), Some(&pubkey));
     }

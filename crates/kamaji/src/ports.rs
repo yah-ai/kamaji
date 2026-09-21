@@ -798,16 +798,24 @@ fn load(path: &Path) -> BTreeMap<PortKey, u16> {
     })
 }
 
+/// R925 CONVERTED — the staging file is per-writer, not per-path.
+///
+/// `self.reserved`'s `Mutex` serializes writers *within one `LedgerPorts`*, and
+/// that is not the same thing as one writer of `ports.json`. One kamaji process
+/// holds **two** distinct `LedgerPorts` values open on the same `state_dir` —
+/// `ServerCtx`'s `Arc<LedgerPorts>` and the `NativeRuntime`'s own field, which
+/// [`crate::native::NativeRuntime`]'s doc comment deliberately points at that
+/// same directory so the two backends cannot hand one number to two workloads.
+/// Each has its own `Mutex`, so nothing serializes them against each other, and
+/// both are driven from per-connection `tokio::spawn`ed request handlers. A
+/// fixed `ports.json.tmp` was therefore shared by two concurrent writers, and a
+/// half-written ledger does not fail loudly: `load` treats malformed JSON as
+/// "start empty", which silently reallocates every reserved port on the next
+/// restart — the exact failure this ledger exists to prevent.
 fn write_atomic(path: &Path, file: &LedgerFile) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create port-ledger dir {}", dir.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(file).context("serialize port ledger")?;
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
-    Ok(())
+    crate::atomic_file::write_atomic(path, &bytes)
+        .with_context(|| format!("write port ledger {}", path.display()))
 }
 
 /// Loopback, the address every non-mesh supervisor binds. Convenience for

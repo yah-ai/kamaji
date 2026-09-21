@@ -168,6 +168,13 @@ pub mod fake;
 /// `apply` function, so a build that cannot run `ip` can still reason about it.
 pub mod container_net;
 
+/// Write-then-rename staging that is per-writer rather than per-file (R925).
+/// Unconditional and dependency-free for the same reason [`ports`] is: it is
+/// used by this crate's port ledger and by `kamaji-bin`'s JWKS cache and deploy
+/// records, so a feature that could select it away would put the fix out of
+/// reach of two of the three sites it exists for.
+pub mod atomic_file;
+
 /// Listen-port allocation (R844-F2): the one contract the local (camp) and
 /// remote (kamaji) supervisors both answer through, so a workload that runs
 /// both ways does not learn its port from two mechanisms that can disagree.

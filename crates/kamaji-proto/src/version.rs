@@ -1,3 +1,15 @@
+//! @yah:ticket(R880-B1, "hotship's proto-skew guard compares the tree against the last RELEASE, not against what the node runs — so it passes on a hotshipped node and breaks the kamaji/yubaba pair")
+//! @yah:at(2026-09-18T16:34:26Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R880)
+//! @yah:severity(high)
+//! @yah:next("The guard reads proto_max() of the tree against proto_max() of the last `release v*` commit, on the stated assumption that \"the node's other half is on the released wire\". That assumption is false on any node carrying a hotship — the normal state of this fleet. us-west-002/003 ran kamaji 0.8.40-h4 (unreleased) while v0.8.40 had just been cut, so tree-proto == release-proto, the guard saw no bump and said nothing, and the node's h4 wire was older than both. Compare against the NODE: the script already probes each one and /health reports the other half's version.</next>\n<parameter name=\"assumes\">Recovery used here was to ship the other half (--binaries kamaji) and then restart yubaba by hand on each node. yubaba's KamajiClient connects ONCE at boot with a 30s budget and falls back permanently, so shipping kamaji alone does not re-pair. Whether `hotship --binaries kamaji` should also restart yubaba is undecided.</parameter>\n<parameter name=\"verify\">Point a tree whose kamaji_proto has moved past a node's hotshipped half at that node with --binaries yubaba; today the guard is silent. After the fix it must refuse and name the node.")
+//! @yah:gotcha("Hit for real 2026-09-18. `scripts/hotship.sh --nodes us-west-002,us-west-003 --binaries yubaba` passed the guard and broke the kamaji UDS on both nodes: kamaji logged `decode failed: postcard error: Serde Deserialization Error` once per retry, and yubaba fell back to its in-process containerd runtime with a single WARN. The only external symptom is that GET /health then OMITS kamaji_version entirely — easy to read as transient. This is the exact failure the guard's own R881-B7 comment predicts; the guard simply could not see it.")
+//! @arch:see(scripts/hotship.sh)
+//! @yah:verify("Point a tree whose kamaji_proto has moved past a node's hotshipped half at that node with --binaries yubaba; today the guard is silent. After the fix it must refuse and name the node.")
+//! @yah:assumes("Recovery used here was to ship the other half (--binaries kamaji) and then restart yubaba by hand on each node. yubaba's KamajiClient connects ONCE at boot with a 30s budget and falls back permanently, so shipping kamaji alone does not re-pair. Whether `hotship --binaries kamaji` should also restart yubaba is undecided.")
+
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bumped on any backward-incompatible change to the
