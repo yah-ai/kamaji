@@ -48,6 +48,8 @@ pub mod auth;
 pub use kamaji::cgroup;
 #[cfg(feature = "containerd-integration")]
 pub mod containerd;
+/// R755-B5 / R936-B11: deploy records that let a workload outlive kamaji.
+pub mod deploy_records;
 pub mod drain;
 /// R850-F1: run the declared restore before a stateful workload starts.
 pub mod hydrate;

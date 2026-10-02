@@ -72,14 +72,14 @@ tracing = "0.1"
 # `workload_spec::admission`. Not optional — deciding what is allowed to run
 # is kamaji's job description, and a build that could silently omit the
 # admission gate is a build an operator cannot tell apart from one that has it.
-workload-spec = { package = "yah-workload-spec", version = "0.8.41", features = ["admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.42", features = ["admission-verify"] }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.41", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.42", default-features = false }
 
 # SIGTERM for the native backend's graceful stop, and the `SIGKILL` sweep that
 # is `cgroup.rs`'s pre-5.14 fallback for `cgroup.kill` (R885-B4).
@@ -93,7 +93,7 @@ kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, 
 libc = "0.2"
 
 # Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
-kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.41" }
+kamaji-proto = { path = "../kamaji-proto", optional = true, version = "0.8.42" }
 
 # R918-T1 — the yah CLI reaches this crate for `ports::port_env` alone, so the
 # crate has to resolve on a Windows target even though every supervisor backend

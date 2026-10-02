@@ -85,6 +85,13 @@ pub use client::{fetch, fetch_at, ReadyOutcome, wait_ready};
 /// Environment variable naming the control socket a supervised process should
 /// bind. Absent → the process is not running under a supervisor that wants a
 /// control channel, and MUST NOT fail for its absence.
+///
+/// A value spelled `@name` names a Linux abstract-namespace socket rather than
+/// a file — the form yah's device provider hands an Android app, whose socket
+/// the host reaches through `adb forward tcp:N localabstract:name` (R941). An
+/// Android activity has no process environment to receive this in, so the
+/// supervisor delivers it as the intent string extra of the same name; the
+/// app passes it to [`serve_at`].
 pub const CONTROL_SOCK_ENV: &str = "YAH_CONTROL_SOCK";
 
 /// Conventional HTTP path for the status document on a process that already
@@ -302,6 +309,14 @@ pub fn control_sock_path() -> Option<PathBuf> {
         Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
         _ => None,
     }
+}
+
+/// The abstract-namespace name `path` spells, if it is `@name` (R941).
+///
+/// Recognised on every platform so the rule is one rule, but only Linux and
+/// Android bind it as abstract — see `serve::bind`.
+pub(crate) fn abstract_name(path: &Path) -> Option<&str> {
+    path.to_str()?.strip_prefix('@').filter(|n| !n.is_empty())
 }
 
 /// A leftover socket *file* makes `bind` fail with `EADDRINUSE` even when

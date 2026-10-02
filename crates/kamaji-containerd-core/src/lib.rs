@@ -1624,6 +1624,70 @@ pub fn build_oci_spec_with(
     })
 }
 
+/// Every `(destination, source)` pair an OCI spec's **bind** mounts name.
+///
+/// Read off the built spec rather than re-derived from the `WorkloadSpec`, so
+/// it cannot drift from [`build_oci_spec_with`]: a mount added there is
+/// enumerated here the same day. `tmpfs`/`proc`/`sysfs` mounts have no host
+/// source and are skipped.
+pub fn bind_mount_sources(oci_spec: &serde_json::Value) -> Vec<(String, String)> {
+    oci_spec["mounts"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m["type"] == "bind")
+        .filter_map(|m| {
+            Some((
+                m["destination"].as_str()?.to_string(),
+                m["source"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// The bind sources in `oci_spec` that do not exist on this host.
+///
+/// `Path::exists` follows symlinks, which is what `runc` does too — it
+/// `stat(2)`s the source, so a dangling symlink is as fatal as an absent file.
+pub fn missing_bind_sources(oci_spec: &serde_json::Value) -> Vec<(String, String)> {
+    bind_mount_sources(oci_spec)
+        .into_iter()
+        .filter(|(_, source)| !std::path::Path::new(source).exists())
+        .collect()
+}
+
+/// Refuse a deploy whose OCI spec names a bind source this host does not have.
+///
+/// **Call this before tearing the incumbent down.** `runc` checks the same
+/// thing at container-create time and fails with `bind mount source stat: no
+/// such file or directory` — by which point a destroy-then-create deploy has
+/// already destroyed. That is R932-B1: on 2026-09-22 the node's `yah-scryer`
+/// ingestion socket was missing (a systemd drop-in had dropped the
+/// `--ingest-socket` flag eleven days earlier), the collector bind kamaji
+/// injects into *every* container named it, and `noisetable-account` was torn
+/// down and could not be recreated. The mount was not in the workload's spec,
+/// so no amount of spec validation would have caught it; the host is the only
+/// place the answer lives.
+///
+/// The error names every missing source and the destination it was for, so an
+/// operator reads which mount to go fix rather than which container failed.
+pub fn check_bind_sources(oci_spec: &serde_json::Value) -> Result<(), String> {
+    let missing = missing_bind_sources(oci_spec);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let detail = missing
+        .iter()
+        .map(|(dest, source)| format!("{source} (for {dest})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "bind mount source missing on this host: {detail}. runc would refuse to create the \
+         container; nothing was torn down"
+    ))
+}
+
 #[cfg(test)]
 mod reap_tests {
     //! R854 — the reap loop's contract, exercised through [`TaskOps`] so it
@@ -2814,5 +2878,148 @@ mod tests {
         assert_eq!(env.len(), 2);
         assert_eq!(env[0].as_str().unwrap(), "FOO=bar");
         assert_eq!(env[1].as_str().unwrap(), "YAH_MESH_IP=10.64.0.1");
+    }
+
+    // ---- R932-B1: the bind-source preflight ----------------------------------
+
+    /// A path no host has. Absolute so it cannot be affected by the cwd the
+    /// test runner happens to have.
+    const ABSENT: &str = "/nonexistent/r932b1/definitely-not-here.sock";
+
+    #[test]
+    fn bind_mount_sources_skips_every_mount_that_has_no_host_source() {
+        let mut spec = test_spec("plain");
+        // A tmpfs volume beside a bind one, so the spec carries both shapes of
+        // the thing the filter has to tell apart.
+        spec.volumes = vec![
+            workload_spec::VolumeMount {
+                source: workload_spec::VolumeSource::Bind {
+                    host_path: std::env::temp_dir(),
+                },
+                target: "/data".into(),
+                read_only: false,
+                from_secret_mount: false,
+            },
+            workload_spec::VolumeMount {
+                source: workload_spec::VolumeSource::Tmpfs { size_mb: 8 },
+                target: "/scratch".into(),
+                read_only: false,
+                from_secret_mount: false,
+            },
+        ];
+        let oci = build_oci_spec(&spec, &[], None);
+        let binds = bind_mount_sources(&oci);
+
+        // /proc, /dev, /tmp, /dev/shm & co. are proc/tmpfs/sysfs mounts with a
+        // pseudo source; none of them may be handed to a `stat`.
+        let mounts = oci["mounts"].as_array().unwrap();
+        let bind_count = mounts.iter().filter(|m| m["type"] == "bind").count();
+        assert_eq!(binds.len(), bind_count, "every bind mount must be listed");
+        assert!(
+            bind_count < mounts.len(),
+            "the spec also has non-bind mounts, which must be skipped"
+        );
+        assert!(
+            binds.iter().any(|(dest, _)| dest == "/data"),
+            "the bind volume must be listed; got {binds:?}"
+        );
+        assert!(
+            !binds.iter().any(|(dest, _)| dest == "/scratch"),
+            "the tmpfs volume has no host source; got {binds:?}"
+        );
+    }
+
+    #[test]
+    fn check_bind_sources_passes_when_every_source_is_present() {
+        let mut spec = test_spec("present");
+        spec.volumes = vec![workload_spec::VolumeMount {
+            source: workload_spec::VolumeSource::Bind {
+                host_path: std::env::temp_dir(),
+            },
+            target: "/data".into(),
+            read_only: false,
+            from_secret_mount: false,
+        }];
+        let oci = build_oci_spec(&spec, &[], None);
+        assert_eq!(check_bind_sources(&oci), Ok(()));
+    }
+
+    /// The production failure, reproduced at the layer that can now refuse it:
+    /// the bind is one kamaji *injects*, so the workload's own spec is clean
+    /// and only the built mount plan knows the path.
+    #[test]
+    fn an_injected_collector_socket_that_is_missing_refuses_the_deploy() {
+        let pod = PodOptions {
+            collector_socket: Some((ABSENT.to_string(), "/run/yah/scryer.sock".to_string())),
+            ..Default::default()
+        };
+        let oci = build_oci_spec_with(&test_spec("noisetable-account"), &[], None, &pod);
+
+        let err = check_bind_sources(&oci).unwrap_err();
+        assert!(err.contains(ABSENT), "the host path must be named: {err}");
+        assert!(
+            err.contains("/run/yah/scryer.sock"),
+            "the destination must be named so the operator knows which mount: {err}"
+        );
+        assert!(
+            err.contains("nothing was torn down"),
+            "the message has to say the incumbent survived: {err}"
+        );
+
+        // And the same spec passes the moment the socket is there — the check
+        // is about the host, not about the shape of the mount.
+        let pod = PodOptions {
+            collector_socket: Some((
+                std::env::temp_dir().to_string_lossy().into_owned(),
+                "/run/yah/scryer.sock".to_string(),
+            )),
+            ..Default::default()
+        };
+        let oci = build_oci_spec_with(&test_spec("noisetable-account"), &[], None, &pod);
+        assert_eq!(check_bind_sources(&oci), Ok(()));
+    }
+
+    #[test]
+    fn a_declared_bind_volume_with_no_host_path_refuses_the_deploy() {
+        let mut spec = test_spec("declared");
+        spec.volumes = vec![workload_spec::VolumeMount {
+            source: workload_spec::VolumeSource::Bind {
+                host_path: ABSENT.into(),
+            },
+            target: "/data".into(),
+            read_only: true,
+            from_secret_mount: false,
+        }];
+        let oci = build_oci_spec(&spec, &[], None);
+        let err = check_bind_sources(&oci).unwrap_err();
+        assert!(err.contains(ABSENT), "{err}");
+        assert!(err.contains("/data"), "{err}");
+    }
+
+    #[test]
+    fn every_missing_source_is_named_not_just_the_first() {
+        let oci = serde_json::json!({
+            "mounts": [
+                { "destination": "/a", "type": "bind", "source": ABSENT },
+                { "destination": "/b", "type": "tmpfs", "source": "tmpfs" },
+                { "destination": "/c", "type": "bind", "source": "/nonexistent/r932b1/other" },
+            ]
+        });
+        let err = check_bind_sources(&oci).unwrap_err();
+        assert!(err.contains(ABSENT), "{err}");
+        assert!(err.contains("/nonexistent/r932b1/other"), "{err}");
+        assert!(
+            !err.contains("tmpfs"),
+            "a tmpfs mount has no host source to be missing: {err}"
+        );
+    }
+
+    #[test]
+    fn a_spec_with_no_mounts_at_all_is_not_an_error() {
+        assert_eq!(check_bind_sources(&serde_json::json!({})), Ok(()));
+        assert_eq!(
+            check_bind_sources(&serde_json::json!({ "mounts": [] })),
+            Ok(())
+        );
     }
 }

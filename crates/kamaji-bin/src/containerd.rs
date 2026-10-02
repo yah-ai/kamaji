@@ -93,7 +93,7 @@ use kamaji_containerd_core as kcc;
 use kamaji_proto::{WorkloadEntry, WorkloadId, WorkloadState};
 use thiserror::Error;
 use tokio::task::AbortHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use workload_spec::{EnvValue, WorkloadSpec};
 
 use crate::journal::{LogSink, Stream};
@@ -113,6 +113,17 @@ pub enum BackendError {
     /// env, etc.). Maps to `ErrorCode::InvalidSpec`.
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
+
+    /// A host precondition runc will check is not met — today, a bind mount
+    /// whose source path does not exist on this node (R932-B1). Distinct from
+    /// [`BackendError::InvalidSpec`] because the spec can be perfect and the
+    /// *node* be the thing that drifted, and distinct from
+    /// [`BackendError::Containerd`] because containerd was never asked.
+    ///
+    /// Raised only from checks that run **before** the incumbent generation is
+    /// torn down, so this error always means "nothing changed".
+    #[error("host precondition: {0}")]
+    HostPrecondition(String),
 
     /// Containerd refused or failed a syscall — connection dropped, image
     /// missing, task creation refused. Maps to `ErrorCode::BackendRefused`.
@@ -382,6 +393,20 @@ impl ContainerdBackend {
         // OCI spec — capabilities, mounts, namespaces, cgroup path, plus any
         // custody pod placement (shared upgrade-sock bind mount) and extra env.
         let oci_spec = kcc::build_oci_spec_with(spec, &extra_env, image_config.as_ref(), &pod);
+
+        // R932-B1: every bind mount's source must exist on this host, and this
+        // is the last moment at which learning otherwise is free — the reap
+        // below destroys the incumbent. runc checks the same thing when it
+        // creates the container, ~six steps later, with the previous generation
+        // already gone. Sited after the spec is built rather than over
+        // `spec.volumes` so it sees the mounts kamaji *injects* too, which is
+        // the class the production failure was in: the node's scryer socket.
+        if let Err(message) = kcc::check_bind_sources(&oci_spec) {
+            return Err(BackendError::HostPrecondition(format!(
+                "workload {container_id}: {message}"
+            )));
+        }
+
         let spec_bytes = serde_json::to_vec(&oci_spec)
             .context("serializing OCI spec")
             .map_err(BackendError::Containerd)?;
@@ -411,103 +436,316 @@ impl ContainerdBackend {
         // unlinks stale FIFOs / aborts prior forwarders — and, unlike the public
         // teardown, keeps any held custody socket so a custody redeploy /
         // graceful recycle doesn't drop kamaji's listener (R600-F9).
+        //
+        // R932-B1: snapshot the incumbent's containerd record FIRST. Everything
+        // between the reap and a live pid can still fail — a bad entrypoint in
+        // the replacement image only surfaces at task start — and until now such
+        // a failure left the node with nothing running under this id and no way
+        // back. The record carries the previous generation's OCI spec verbatim,
+        // which is all `restore_incumbent` needs to put it back.
+        let incumbent = self.incumbent_record(&container_id).await;
         let _ = self.reap_container(id).await;
 
-        ensure_fifo(&stdout_fifo)
-            .with_context(|| format!("mkfifo {}", stdout_fifo.display()))
-            .map_err(BackendError::Containerd)?;
-        ensure_fifo(&stderr_fifo)
-            .with_context(|| format!("mkfifo {}", stderr_fifo.display()))
-            .map_err(BackendError::Containerd)?;
+        let started: Result<u32, BackendError> = async {
+            ensure_fifo(&stdout_fifo)
+                .with_context(|| format!("mkfifo {}", stdout_fifo.display()))
+                .map_err(BackendError::Containerd)?;
+            ensure_fifo(&stderr_fifo)
+                .with_context(|| format!("mkfifo {}", stderr_fifo.display()))
+                .map_err(BackendError::Containerd)?;
 
-        retire_relic_logs(&log_dir).await;
+            retire_relic_logs(&log_dir).await;
 
-        let stdout_path = stdout_fifo.to_string_lossy().into_owned();
-        let stderr_path = stderr_fifo.to_string_lossy().into_owned();
+            let stdout_path = stdout_fifo.to_string_lossy().into_owned();
+            let stderr_path = stderr_fifo.to_string_lossy().into_owned();
 
-        // Spawn the journald forwarders BEFORE CreateTask: the shim opens
-        // the FIFOs' write ends *during task creation* with a plain O_WRONLY
-        // open, which blocks until a reader exists — with no forwarder yet,
-        // task creation deadlocks and containerd kills it at its deadline
-        // ("opening w/o fifo ... context deadline exceeded"; found live on
-        // us-east-001, first real-shim run of this path). The forwarders
-        // open their read end O_RDWR, so starting them early is safe: they
-        // simply idle until the shim connects. Tracking is inserted now so
-        // a failed create's redeploy tears the forwarders down via the
-        // idempotent teardown above.
-        let stdout_handle = spawn_forwarder(
-            self.log_sink.clone(),
-            id.clone(),
-            Stream::Stdout,
-            &stdout_fifo,
-        )?;
-        let stderr_handle = spawn_forwarder(
-            self.log_sink.clone(),
-            id.clone(),
-            Stream::Stderr,
-            &stderr_fifo,
-        )?;
+            // Spawn the journald forwarders BEFORE CreateTask: the shim opens
+            // the FIFOs' write ends *during task creation* with a plain O_WRONLY
+            // open, which blocks until a reader exists — with no forwarder yet,
+            // task creation deadlocks and containerd kills it at its deadline
+            // ("opening w/o fifo ... context deadline exceeded"; found live on
+            // us-east-001, first real-shim run of this path). The forwarders
+            // open their read end O_RDWR, so starting them early is safe: they
+            // simply idle until the shim connects. Tracking is inserted now so
+            // a failed create's redeploy tears the forwarders down via the
+            // idempotent teardown above.
+            let stdout_handle = spawn_forwarder(
+                self.log_sink.clone(),
+                id.clone(),
+                Stream::Stdout,
+                &stdout_fifo,
+            )?;
+            let stderr_handle = spawn_forwarder(
+                self.log_sink.clone(),
+                id.clone(),
+                Stream::Stderr,
+                &stderr_fifo,
+            )?;
+            {
+                let mut tracked = self.tracked.lock().expect("tracked mutex poisoned");
+                tracked.insert(
+                    id.clone(),
+                    WorkloadTracking {
+                        forwarders: vec![stdout_handle, stderr_handle],
+                        fifo_paths: vec![stdout_fifo.clone(), stderr_fifo.clone()],
+                    },
+                );
+            }
+
+            // Create the container record.
+            {
+                let mut ctrs = self.containers_client();
+                let labels = labels_for(spec, id, mesh_ip);
+                let container = Container {
+                    id: container_id.clone(),
+                    image: image_ref.clone(),
+                    runtime: Some(ContainerRuntime {
+                        name: "io.containerd.runc.v2".to_string(),
+                        options: None,
+                    }),
+                    spec: Some(any_spec),
+                    snapshotter: "overlayfs".to_string(),
+                    snapshot_key: container_id.clone(),
+                    labels,
+                    ..Default::default()
+                };
+                let req = CreateContainerRequest {
+                    container: Some(container),
+                };
+                let req = with_namespace!(req, self.namespace);
+                ctrs.create(req)
+                    .await
+                    .with_context(|| format!("creating container {container_id}"))
+                    .map_err(BackendError::Containerd)?;
+            }
+
+            // Prepare the rootfs snapshot from the image's committed layer chain.
+            // Without this the task gets an empty rootfs and runc can't exec the
+            // entrypoint (shared with the inlined shape via kamaji-containerd-core, R592-T1).
+            let rootfs_mounts = self
+                .prepare_rootfs(&container_id, &image_target_digest)
+                .await
+                .with_context(|| format!("preparing rootfs for {container_id}"))?;
+
+            // Create + start the task (the live execution instance).
+            //
+            // R854: via `create_task_reaping_stale`, so a task record that outlived
+            // the reap above (a shim slow to publish its exit) is torn down and the
+            // create retried once, rather than 500ing the deploy on "already
+            // exists" and leaving the workload down until an operator happens to
+            // redeploy a third time.
+            let pid = {
+                let mut tasks = self.tasks_client();
+                let req = CreateTaskRequest {
+                    container_id: container_id.clone(),
+                    rootfs: rootfs_mounts,
+                    stdin: String::new(),
+                    stdout: stdout_path,
+                    stderr: stderr_path,
+                    terminal: false,
+                    checkpoint: None,
+                    options: None,
+                    ..Default::default()
+                };
+                kcc::create_task_reaping_stale(&mut tasks, &self.namespace, req)
+                    .await
+                    .with_context(|| format!("creating task for {container_id}"))
+                    .map_err(BackendError::Containerd)?
+            };
+            {
+                let mut tasks = self.tasks_client();
+                let req = StartRequest {
+                    container_id: container_id.clone(),
+                    exec_id: String::new(),
+                };
+                let req = with_namespace!(req, self.namespace);
+                tasks
+                    .start(req)
+                    .await
+                    .with_context(|| format!("starting task for {container_id}"))
+                    .map_err(BackendError::Containerd)?;
+            }
+
+            // (Journald forwarders were spawned before CreateTask above — the
+            // shim's write-only FIFO open during task creation needs a live
+            // reader or it deadlocks.)
+            Ok(pid)
+        }
+        .await;
+
+        // R932-B1: the replacement did not come up. Put the generation we
+        // reaped back, so the outcome of a failed deploy is "the old version is
+        // still serving" rather than "nothing is". Reported either way — a node
+        // running a spec yubaba's registry no longer names is a divergence an
+        // operator has to know about, not a quiet success.
+        let pid = match started {
+            Ok(pid) => pid,
+            Err(e) => {
+                let Some(prev) = incumbent else {
+                    return Err(e);
+                };
+                return Err(match self
+                    .restore_incumbent(id, prev, &stdout_fifo, &stderr_fifo)
+                    .await
+                {
+                    Ok(pid) => {
+                        warn!(
+                            container_id = %container_id,
+                            pid = pid,
+                            error = %format!("{e:#}"),
+                            "kamaji: deploy failed; previous generation restored"
+                        );
+                        BackendError::Containerd(anyhow::anyhow!(
+                            "{e}; the previous generation of {container_id} was restored and is \
+                             running again as pid {pid} — this node is serving the PREVIOUS spec"
+                        ))
+                    }
+                    Err(restore_err) => {
+                        error!(
+                            container_id = %container_id,
+                            error = %format!("{restore_err:#}"),
+                            "kamaji: deploy failed AND the previous generation could not be restored"
+                        );
+                        BackendError::Containerd(anyhow::anyhow!(
+                            "{e}; restoring the previous generation of {container_id} also failed: \
+                             {restore_err:#} — nothing is running under this id"
+                        ))
+                    }
+                });
+            }
+        };
+
+        info!(
+            container_id = %container_id,
+            pid = pid,
+            image = %image_ref,
+            "kamaji: containerd workload deployed"
+        );
+        Ok(pid)
+    }
+
+    /// Containerd's own record for the generation currently running under
+    /// `container_id`, read immediately before a reap so a failed replacement
+    /// can be rolled back (R932-B1).
+    ///
+    /// `None` on any answer that is not a container — nothing running (the
+    /// first deploy of this id) and an unreadable containerd are both
+    /// "there is nothing to restore", and neither is a reason to refuse a
+    /// deploy that would otherwise proceed. The unreadable case is warned
+    /// about, because it silently removes the rollback the caller is counting
+    /// on.
+    async fn incumbent_record(&self, container_id: &str) -> Option<Container> {
+        let mut ctrs = self.containers_client();
+        let req = GetContainerRequest {
+            id: container_id.to_string(),
+        };
+        let req = with_namespace!(req, self.namespace);
+        match ctrs.get(req).await {
+            Ok(resp) => resp.into_inner().container,
+            Err(status) if status.code() == containerd_client::tonic::Code::NotFound => None,
+            Err(status) => {
+                warn!(
+                    container_id = %container_id,
+                    error = %status,
+                    "kamaji: cannot read the incumbent container record; a failed deploy \
+                     will have nothing to roll back to"
+                );
+                None
+            }
+        }
+    }
+
+    /// Put back the generation [`deploy_generation`](Self::deploy_generation)
+    /// reaped, after its replacement failed to come up (R932-B1).
+    ///
+    /// `prev` is containerd's own record, carrying the previous generation's
+    /// OCI spec, image and labels verbatim — so this reinstates exactly what
+    /// was running, not a re-derivation of it from a `WorkloadSpec` this node
+    /// may no longer have. The reap deleted three things (task, container
+    /// record, rootfs snapshot) and this redoes all three, plus the FIFOs and
+    /// journald forwarders, which the failed attempt's own cleanup may have
+    /// taken with it.
+    ///
+    /// The image digest is resolved afresh rather than reused from the caller:
+    /// the incumbent may be running a different image entirely from the one the
+    /// failed deploy was installing, and restoring the *new* image's rootfs
+    /// under the *old* spec is a worse outcome than a named failure.
+    async fn restore_incumbent(
+        &self,
+        id: &WorkloadId,
+        prev: Container,
+        stdout_fifo: &Path,
+        stderr_fifo: &Path,
+    ) -> Result<u32> {
+        let container_id = prev.id.clone();
+        let image_ref = prev.image.clone();
+
+        // The failed attempt rewrote this generation's staged
+        // `WorkloadSpec::files` (`stage_spec_files` clears the directory
+        // first), so a file the incumbent binds may no longer be on disk. Say
+        // so here, naming the path, rather than letting runc answer it with
+        // `bind mount source stat` after the record has been recreated.
+        if let Some(any) = &prev.spec {
+            if let Ok(oci) = serde_json::from_slice::<serde_json::Value>(&any.value) {
+                if let Err(message) = kcc::check_bind_sources(&oci) {
+                    anyhow::bail!("the previous generation can no longer be mounted: {message}");
+                }
+            }
+        }
+
+        let digest = kcc::resolve_image_target_digest(&self.channel, &self.namespace, &image_ref)
+            .await
+            .with_context(|| {
+                format!("resolving image {image_ref} to restore {container_id}")
+            })?;
+
+        // Clear whatever half-built state the failed attempt left under this
+        // id — a container record with no task is the common shape.
+        let _ = self.reap_container(id).await;
+
+        ensure_fifo(stdout_fifo)
+            .with_context(|| format!("mkfifo {}", stdout_fifo.display()))?;
+        ensure_fifo(stderr_fifo)
+            .with_context(|| format!("mkfifo {}", stderr_fifo.display()))?;
+        let stdout_handle =
+            spawn_forwarder(self.log_sink.clone(), id.clone(), Stream::Stdout, stdout_fifo)?;
+        let stderr_handle =
+            spawn_forwarder(self.log_sink.clone(), id.clone(), Stream::Stderr, stderr_fifo)?;
         {
             let mut tracked = self.tracked.lock().expect("tracked mutex poisoned");
             tracked.insert(
                 id.clone(),
                 WorkloadTracking {
                     forwarders: vec![stdout_handle, stderr_handle],
-                    fifo_paths: vec![stdout_fifo.clone(), stderr_fifo.clone()],
+                    fifo_paths: vec![stdout_fifo.to_path_buf(), stderr_fifo.to_path_buf()],
                 },
             );
         }
 
-        // Create the container record.
         {
             let mut ctrs = self.containers_client();
-            let labels = labels_for(spec, id, mesh_ip);
-            let container = Container {
-                id: container_id.clone(),
-                image: image_ref.clone(),
-                runtime: Some(ContainerRuntime {
-                    name: "io.containerd.runc.v2".to_string(),
-                    options: None,
-                }),
-                spec: Some(any_spec),
-                snapshotter: "overlayfs".to_string(),
-                snapshot_key: container_id.clone(),
-                labels,
-                ..Default::default()
-            };
             let req = CreateContainerRequest {
-                container: Some(container),
+                container: Some(prev),
             };
             let req = with_namespace!(req, self.namespace);
             ctrs.create(req)
                 .await
-                .with_context(|| format!("creating container {container_id}"))
-                .map_err(BackendError::Containerd)?;
+                .with_context(|| format!("recreating container {container_id}"))?;
         }
 
-        // Prepare the rootfs snapshot from the image's committed layer chain.
-        // Without this the task gets an empty rootfs and runc can't exec the
-        // entrypoint (shared with the inlined shape via kamaji-containerd-core, R592-T1).
         let rootfs_mounts = self
-            .prepare_rootfs(&container_id, &image_target_digest)
+            .prepare_rootfs(&container_id, &digest)
             .await
-            .with_context(|| format!("preparing rootfs for {container_id}"))?;
+            .with_context(|| format!("re-preparing rootfs for {container_id}"))?;
 
-        // Create + start the task (the live execution instance).
-        //
-        // R854: via `create_task_reaping_stale`, so a task record that outlived
-        // the reap above (a shim slow to publish its exit) is torn down and the
-        // create retried once, rather than 500ing the deploy on "already
-        // exists" and leaving the workload down until an operator happens to
-        // redeploy a third time.
         let pid = {
             let mut tasks = self.tasks_client();
             let req = CreateTaskRequest {
                 container_id: container_id.clone(),
                 rootfs: rootfs_mounts,
                 stdin: String::new(),
-                stdout: stdout_path,
-                stderr: stderr_path,
+                stdout: stdout_fifo.to_string_lossy().into_owned(),
+                stderr: stderr_fifo.to_string_lossy().into_owned(),
                 terminal: false,
                 checkpoint: None,
                 options: None,
@@ -515,8 +753,7 @@ impl ContainerdBackend {
             };
             kcc::create_task_reaping_stale(&mut tasks, &self.namespace, req)
                 .await
-                .with_context(|| format!("creating task for {container_id}"))
-                .map_err(BackendError::Containerd)?
+                .with_context(|| format!("recreating task for {container_id}"))?
         };
         {
             let mut tasks = self.tasks_client();
@@ -528,20 +765,9 @@ impl ContainerdBackend {
             tasks
                 .start(req)
                 .await
-                .with_context(|| format!("starting task for {container_id}"))
-                .map_err(BackendError::Containerd)?;
+                .with_context(|| format!("restarting task for {container_id}"))?;
         }
 
-        // (Journald forwarders were spawned before CreateTask above — the
-        // shim's write-only FIFO open during task creation needs a live
-        // reader or it deadlocks.)
-
-        info!(
-            container_id = %container_id,
-            pid = pid,
-            image = %image_ref,
-            "kamaji: containerd workload deployed"
-        );
         Ok(pid)
     }
 

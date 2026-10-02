@@ -435,6 +435,13 @@ impl ContainerdRuntime {
 
         // Build OCI spec (with pod placement) and wrap it as protobuf.Any.
         let oci_spec = kcc::build_oci_spec_with(spec, &deploy_env, image_config.as_ref(), &pod);
+        // R932-B1: the full mount plan, now that `spec_files` and any custody
+        // `shared_dir` are staged. `deploy_workload` already ran this over the
+        // host-provided subset before the teardown; this one closes the gap
+        // between that check and what runc will actually be handed.
+        if let Err(message) = kcc::check_bind_sources(&oci_spec) {
+            anyhow::bail!("workload {container_id}: {message}");
+        }
         let spec_bytes = serde_json::to_vec(&oci_spec).context("serializing OCI spec")?;
         let any_spec = prost_types::Any {
             type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
@@ -884,6 +891,33 @@ impl Kamaji for ContainerdRuntime {
         // names a trust decision, and neither should have side effects.
         workload_spec::admission::check(spec)
             .map_err(|e| anyhow::anyhow!("workload {} not admitted: {e}", spec.name))?;
+
+        // R932-B1: refuse a spec whose bind mounts name a host path this node
+        // does not have, BEFORE the teardown below destroys the incumbent.
+        // runc checks the same thing at container-create time, by which point
+        // the previous generation is already gone — that is the shape that took
+        // `noisetable-account` down on 2026-09-22, over a mount kamaji injects
+        // rather than one the workload declared.
+        //
+        // Built through `build_oci_spec_with` rather than read off
+        // `spec.volumes` so the injected mounts are included and the check
+        // cannot drift from the real mount plan. The throwaway `PodOptions`
+        // carries only the collector bind: `spec_files` and the custody
+        // `shared_dir` are staged by the deploy itself a few steps from now, so
+        // they do not exist yet and must not be checked yet. `create_and_start`
+        // re-runs the check against the *real* spec once they do.
+        let preflight = kcc::build_oci_spec_with(
+            spec,
+            &[],
+            None,
+            &kcc::PodOptions {
+                collector_socket: self.collector.guest_bind(),
+                ..Default::default()
+            },
+        );
+        if let Err(message) = kcc::check_bind_sources(&preflight) {
+            anyhow::bail!("workload {}: {message}", spec.expose.mesh.identity.0);
+        }
 
         // Idempotent redeploy: reap any prior generation(s) — BOTH pod slots —
         // reset the slot cell, and release any held custody listen socket.

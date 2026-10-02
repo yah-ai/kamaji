@@ -576,6 +576,24 @@ fn run() -> Result<()> {
             let n = ctx.resume_bundle_workloads().await;
             tracing::info!(resumed = n, "recorded bundle deploys replayed (R755-B5)");
         }
+        // R936-B11: and every native-exec deploy that asked to outlive kamaji
+        // (a front door's inner door). Before the tail re-arm below, so a
+        // resumed workload is running by the time tails look for it.
+        #[cfg(feature = "native-exec")]
+        {
+            let n = ctx.resume_native_workloads().await;
+            tracing::info!(resumed = n, "recorded native deploys replayed (R936-B11)");
+        }
+        // R932: and re-arm the durability tail of every container workload that
+        // is still running here. The bundle resume above brings workloads BACK;
+        // this one reattaches to workloads that never left — a container
+        // outlives kamaji, so after a restart it keeps serving with nothing
+        // shipping its state until something re-arms the tail. Nothing did
+        // until this line: `tail::spawn`'s only caller was the Deploy handler.
+        {
+            let n = kamaji_bin::tail::resume(&ctx).await;
+            tracing::info!(rearmed = n, "durability tails re-armed after restart (R932)");
+        }
         kamaji_bin::serve_with_ctx(&args.socket, ctx, async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -747,6 +765,9 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
             ctx.with_native_exec(Arc::new(
                 kamaji::native::NativeRuntime::new(dir).with_collector(collector.clone()),
             ))
+            .with_native_deploy_records(kamaji_bin::deploy_records::NativeDeployRecords::under(
+                dir,
+            ))
         } else {
             tracing::debug!(
                 "no --native-exec-dir; native-marked Container deploys will be refused"
@@ -844,6 +865,22 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
              than run with nothing shipping its state"
         );
     }
+
+    // ── durability credentials, per bucket (R936-B13) ────────────────────────
+    // Names only are logged. A bare S3_ACCESS_KEY is no longer read by anyone:
+    // it is the node-wide pair this replaced, and a node still carrying one is
+    // a node whose drop-ins were not migrated, so say so loudly.
+    let creds = kamaji_bin::hydrate::BucketCredentials::from_env();
+    let names: Vec<&str> = creds.names().collect();
+    tracing::info!(vars = ?names, "durability credentials (per bucket)");
+    if std::env::var_os("S3_ACCESS_KEY").is_some() || std::env::var_os("S3_SECRET_KEY").is_some() {
+        tracing::warn!(
+            "S3_ACCESS_KEY/S3_SECRET_KEY are set in kamaji's environment and IGNORED: durability \
+             helpers get S3_ACCESS_KEY__<BUCKET>/S3_SECRET_KEY__<BUCKET> for their own bucket \
+             only (R936-B13). Rename the drop-in's variables."
+        );
+    }
+    ctx = ctx.with_durability_credentials(creds);
 
     // ── microVM backend (R605-F8 / W325 §5) ──────────────────────────────────
     // For workloads that must not share the host kernel — a build placed next

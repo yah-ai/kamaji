@@ -238,6 +238,44 @@
 //! @yah:gotcha("CORRECTION TO A STALE GOTCHA ON THIS RELAY: the note at oss/kamaji/crates/kamaji-bin/src/server.rs:195 saying us-east-001's yah-marketing deploy record is still on the OLD pair is NO LONGER TRUE. This audit independently re-verified that the R876-B9 re-apply landed — us-east-001's yah-marketing.json is on the NEW pair. Do not act on that gotcha.")
 //! @yah:handoff("THE ANSWER FLIPS: **SAFE TO DELETE**, as of 2026-09-16 (R891 closed by @Ashguard:vortex, session:c8036b0c). Every consumer this audit named is migrated, and each was verified by measurement rather than by assuming the edit took. CONSUMER 1, us-east-001 yah-scryer.service: /etc/yah/scryer-r2.env rewritten to the new pair (38da59ad427a7e1f/9198605d52642726 -> f293d33294250d04/8d0ad8c9470d48df, hashed on the host), unit restarted and ACTIVE, and it published analytics snapshot b8eefe2550da5d3f7acf68856550de5894ad11d2ac0bcec59896e27354acf031 four seconds later — confirmed present in the yah-analytics bucket. CONSUMERS 2-4, us-west-011/-013/-014: /etc/yah-cloud/litestream.env rewritten to the new pair on all three, yubaba.service restarted one node at a time with followers first and the leader (013) last, litestream-headscale.service restarted on 013, and each node separately proved it can WRITE to R2 with the rotated file via a throwaway `litestream replicate -config` that logged both 'snapshot written' and 'wal segment written'. Dev raft never dipped: leader 13, term 66, all three peers live before, between and after. Rotation rather than drop-in removal, because `systemctl cat yubaba.service` shows the SHIPPED unit reads litestream.env independently of the R858-T5 drop-in — deleting the drop-in would have removed nothing. CONSUMER 5, repo-root .env: the raw token moved to the vault slot `cloudflare-r2-token-pre-r131t19` (derivation test passes — sha256 of that slot's value fingerprints to 9198605d52642726), R2_ACCESS_KEY/R2_SECRET_KEY rotated to the new pair, R2_TOKEN retired, file tightened 0644 -> 0600. GAP (A) IS CLOSED BY DELETION, NOT ROTATION: the operator's call was that GitHub repo secrets are not needed (R915 — `gh` is a non-goal), so all NINE were deleted via direct REST, verified total_count 0. Gap (A)'s org-level half is ACCEPTED-UNCHECKED by operator decision. GAP (B) fixed (R891-B6). GAP (C) fixed at the mechanism (R891-B5); its rotation was declined by the operator on the record.")
 //! @yah:verify("THE SWEEP THIS AUDIT COULD NOT FINISH IS NOW FINISHED, AND IT IS CLEAN. This ticket reached 5 of 9 fleet nodes and said so. All NINE have now been swept for the old pair, by piping both old-pair VALUES from the parked vault slots onto `ssh <node> 'sudo -n grep -rlFI -f - /etc /root /home /var/lib/yah /var/lib/yah-cloud /opt'` — patterns on stdin, only filenames returned, no value printed in either direction. Zero hits on us-east-001, us-south-001, us-west-001, -002, -003, -011, -013, -014, with `sudo -n id -u` = 0 confirmed separately on each so that an empty result is a real read rather than a permission failure reading as clean. ONE BOUNDED EXCEPTION: us-west-015 has no passwordless sudo and refuses root SSH, so its grep ran unprivileged; it is also not a systemd box (`systemctl` not found) and has no /etc/yah or /etc/yah-cloud, so the consumer class this audit is about cannot exist there. The same sweep over the workstation — whole repo tree minus target/.git/node_modules, plus ~/.config, ~/.aws, ~/.zshrc, ~/.zshenv, ~/.profile — found zero copies of the old SECRET and zero of the RAW TOKEN. Three files matched the old ACCESS KEY ID and all three are board annotation prose, which is expected and harmless: this audit's own proof that sha256('92414fa46ea2b8a5f06df51bae1a3512') = 38da59ad427a7e1f means the access-key-id half IS the public token id and was never secret material.")
+//!
+//! @yah:ticket(R932-B1, "Plain `deploy` on an existing container workload tears the incumbent down before the OCI create, and /workloads/validate passes a spec whose bind-mount source is missing on the host — R892's gate did not cover it")
+//! @yah:status(review)
+//! @yah:at(2026-09-22T05:18:13Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R932)
+//! @yah:severity(high)
+//! @yah:handoff("PRODUCTION OUTAGE, 2026-09-22T01:49:59Z, noisetable camp (R131-B36). `yah cloud workload deploy noisetable-account` — plain deploy, NOT rolling — against the RUNNING container workload on us-east-001. CLI: 'placement resolved -> us-east-001', 'us-east-001 accepts the spec' (so R892-T2's validate ran and PASSED), then yubaba 500: kamaji BackendRefused, containerd OCI runtime create failed: 'error mounting /run/yah-scryer/ingest.sock to rootfs at /run/yah/scryer.sock: bind mount source stat: no such file or directory'. Kamaji journal sequence: 'hydrate-on-place id=noisetable-account outcome=already_populated' -> 'container network namespace wired address=10.128.3.2' -> 'containerd workload torn down container_id=noisetable-account' -> create fails. The incumbent (pid 692098, Running, health=ready) was destroyed BEFORE the create was attempted; no rollback, no re-create of the prior container; workload left state=Pending pid=null; passway dropped the upstream (api.noisetable.com ready_upstreams 0/0, __mesofact/health 503). Two defects: (1) plain deploy on an existing workload is destroy-then-create, the same shape R892-B1 fixed for `rolling` only; (2) /workloads/validate accepted a spec whose host-side bind source does not exist — validate must stat every bind-mount source on the target node (and any other host precondition runc will check) before the incumbent is touched. Host context: yah-scryer on us-east-001 is ALIVE (pid 790289, restarted 2026-09-21T22:49:54Z, still publishing snapshots) but /run/yah-scryer/ingest.sock is absent after that restart — whether scryer stopped creating it or its path moved is being determined by the noisetable recovery courier; either way a live consumer's bind source vanished under it with no signal.")
+//! @yah:next("Tier: Warrior. (a) Make the container-workload deploy path create-then-swap: build the replacement (OCI create, task start, health) BEFORE tearing down the incumbent, or at minimum re-create the incumbent from its recorded spec when the replacement create fails. (b) Extend /workloads/validate to stat bind-mount sources (files and sockets) on the target node and refuse with the path named. (c) A test for each: a spec with a nonexistent bind source is refused by validate; a failing create leaves the incumbent running.")
+//! @yah:next("Cross-check yah-scryer: why did its 2026-09-21T22:49:54Z restart not recreate /run/yah-scryer/ingest.sock — if the socket path or ownership changed, every container binding it is one deploy away from this outage. Name the unit change that moved it.")
+//! @yah:gotcha("ROOT CAUSE OF THE MISSING SOCKET, measured on us-east-001 by @Ashguard:polaris (noisetable session:0e54513e) during recovery: the base unit /etc/systemd/system/yah-scryer.service:99 carries `--ingest-socket /run/yah-scryer/ingest.sock`, but the local drop-in yah-scryer.service.d/10-snapshot-producer.conf (written 2026-09-10 07:47) does `ExecStart=` to reset and re-emits the full command WITHOUT that flag, so the socket is never created; `systemctl restart` cannot help because the flag, not the process, is absent (W194-chloro-apply-time-validation.md:16 in the noisetable tree had already recorded this drift). The 11-day gap between drift and symptom is because the mount only matters at container-create time and this deploy was the node's first create since. The mount is injected unconditionally by kamaji-containerd-core, not declared by the workload. FIXED ON THE NODE with operator authorisation (flag restored in the drop-in, socket present, deploy then succeeded), but the SOURCE of that drop-in in the yah tree still emits the clobbered ExecStart and will re-break the next node it is applied to — that is the outstanding fix here, alongside the validate-must-stat-bind-sources gap.")
+//! @yah:handoff("FIXED, THREE LAYERS, all in source. (1) KAMAJI REFUSES BEFORE IT DESTROYS. New kamaji_containerd_core::{bind_mount_sources, missing_bind_sources, check_bind_sources} (oss/kamaji/crates/kamaji-containerd-core/src/lib.rs, beside build_oci_spec_with) enumerate every `type: bind` mount of the BUILT OCI spec and stat each source. Read off the built spec, not re-derived from WorkloadSpec, so it cannot drift from the mount plan and — the whole point here — it sees the mounts kamaji INJECTS, which is the class the outage was in: the collector socket is not in any workload's spec. Called in kamaji-bin deploy_generation immediately after build_oci_spec_with and BEFORE `reap_container`, so the 2026-09-22 sequence now ends at 'refused, nothing torn down'. New BackendError::HostPrecondition carries it (the spec was fine, the NODE drifted — distinct from InvalidSpec, and containerd was never asked); mapped to ErrorCode::BackendRefused in both server.rs arms that match the enum (Deploy ~:2295, GracefulUpgrade ~:4210). The inlined kamaji::containerd backend gets the same guard twice: a pre-teardown one in deploy_workload over a throwaway OCI spec carrying only the collector bind (spec_files/shared_dir do not exist yet and must not be checked yet), and the full one in create_and_start once they do.")
+//! @yah:handoff("(2) AND IF IT FAILS ANYWAY, THE INCUMBENT COMES BACK. The preflight only covers what can be checked in advance; a bad entrypoint in the replacement image still fails at task start, with the incumbent already reaped. deploy_generation now snapshots containerd's OWN container record (new ContainerdBackend::incumbent_record, a plain containers.get) immediately before the reap, runs everything from mkfifo to task-start inside one fallible block, and on any error calls the new restore_incumbent: re-resolves the PREVIOUS image's target digest (not the caller's — the incumbent may be a different image entirely), reaps the half-built attempt, re-ensures the FIFOs and journald forwarders, re-creates the record verbatim and re-creates + starts the task. It checks the restored generation's own bind sources first, because the failed attempt's stage_spec_files cleared and rewrote the staged-files directory and a file the incumbent binds may no longer be there — named, rather than left for runc. Both outcomes are REPORTED, never silent: a successful restore still returns an error saying this node is serving the PREVIOUS spec, since a node running something yubaba's registry no longer names is a divergence the operator has to see. `incumbent_record` returning None (first deploy, or containerd unreadable) is not a reason to refuse a deploy — the unreadable case warns, because it silently removes the rollback.")
+//! @yah:handoff("(3) VALIDATE NOW LOOKS AT THE NODE. New missing_bind_volume_sources(spec) in oss/yubaba/crates/yubaba/src/lib.rs, called from validate_workload_spec on the SpecCheck::Container arm: 422 `rejected` naming the host path and the mount it was for. Deliberately NOT folded into check_deploy_body — everything in there is a pure function of the request body by design, which is precisely why a body that parsed, shape-validated and cleared admission still took the node down. SCOPE, STATED PLAINLY BECAUSE IT IS NOT THE WHOLE ANSWER: this covers the spec's own VolumeSource::Bind sources only. It does NOT cover the injected collector socket — the actual 2026-09-22 path — because yubaba does not read kamaji's --scryer-socket, and the honest options were a NodeCapabilities protocol field or a new kamaji Validate RPC. Neither is needed for correctness now that kamaji refuses before it destroys: validate is the cheap early 'no' the CLI gets, kamaji's preflight is the authoritative one, and the doc comment on the new fn says exactly that so nobody reads `validated` as a promise it does not make.")
+//! @yah:handoff("(4) THE DROP-IN SOURCE — AND THE ROOT CAUSE IS NOT WHAT THE TICKET'S GOTCHA SAYS. There is no drop-in generator in the tree; I grepped for one. The source is an INSTRUCTION, in two places: app/yah/cli/resources/yah-scryer.service's comment block and .yah/services/yah-analytics/mirrors/prod.toml:236, both of which said 'override ExecStart adding <flags>'. AND THE DROP-IN DID NOT FORGET THE FLAG. `git log -S'--ingest-socket /run/yah-scryer/ingest.sock' -- app/yah/cli/resources/yah-scryer.service` returns exactly one commit, c2e87d70, dated 2026-09-14 (R893-B17). The drop-in was written 2026-09-10 — FOUR DAYS EARLIER. It could not have carried a flag that did not exist; the node took the new base unit on its next roll and the drop-in's `ExecStart=` reset discarded it. So this was never an authoring mistake and no amount of care would have caught it: a list-typed systemd override PINS the command line as of its authoring date, and every flag added to the base unit afterwards is one more thing it silently removes. FIX IS STRUCTURAL, not a warning: the unit's ExecStart now ends in `$YAH_SCRYER_OPT_IN` with `Environment=YAH_SCRYER_OPT_IN=` as the default (unquoted, so an unset/empty var contributes no argv at all and a non-opted-in node's command line is byte-identical to before), and both instruction sites now tell an opted-in node to set that ONE variable and never touch ExecStart. New test camp_systemd_unit_emit::the_scryer_long_tier_opt_in_arrives_by_variable_not_by_execstart_override pins the pair — tail present, default empty, --long-tier-bucket not shipped, --ingest-socket still in the base command.")
+//! @yah:verify("FULL RADIUS, EXIT CODES ECHOED NOT INFERRED, every run redirected to its own literal /tmp path. oss/kamaji `cargo test --workspace --all-features` = EXIT 0, zero failures across all 26 targets (kamaji lib 358, kamaji-bin lib 307, kamaji-containerd-core 52, docker_live 5, rest unchanged). oss/yubaba `cargo test -p yubaba --lib` = 996 passed / 0 failed, EXIT 0 (was 905 at R892-T2; the 2 new validate tests are in that delta). oss/yubaba `cargo check --workspace --all-targets` = EXIT 0. Root `cargo check --workspace --all-targets` = EXIT 0, no new warning (parse_list_v2 dead-code is pre-existing in oss/yah-base object-store). Root `cargo test -p yah --test main` = 154 passed / 0 failed / 4 ignored, EXIT 0. ELEVEN NEW TESTS: six in kamaji-containerd-core (bind_mount_sources_skips_every_mount_that_has_no_host_source; check_bind_sources_passes_when_every_source_is_present; an_injected_collector_socket_that_is_missing_refuses_the_deploy — the production case, asserting the host path, the destination AND 'nothing was torn down' in the message, then passing again once the path exists; a_declared_bind_volume_with_no_host_path_refuses_the_deploy; every_missing_source_is_named_not_just_the_first; a_spec_with_no_mounts_at_all_is_not_an_error), two in yubaba (validate_refuses_a_spec_whose_bind_source_is_missing_on_this_node + validate_accepts_a_bind_whose_source_is_present as its non-vacuity partner), one in the CLI (the scryer opt-in shape).")
+//! @yah:verify("ONE FAILURE SEEN AND RUN DOWN RATHER THAN RE-RUN AWAY FROM: the first `cargo test --workspace --all-features` failed server::tests::tenant_passway::stop_drops_the_digest_so_the_same_spec_is_deployed_again. It passes in isolation (all 6 tenant_passway tests, EXIT 0) and on a full re-run of the same command (EXIT 0), and nothing in this change touches port binding or the JIT runtime — it is the free_port() bind race between the two tenant_passway tests that both allocate and re-bind, widened under 307-test parallelism. Pre-existing flake, not this change; recording it because a future full-suite run will hit it again.")
+//! @yah:gotcha("THE NODES CARRYING THE OLD DROP-IN ARE STILL BROKEN AND A yah-scryer RELEASE DOES NOT FIX THEM. The `$YAH_SCRYER_OPT_IN` change is to the SHIPPED unit template; a node whose /etc/systemd/system/yah-scryer.service.d/*.conf still does `ExecStart=` + full restatement keeps discarding every flag the base unit gained after that drop-in was written, forever, including flags added after today. us-east-001 was hand-repaired on 2026-09-22 (flag restored in the drop-in) so it is serving, but it is repaired in the OLD shape and will re-break on the next flag added to the base unit. Rewriting each opted-in node's drop-in to `Environment=YAH_SCRYER_OPT_IN=...` is a live-node action nobody has taken; it is the only thing that closes this class on existing hardware.")
+//! @yah:gotcha("INERT ON EVERY NODE UNTIL A ROLL — and this one needs THREE artifacts, not one: kamaji (the preflight + rollback), yubaba (the validate check), and the yah-scryer unit template (which travels in the release tarball per scripts/publish-yubaba-release.sh). Rolling only kamaji still closes the outage class, since the preflight is the authoritative gate; rolling only yubaba closes nothing that matters. A green build here reaches nobody.")
+//! @yah:assumes("THE ROLLBACK PATH HAS NEVER RUN. restore_incumbent is reviewed code, not tested code: exercising it needs a live containerd (create a container, make the next deploy fail after the reap, assert the old pid is back), and this workspace has no containerd seam for it — the reap loop's TaskOps fake in kamaji-containerd-core covers task deletion only, and docker_live is the docker backend. The ticket's asked-for bar 'a failing create leaves the incumbent running' is therefore met by the PREFLIGHT arm (tested, and the arm the production failure was in) and only argued for the post-reap arm. If you want that bar closed for real it is a live-node test on a rolled kamaji: deploy a workload, redeploy it with a spec whose entrypoint does not exist in the image, and check `GET /workloads` still shows the old pid.")
+//! @yah:assumes("`Path::exists()` IS ASSUMED TO MATCH WHAT runc CHECKS. runc stats a bind source and refuses on ENOENT; exists() follows symlinks the same way stat does, and answers true for a socket inode, which is the R932-B1 case. Read from the production error text (`bind mount source stat: no such file or directory`) and from the pre-existing /etc/resolv.conf guard in build_oci_spec_with, which already skips the mount 'since runc refuses a mount with a missing source' — not from runc's source. If runc ever auto-created a missing bind source, this preflight would refuse a deploy that would have worked; nothing in-tree suggests it does, and the resolv.conf guard would be equally wrong if it did.")
+//! @yah:handoff("Both defects the ticket named are closed in source, plus the drop-in root cause its gotcha handed forward — details in the four numbered handoff entries above.")
+//!
+//! @yah:ticket(R931-B5, "native-exec backend cannot write /var/lib/passway/routes/*.routes.json on us-east-001 — read-only file system (os error 30)")
+//! @yah:status(review)
+//! @yah:at(2026-09-22T05:21:15Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R931)
+//! @yah:severity(high)
+//! @yah:handoff("FOUND BY THE NOISETABLE CAMP (R733-T26, @Miravel:libra) WHILE VERIFYING R931-B4's FIX ON PROD. Tier: Warrior. B4 IS CONFIRMED WORKING — this is the next layer down, not a regression of it. MEASURED: `yah cloud mirror up noisetable-marketing --env prod` now routes the inner-door spec to kamaji's NATIVE-EXEC backend (the empty-digest `local/passway:inner-door@` containerd 500 is GONE, which is exactly the diagnostic improvement B4's own gotcha predicted), and then fails with `kamaji deploy_workload: kamaji error: BackendRefused: native exec: writing spec file /var/lib/passway/routes/noisetable-marketing.routes.json: Read-only file system (os error 30)`, ident=passway-inner-noisetable-marketing, node us-east-001. START HERE: check whether /var/lib/passway/routes/ exists at all on us-east-001 and whether it is writable by the kamaji process user. This looks like the SAME CLASS of missing provisioning step B4 already hit one layer up, where it found both nodes' --native-exec-dir present but the native dirs 'effectively empty' — so the question is probably whether that directory is created/chmod'd during node provisioning, not whether kamaji's write is wrong. Note /usr/local/bin/passway on the node is a SYSTEMD-managed host binary (passway, passway-demux, passway-http-router are all units), so /var/lib/passway may be owned by that systemd unit's packaging rather than by anything kamaji provisions — worth checking before assuming kamaji should mkdir it.")
+//! @yah:handoff("FIXED IN SOURCE — the cause is kamaji's sandbox (the systemd mount namespace), not missing provisioning. kamaji.service runs ProtectSystem=strict, and nothing granted /var/lib/passway/routes, so the native backend's materialize_files (oss/kamaji/crates/kamaji/src/native.rs:593, which already does create_dir_all + write) hit EROFS inside kamaji's namespace. The directory already exists on us-east-001: yubaba's demux/http-router publisher writes into it through its own node-local drop-in. app/yah/cli/resources/kamaji.service:276 now adds `passway/routes` to StateDirectory= (so it gets created on a node that has never been a door) and ReadWritePaths=/var/lib/passway/routes (:300). The grant stops at the leaf on purpose: the apex door's cert.pem/key.pem/ACME cache one level up stay read-only to kamaji. The guard test supervisor_unit::kamaji_unit_grants_every_host_path_kamaji_writes now pins cloud::inner_door::ROUTES_DIR as a live constant. Two siblings were missing from its list (/var/lib/yah/passway for R910-F2, /var/lib/yah/qed/produced for R605-T24) and are added. A mutation check proves the test goes red only when BOTH grants are gone, and that the /var/lib/yah/passway grant next door does not satisfy it.")
+//! @yah:verify("`cargo test -p yah --lib supervisor_unit` = 16 passed / 0 failed, EXIT 0. `cargo test -p yah --test main camp_systemd_unit_emit` = 15 passed / 0 failed, EXIT 0, and the daemon reported no input skew during that run. Both logs are under /tmp/r931b5-t{1,3}.log.")
+//! @yah:gotcha("NOT LIVE ON THE NODE YET. us-east-001 is still running the old kamaji.service. It needs a unit re-render or roll (the kamaji unit template ships with the release), then `systemctl daemon-reload && systemctl restart kamaji`. After that, re-run `yah cloud mirror up noisetable-marketing --env prod`: expect the routes.json write to succeed, and look for the next layer down if the deploy still fails. I did not touch the live node: it is an outward-facing prod action and needs operator authorization.")
+//! @yah:handoff("DISCOVERED AND FIXED: the deploy could not be re-run while the door was live. deploy_inner_door (app/yah/cli/src/cloud.rs, front-door loop) plain-deployed the door, which is an Appliance archetype. So once it was live on one node, the next run got yubaba's R572-F4 409 'appliance already live' and aborted the loop before later front doors, and a half-finished rollout could never be completed. New helpers is_live_appliance_conflict + replace_live_inner_door (beside deploy_inner_door) turn exactly that 409 into validate -> destroy -> deploy. Validation runs first, as in `workload rolling` (R892-B1), and a node with no /workloads/validate is refused rather than having its door destroyed blind. There is no skip-if-unchanged, because GET /workloads/{ident}/spec redacts the inline-file body, which is the only part that changes. Installed via `cargo xtask install` and exercised on prod: it replaced the doors on east and south.")
+//! @yah:verify("New test cloud::inner_door_apply_tests::only_the_live_appliance_409_is_read_as_replace_the_inner_door plus the 3 existing inner_door tests: `cargo test -p yah --lib inner_door` = 4 passed / 0 failed, EXIT 0. Live check: the final mirror up printed 'already live on us-east-001 — replaced' for east and south and a first deploy on west, then 'noisetable.com is serving this bundle', EXIT 0. After that, noisetable.com/ and /app return 200. /api/issues still returns 404 on every origin (see gotcha).")
+//! @yah:handoff("LIVE ON ALL THREE FRONT DOORS, 2026-09-22, operator-authorised ssh mission. On us-east-001, us-south-001 and us-west-001, added /etc/systemd/system/kamaji.service.d/60-inner-door-routes.conf (`[Service]` + `ReadWritePaths=/var/lib/passway/routes`), then daemon-reload + restart kamaji. This mirrors the template grant until the nodes take the new unit on a roll, after which the drop-in is redundant and can be deleted. passway-inner-noisetable-marketing now runs on all three nodes on 127.0.0.1:12310. COSTS OF THE RESTARTS: (a) east's restart SIGKILLed noisetable-account's durability tail, and kamaji 0.8.41 cannot re-arm tails after a restart (R932's re-arm code is only in e5ff39f6 and later). Re-armed by `yah cloud workload rolling noisetable-account`: epoch 5, state current, one 502 in 120 probes. (b) On south, yubaba's reconciler re-forked headscale about 9s after the restart, and its tail came back on its own (epoch 7). (c) west had no natives and no tails, and its two containers kept their pids.")
+//! @yah:handoff("OUTER DOORS REPOINTED, 2026-09-22 05:40 UTC, operator-authorised. On all three nodes, /etc/passway-noisetable.env gained `PASSWAY_UPSTREAMS=noisetable.com=127.0.0.1:12310`, with a comment block and the backup at /etc/passway-noisetable.env.bak-r931b5, followed by `systemctl reload passway-noisetable` (a graceful upgrade). The static pin beats discovery for that hostname only (R858-T1, 'upstream set Host(\"noisetable.com\") (static pin)' in each journal). api.noisetable.com and the `*` catch-all still discover from east's yubaba. Verified per origin with --resolve: noisetable.com /, /app and /api/issues, plus api.noisetable.com/__mesofact/health, all return 200 on 51.81.85.145, 45.32.194.254 and 15.204.89.240. /api/issues was a 404 before the change.")
+//! @yah:gotcha("MIRROR UP'S PRINTED FRONT-DOOR STEP DOES NOT MATCH THE LIVE DOORS. It suggests `yah cloud ingress deploy <node> --provider passway --image <ref> --upstream noisetable.com=127.0.0.1:12310`, which stands up a CONTAINERISED passway appliance. The live noisetable doors are HOST systemd units (passway-noisetable.service, EnvironmentFile=/etc/passway-noisetable.env, ExecReload=passway-graceful-upgrade). Running the printed command would have added a second door rather than repointing the existing one, so the repoint was done as a hand edit of the env file. The pin now lives only in those three node-local files: nothing in the tree renders /etc/passway-noisetable.env, so a node rebuilt from source loses it.")
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -426,6 +464,11 @@ pub struct ServerCtx {
     /// legitimately be able to restore and not to stream (a migration target
     /// being prepared), and collapsing them would make that state unexpressible.
     pub tail_helper: Option<std::path::PathBuf>,
+    /// R936-B13 — the per-bucket S3 key pairs the hydrate and tail helpers are
+    /// handed, read once from kamaji's environment in `main.rs`. Empty by
+    /// default, which makes a deploy that declares a tier fail loudly naming
+    /// the missing `S3_ACCESS_KEY__<BUCKET>`.
+    pub durability_credentials: crate::hydrate::BucketCredentials,
     /// The durability tails this node is running, one per workload that
     /// declares a bytes-shipping tier (R850-F1). Not an `Option` and not behind
     /// a feature: an empty supervisor is the correct state for a node with no
@@ -471,6 +514,12 @@ pub struct ServerCtx {
     /// not the same deployment as a Darwin build-worker.
     #[cfg(feature = "native-exec")]
     pub native: Option<Arc<kamaji::native::NativeRuntime>>,
+    /// R936-B11: where native-exec deploys that opted in to
+    /// [`workload_spec::RESUME_AFTER_RESTART_ANNOTATION`] are recorded, so
+    /// startup can replay them ([`ServerCtx::resume_native_workloads`]).
+    /// `None` = nothing is recorded (tests, a node without `--native-exec-dir`).
+    #[cfg(feature = "native-exec")]
+    pub native_records: Option<crate::deploy_records::NativeDeployRecords>,
     /// Optional Firecracker microVM backend (R605-F8 / W325 §5). `None`
     /// outside the `microvm` feature build, or when kamaji is started without
     /// `--microvm-dir`.
@@ -760,10 +809,6 @@ impl BundleBackend {
         )))
     }
 
-    fn record_path(&self, id: &WorkloadId) -> PathBuf {
-        self.records_dir.join(format!("{}.json", id.0))
-    }
-
     /// Persist the admission input for `id` (R755-B5). Atomic: written to a
     /// sibling temp file and renamed, so a crash mid-write leaves either the
     /// previous record or none, never a half-record that fails to parse on
@@ -785,95 +830,23 @@ impl BundleBackend {
     /// upgraded from an older kamaji would otherwise keep its 0755 `deploys/`
     /// forever; doing it here makes the next deploy self-heal the mode.
     pub fn record_deploy(&self, record: &BundleDeployRecord) -> std::io::Result<()> {
-        // Scoped to this fn: the rest of the module is compiled without the
-        // `bundle-serving` feature too, where these two would be unused.
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        std::fs::create_dir_all(&self.records_dir)?;
-        std::fs::set_permissions(&self.records_dir, std::fs::Permissions::from_mode(0o700))?;
-        let final_path = self.record_path(&WorkloadId::new(&record.id));
-        // R925 CONVERTED — `.{id}.json.tmp` was per-RECORD but not per-WRITER,
-        // which is a different and weaker thing. Every connection is handled on
-        // its own `tokio::spawn` (the accept loop), and nothing serializes two
-        // Deploys of the SAME workload id — a yubaba retry, or two controllers
-        // reconciling the same service, puts two handlers in here at once and
-        // both staged into the one file. Left hand-rolled rather than routed
-        // through `kamaji::atomic_file::write_atomic`: that helper writes with
-        // default permissions, and this record carries the deploy's `env`
-        // verbatim, which for the revalidate tier is live credential material
-        // (measured on us-east-001: `CLOUDFLARE_API_TOKEN` and two
-        // `MESOFACT_S3_*` keys, inline and in cleartext). Only the staging NAME
-        // is borrowed, so the 0600 reasoning below is untouched.
-        let tmp = kamaji::atomic_file::staging_path(
-            &self.records_dir.join(format!(".{}.json", record.id)),
-        );
+        // R936-B11: the 0600/0700 + per-writer staging mechanics moved to
+        // `deploy_records::write_owner_only`, shared with native-exec records.
         let bytes = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            // `.mode()` only applies when THIS call creates the file, so it
-            // cannot be trusted alone on a path that might already exist —
-            // tighten the open handle before any bytes land in it. Since R925
-            // the staging name is unique per writer and this open effectively
-            // always creates, but the belt stays: it costs one syscall and it
-            // is what makes the 0600 claim true of the file rather than of the
-            // happy path.
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            f.write_all(&bytes)?;
-        }
-        // Remove the staging file if the rename fails. Load-bearing now that
-        // the name is unique per writer: nothing later reuses a leaked one, so
-        // without this they accumulate in `deploys/` without bound.
-        if let Err(e) = std::fs::rename(&tmp, &final_path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        Ok(())
+        crate::deploy_records::write_owner_only(&self.records_dir, &record.id, &bytes)
     }
 
     /// Drop the record for `id` (R755-B5). Idempotent — a Stop for a workload
     /// that was never a bundle, or was already stopped, is Ok.
     pub fn forget_deploy(&self, id: &WorkloadId) -> std::io::Result<()> {
-        match std::fs::remove_file(self.record_path(id)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        crate::deploy_records::remove_record(&self.records_dir, id)
     }
 
     /// Every record on disk, in name order. A record that fails to parse is
     /// logged and skipped rather than aborting the whole resume — one corrupt
     /// file must not keep every other site on the node down.
     pub fn recorded_deploys(&self) -> Vec<BundleDeployRecord> {
-        let mut out = Vec::new();
-        let entries = match std::fs::read_dir(&self.records_dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
-            Err(e) => {
-                warn!(dir = %self.records_dir.display(), error = %e, "cannot read bundle deploy records");
-                return out;
-            }
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            match std::fs::read(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|b| serde_json::from_slice::<BundleDeployRecord>(&b).map_err(|e| e.to_string()))
-            {
-                Ok(rec) => out.push(rec),
-                Err(e) => warn!(path = %path.display(), error = %e, "skipping unreadable bundle deploy record"),
-            }
-        }
-        out
+        crate::deploy_records::read_records(&self.records_dir, "bundle deploy")
     }
 
     /// Set the node-wide port override — an explicit operator flag over the
@@ -951,6 +924,7 @@ impl ServerCtx {
             log_sink: Arc::new(JournalSender::connect()),
             hydrate_helper: None,
             tail_helper: None,
+            durability_credentials: crate::hydrate::BucketCredentials::default(),
             tail: crate::tail::TailSupervisor::default(),
             #[cfg(feature = "containerd-integration")]
             containerd: None,
@@ -964,6 +938,8 @@ impl ServerCtx {
             docker: None,
             #[cfg(feature = "native-exec")]
             native: None,
+            #[cfg(feature = "native-exec")]
+            native_records: None,
             #[cfg(feature = "microvm")]
             microvm: None,
         }
@@ -977,6 +953,7 @@ impl ServerCtx {
             log_sink: Arc::new(JournalSender::connect()),
             hydrate_helper: None,
             tail_helper: None,
+            durability_credentials: crate::hydrate::BucketCredentials::default(),
             tail: crate::tail::TailSupervisor::default(),
             #[cfg(feature = "containerd-integration")]
             containerd: None,
@@ -990,6 +967,8 @@ impl ServerCtx {
             docker: None,
             #[cfg(feature = "native-exec")]
             native: None,
+            #[cfg(feature = "native-exec")]
+            native_records: None,
             #[cfg(feature = "microvm")]
             microvm: None,
         }
@@ -1045,6 +1024,15 @@ impl ServerCtx {
         self
     }
 
+    /// Put the durability tail records somewhere other than
+    /// [`crate::tail::RECORDS_DIR`] (R932). Tests point this at a temp dir;
+    /// nothing in the binary calls it, because a node that keeps its records
+    /// somewhere else is a node whose tails the next kamaji will not find.
+    pub fn with_tail_records_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.tail = crate::tail::TailSupervisor::with_records_dir(dir);
+        self
+    }
+
     /// Point hydrate-on-place at `turso-backup-hydrate` (R850-F1). The binary
     /// calls this in `main.rs` when the operator passed `--hydrate-helper`.
     ///
@@ -1061,6 +1049,12 @@ impl ServerCtx {
     /// shipping its state.
     pub fn with_tail_helper(mut self, helper: std::path::PathBuf) -> Self {
         self.tail_helper = Some(helper);
+        self
+    }
+
+    /// Hand the durability helpers their per-bucket key pairs (R936-B13).
+    pub fn with_durability_credentials(mut self, creds: crate::hydrate::BucketCredentials) -> Self {
+        self.durability_credentials = creds;
         self
     }
 
@@ -1085,6 +1079,18 @@ impl ServerCtx {
     #[cfg(feature = "native-exec")]
     pub fn with_native_exec(mut self, backend: Arc<kamaji::native::NativeRuntime>) -> Self {
         self.native = Some(backend);
+        self
+    }
+
+    /// Record resumable native-exec deploys under `records` (R936-B11). The
+    /// binary calls this beside [`Self::with_native_exec`]; a context without
+    /// it records nothing and resumes nothing.
+    #[cfg(feature = "native-exec")]
+    pub fn with_native_deploy_records(
+        mut self,
+        records: crate::deploy_records::NativeDeployRecords,
+    ) -> Self {
+        self.native_records = Some(records);
         self
     }
 
@@ -1502,144 +1508,16 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             }
         }
         YubabaToKamaji::List { request_id } => {
-            // Start with the in-memory registry entries. This list is a
-            // historical stub — nothing writes `Registry::workloads` outside
-            // tests — so on a live daemon it is empty and every backend below
-            // contributes its own live view.
-            #[allow(unused_mut)]
-            let mut entries = ctx.registry.lock().await.list();
-
-            // Merge native fork+exec workloads (R858-B14). `ctx.native` is the
-            // `--native-exec-dir` backend `deploy_native_exec` forks through —
-            // the headscale appliance among them — and it was the one runtime
-            // `List` never asked. Its workloads existed, were supervised, and
-            // were invisible on the wire: yubaba's `get_workload` filters this
-            // list by ident, so `observe_local_appliance` answered "not running
-            // here" about a healthy appliance, `decide_owner` never reached
-            // `OwnerServing(self)`, and every reconcile tick redeployed a
-            // coordinator kamaji was already supervising correctly.
-            #[cfg(feature = "native-exec")]
-            if let Some(native) = &ctx.native {
-                match native.list_workloads().await {
-                    Ok(states) => {
-                        entries.extend(states.into_iter().map(runtime_state_to_entry))
-                    }
-                    Err(e) => {
-                        return KamajiToYubaba::Error {
-                            request_id: Some(request_id),
-                            code: ErrorCode::BackendRefused,
-                            message: format!("native list failed: {e}"),
-                        };
+            let mut entries = match live_workload_entries(ctx).await {
+                Ok(entries) => entries,
+                Err(message) => {
+                    return KamajiToYubaba::Error {
+                        request_id: Some(request_id),
+                        code: ErrorCode::BackendRefused,
+                        message,
                     }
                 }
-            }
-
-            // Merge containerd containers when the backend is configured.
-            #[cfg(feature = "containerd-integration")]
-            if let Some(backend) = &ctx.containerd {
-                match backend.list().await {
-                    Ok(ctr_entries) => entries.extend(ctr_entries),
-                    Err(e) => {
-                        return KamajiToYubaba::Error {
-                            request_id: Some(request_id),
-                            code: ErrorCode::BackendRefused,
-                            message: format!("containerd list failed: {e}"),
-                        };
-                    }
-                }
-            }
-
-            // Merge bundle workloads (R599-F10 keep-alive + R599-F6 on-demand).
-            // Each runtime is the source of truth for its own workloads' live
-            // status — mirror the containerd merge rather than tracking a stale
-            // registry snapshot. The two runtimes hold disjoint identities.
-            #[cfg(feature = "bundle-serving")]
-            if let Some(backend) = &ctx.bundle {
-                match backend.native.list_workloads().await {
-                    Ok(states) => {
-                        entries.extend(states.into_iter().map(runtime_state_to_entry))
-                    }
-                    Err(e) => {
-                        return KamajiToYubaba::Error {
-                            request_id: Some(request_id),
-                            code: ErrorCode::BackendRefused,
-                            message: format!("bundle backend list failed: {e}"),
-                        };
-                    }
-                }
-                entries.extend(
-                    backend
-                        .jit
-                        .list_workloads()
-                        .await
-                        .into_iter()
-                        .map(runtime_state_to_entry),
-                );
-            }
-
-            // Merge per-tenant passways (R852-F1). Same shape as the on-demand
-            // bundle merge above and a disjoint identity space: an armed-but-
-            // idle passway appears as present with no pid, which is the honest
-            // state of a zero-resident workload.
-            #[cfg(feature = "tenant-passway")]
-            if let Some(jit) = &ctx.tenant_passway {
-                entries.extend(
-                    jit.list_workloads()
-                        .await
-                        .into_iter()
-                        .map(runtime_state_to_entry),
-                );
-            }
-
-            // Merge microVM guests (R605-F8). The runtime owns each guest's
-            // live status the same way the bundle runtimes own theirs, and the
-            // identities are disjoint from every other backend's — a guest is
-            // never also a container.
-            #[cfg(feature = "microvm")]
-            if let Some(microvm) = &ctx.microvm {
-                use kamaji::Kamaji as _;
-                match microvm.list_workloads().await {
-                    Ok(states) => {
-                        entries.extend(states.into_iter().map(runtime_state_to_entry))
-                    }
-                    Err(e) => {
-                        return KamajiToYubaba::Error {
-                            request_id: Some(request_id),
-                            code: ErrorCode::BackendRefused,
-                            message: format!("microvm list failed: {e}"),
-                        };
-                    }
-                }
-            }
-
-            // Merge docker/OrbStack containers (R626-F1). Like the containerd
-            // merge, the daemon is the source of truth for its own containers'
-            // live status; `list_workloads_detailed` carries each container's
-            // host pid in the same round-trips, so a docker row can win the
-            // dedupe below on liveness rather than being ranked pid-less.
-            #[cfg(feature = "docker-integration")]
-            if let Some(docker) = &ctx.docker {
-                match docker.list_workloads_detailed().await {
-                    Ok(workloads) => {
-                        entries.extend(workloads.into_iter().map(docker_workload_to_entry))
-                    }
-                    Err(e) => {
-                        return KamajiToYubaba::Error {
-                            request_id: Some(request_id),
-                            code: ErrorCode::BackendRefused,
-                            message: format!("docker list failed: {e}"),
-                        };
-                    }
-                }
-            }
-
-            // One row per workload id (R599-B11). The merges above concatenate
-            // independent backend views, and those views are NOT guaranteed
-            // disjoint: a leftover containerd container can carry the same id as
-            // a live native bundle workload, and containerd reports a
-            // container-without-task as `Pending`/`pid: None`. Collapse to the
-            // most-live row rather than emitting both.
-            let mut entries = dedupe_workload_entries(entries);
+            };
             // R852-B4: stamp what each workload was deployed with, so a caller
             // can tell an unchanged declaration from a changed one and stop
             // re-deploying (on the JIT tier, re-binding) everything every
@@ -1802,6 +1680,145 @@ fn recipe_is_not_deployable(request_id: kamaji_proto::RequestId) -> KamajiToYuba
     }
 }
 
+/// Every workload this node is actually running, one row per id, merged from
+/// each configured backend's own live view.
+///
+/// Factored out of the `List` arm (R932) because the restart-time durability
+/// resume needs the same answer and must not take a second, subtly different
+/// view of it: `crate::tail::resume` re-arms a tail only for a workload a
+/// backend still reports as live, and a tail armed against a workload running
+/// somewhere *else* fences that node. The `Err` string is what the `List` arm
+/// puts in a `BackendRefused`, unchanged — a backend that cannot be listed is
+/// not an empty node.
+///
+/// Excludes the spec-digest stamp, which stays at the `List` arm: it is what a
+/// caller compares against its own declaration, and nothing on the resume path
+/// reads it.
+pub(crate) async fn live_workload_entries(
+    ctx: &Arc<ServerCtx>,
+) -> std::result::Result<Vec<WorkloadEntry>, String> {
+    // Start with the in-memory registry entries. This list is a
+    // historical stub — nothing writes `Registry::workloads` outside
+    // tests — so on a live daemon it is empty and every backend below
+    // contributes its own live view.
+    #[allow(unused_mut)]
+    let mut entries = ctx.registry.lock().await.list();
+
+        // Merge native fork+exec workloads (R858-B14). `ctx.native` is the
+        // `--native-exec-dir` backend `deploy_native_exec` forks through —
+        // the headscale appliance among them — and it was the one runtime
+        // `List` never asked. Its workloads existed, were supervised, and
+        // were invisible on the wire: yubaba's `get_workload` filters this
+        // list by ident, so `observe_local_appliance` answered "not running
+        // here" about a healthy appliance, `decide_owner` never reached
+        // `OwnerServing(self)`, and every reconcile tick redeployed a
+        // coordinator kamaji was already supervising correctly.
+        #[cfg(feature = "native-exec")]
+        if let Some(native) = &ctx.native {
+            match native.list_workloads().await {
+                Ok(states) => {
+                    entries.extend(states.into_iter().map(runtime_state_to_entry))
+                }
+                Err(e) => {
+                    return Err(format!("native list failed: {e}"));
+                }
+            }
+        }
+
+        // Merge containerd containers when the backend is configured.
+        #[cfg(feature = "containerd-integration")]
+        if let Some(backend) = &ctx.containerd {
+            match backend.list().await {
+                Ok(ctr_entries) => entries.extend(ctr_entries),
+                Err(e) => {
+                    return Err(format!("containerd list failed: {e}"));
+                }
+            }
+        }
+
+        // Merge bundle workloads (R599-F10 keep-alive + R599-F6 on-demand).
+        // Each runtime is the source of truth for its own workloads' live
+        // status — mirror the containerd merge rather than tracking a stale
+        // registry snapshot. The two runtimes hold disjoint identities.
+        #[cfg(feature = "bundle-serving")]
+        if let Some(backend) = &ctx.bundle {
+            match backend.native.list_workloads().await {
+                Ok(states) => {
+                    entries.extend(states.into_iter().map(runtime_state_to_entry))
+                }
+                Err(e) => {
+                    return Err(format!("bundle backend list failed: {e}"));
+                }
+            }
+            entries.extend(
+                backend
+                    .jit
+                    .list_workloads()
+                    .await
+                    .into_iter()
+                    .map(runtime_state_to_entry),
+            );
+        }
+
+        // Merge per-tenant passways (R852-F1). Same shape as the on-demand
+        // bundle merge above and a disjoint identity space: an armed-but-
+        // idle passway appears as present with no pid, which is the honest
+        // state of a zero-resident workload.
+        #[cfg(feature = "tenant-passway")]
+        if let Some(jit) = &ctx.tenant_passway {
+            entries.extend(
+                jit.list_workloads()
+                    .await
+                    .into_iter()
+                    .map(runtime_state_to_entry),
+            );
+        }
+
+        // Merge microVM guests (R605-F8). The runtime owns each guest's
+        // live status the same way the bundle runtimes own theirs, and the
+        // identities are disjoint from every other backend's — a guest is
+        // never also a container.
+        #[cfg(feature = "microvm")]
+        if let Some(microvm) = &ctx.microvm {
+            use kamaji::Kamaji as _;
+            match microvm.list_workloads().await {
+                Ok(states) => {
+                    entries.extend(states.into_iter().map(runtime_state_to_entry))
+                }
+                Err(e) => {
+                    return Err(format!("microvm list failed: {e}"));
+                }
+            }
+        }
+
+        // Merge docker/OrbStack containers (R626-F1). Like the containerd
+        // merge, the daemon is the source of truth for its own containers'
+        // live status; `list_workloads_detailed` carries each container's
+        // host pid in the same round-trips, so a docker row can win the
+        // dedupe below on liveness rather than being ranked pid-less.
+        #[cfg(feature = "docker-integration")]
+        if let Some(docker) = &ctx.docker {
+            match docker.list_workloads_detailed().await {
+                Ok(workloads) => {
+                    entries.extend(workloads.into_iter().map(docker_workload_to_entry))
+                }
+                Err(e) => {
+                    return Err(format!("docker list failed: {e}"));
+                }
+            }
+        }
+
+        // One row per workload id (R599-B11). The merges above concatenate
+        // independent backend views, and those views are NOT guaranteed
+        // disjoint: a leftover containerd container can carry the same id as
+        // a live native bundle workload, and containerd reports a
+        // container-without-task as `Pending`/`pid: None`. Collapse to the
+        // most-live row rather than emitting both.
+        let entries = dedupe_workload_entries(entries);
+    Ok(entries)
+}
+
+
 /// Dispatch a `Deploy` to the backend its spec selects, and — on acceptance —
 /// record what it was deployed with (R852-B4, R870-B24).
 ///
@@ -1827,9 +1844,35 @@ async fn deploy_workload(
     let record = spec.clone();
     let reply = dispatch_deploy(ctx, request_id, id.clone(), spec, mesh).await;
     if let KamajiToYubaba::DeployAck { .. } = &reply {
+        record_native_deploy(ctx, &id, &record, mesh);
         ctx.registry.lock().await.set_deployed_spec(id, record);
     }
     reply
+}
+
+/// R936-B11: persist an acked native-exec deploy that asked to outlive kamaji.
+/// A failed write does not fail the deploy — the workload IS running — but it
+/// is logged by name, because it means the next restart will not bring it back.
+#[allow(unused_variables)]
+fn record_native_deploy(
+    ctx: &Arc<ServerCtx>,
+    id: &WorkloadId,
+    workload: &workload_spec::Workload,
+    mesh: Option<&kamaji_proto::MeshAssignment>,
+) {
+    #[cfg(feature = "native-exec")]
+    if let Some(records) = &ctx.native_records {
+        if let Some(rec) = crate::deploy_records::NativeDeployRecord::for_deploy(id, workload, mesh)
+        {
+            if let Err(e) = records.record(&rec) {
+                warn!(
+                    id = %id.0, error = %e,
+                    "native workload is running but its deploy record could not be written; \
+                     it will NOT be resumed after the next kamaji restart (R936-B11)"
+                );
+            }
+        }
+    }
 }
 
 #[allow(unused_variables)]
@@ -2078,7 +2121,7 @@ async fn deploy_container(
     // at boot is indistinguishable from a healthy first boot, while a missing
     // tail is at least a workload that came up with its real data.
     for message in [
-        crate::hydrate::preflight(ctx.hydrate_helper.as_deref(), spec),
+        crate::hydrate::preflight(ctx.hydrate_helper.as_deref(), &ctx.durability_credentials, spec),
         crate::tail::preflight(ctx, spec),
     ] {
         if let Err(message) = message {
@@ -2146,7 +2189,7 @@ async fn deploy_container_inner(
     // workload can dodge by setting `yah.exec = native` is not a guard. This is
     // inert for every spec that declares nothing, which is every spec in the
     // tree today (`hydrate::plan` → `NotDeclared`).
-    let hydrate = match crate::hydrate::run(ctx.hydrate_helper.as_deref(), spec).await {
+    let hydrate = match crate::hydrate::run(ctx.hydrate_helper.as_deref(), &ctx.durability_credentials, spec).await {
         Ok(crate::hydrate::HydrateResult::Proceed(line)) => {
             if let Some(line) = &line {
                 info!(id = %id.0, outcome = %line, "hydrate-on-place");
@@ -2248,6 +2291,15 @@ async fn deploy_container_backend(
             Err(crate::containerd::BackendError::InvalidSpec(msg)) => KamajiToYubaba::Error {
                 request_id: Some(request_id),
                 code: ErrorCode::InvalidSpec,
+                message: msg,
+            },
+            // R932-B1: the spec was fine and this node was not. `BackendRefused`
+            // because the refusal is the node's, not the spec author's — and
+            // because the message's whole job is to name the host path, which
+            // it carries either way.
+            Err(crate::containerd::BackendError::HostPrecondition(msg)) => KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::BackendRefused,
                 message: msg,
             },
             Err(crate::containerd::BackendError::Containerd(e)) => KamajiToYubaba::Error {
@@ -3084,6 +3136,53 @@ impl ServerCtx {
             spawn_bundle_run(self, record.clone()).await;
         }
         records.len()
+    }
+}
+
+#[cfg(feature = "native-exec")]
+impl ServerCtx {
+    /// R936-B11: replay every recorded native-exec deploy through the native
+    /// arm, the native twin of `resume_bundle_workloads`. Call once at
+    /// startup, before the UDS answers. Only workloads that opted in were ever
+    /// recorded (see [`crate::deploy_records`]). Deliberately NOT through
+    /// `deploy_workload`: hydrate-on-place must not run again over state that
+    /// survived on this node's disk. Returns how many came back.
+    pub async fn resume_native_workloads(self: &Arc<Self>) -> usize {
+        let Some(records) = &self.native_records else {
+            return 0;
+        };
+        let mut resumed = 0;
+        for record in records.recorded() {
+            let id = WorkloadId::new(&record.id);
+            let Some(spec) = record.workload.container_spec() else {
+                warn!(id = %record.id, "native deploy record holds no container spec; skipped");
+                continue;
+            };
+            info!(id = %record.id, "resuming recorded native deploy after restart (R936-B11)");
+            match deploy_native_exec(
+                self,
+                kamaji_proto::RequestId(0),
+                &id,
+                spec,
+                record.mesh.as_ref(),
+            )
+            .await
+            {
+                KamajiToYubaba::DeployAck { .. } => {
+                    self.registry
+                        .lock()
+                        .await
+                        .set_deployed_spec(id, record.workload.clone());
+                    resumed += 1;
+                }
+                other => warn!(
+                    id = %record.id, reply = ?other,
+                    "recorded native deploy failed to resume; its record is kept so the next \
+                     restart retries it"
+                ),
+            }
+        }
+        resumed
     }
 }
 
@@ -4160,6 +4259,17 @@ async fn graceful_upgrade_workload(
                             message: msg,
                         }
                     }
+                    // R932-B1: same mapping as the Deploy arm — the node, not
+                    // the spec, is what failed the check, and the message names
+                    // the host path. A graceful upgrade refused here has not
+                    // touched the resident generation.
+                    Err(crate::containerd::BackendError::HostPrecondition(msg)) => {
+                        KamajiToYubaba::Error {
+                            request_id: Some(request_id),
+                            code: ErrorCode::BackendRefused,
+                            message: msg,
+                        }
+                    }
                     Err(crate::containerd::BackendError::Containerd(e)) => KamajiToYubaba::Error {
                         request_id: Some(request_id),
                         code: ErrorCode::BackendRefused,
@@ -4238,6 +4348,20 @@ pub(crate) async fn stop_workload(
     // at most the last interval's frames, which the next node's hydrate does
     // not need because it restores from what did land.
     ctx.tail.stop(&id).await;
+    // …and the record that would otherwise re-arm it on the next restart
+    // (R932). Best-effort rather than a refusal, unlike the bundle record
+    // below: a stale tail record cannot resurrect a workload — `tail::resume`
+    // re-arms only against a backend row that is still live, so the worst a
+    // leaked one costs is a warn line per restart. Refusing the Stop would be
+    // the more expensive mistake, since the tail is already dead by here and
+    // an un-acked Stop makes yubaba retry a teardown that already happened.
+    if let Err(e) = ctx.tail.forget(&id) {
+        warn!(
+            id = %id.0, error = %e,
+            "stopped the durability tail but could not remove its record; a later restart will \
+             log that the workload is not running here and leave it un-armed"
+        );
+    }
     // Route teardown to the native fork+exec backend (R858-B15), the write-side
     // twin of the `List` merge R858-B14 added. `ctx.native` is the
     // `--native-exec-dir` backend `deploy_native_exec` forks through — the
@@ -4267,6 +4391,19 @@ pub(crate) async fn stop_workload(
         // that declares one; a probe outliving its child would keep polling a
         // socket nothing is listening on.
         ctx.registry.lock().await.remove_probe(&id);
+        // R936-B11: a stopped workload must not come back on the next restart.
+        if let Some(records) = &ctx.native_records {
+            if let Err(e) = records.forget(&id) {
+                return KamajiToYubaba::Error {
+                    request_id: Some(request_id),
+                    code: ErrorCode::BackendRefused,
+                    message: format!(
+                        "native workload stopped but its deploy record could not be removed \
+                         (it would be resumed after the next kamaji restart): {e}"
+                    ),
+                };
+            }
+        }
     }
     #[cfg(feature = "containerd-integration")]
     if let Some(backend) = ctx.containerd.clone() {
@@ -5098,6 +5235,98 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// R936-B11: a native workload that opted in survives kamaji. Deploy it on
+    /// one kamaji, "restart" (a fresh ServerCtx + NativeRuntime over the same
+    /// dir, the old child torn down as a real restart's SIGKILL would), and
+    /// the fresh kamaji brings it back Running from the record alone — while
+    /// a native workload that did NOT opt in (headscale's shape) stays gone.
+    /// A Stop then removes the record, so a stopped door never resurrects.
+    #[cfg(all(unix, feature = "native-exec"))]
+    #[tokio::test]
+    async fn an_opted_in_native_workload_is_resumed_by_a_fresh_kamaji() {
+        use kamaji::Kamaji as _;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh_ctx = || {
+            Arc::new(
+                ServerCtx::new()
+                    .with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir.path())))
+                    .with_native_deploy_records(
+                        crate::deploy_records::NativeDeployRecords::under(dir.path()),
+                    ),
+            )
+        };
+        let native_spec = |name: &str, resume: bool| {
+            let mut spec = make_minimal_container_spec(name);
+            spec.annotations.insert(
+                workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+                workload_spec::NATIVE_EXEC_VALUE.to_string(),
+            );
+            if resume {
+                spec.annotations.insert(
+                    workload_spec::RESUME_AFTER_RESTART_ANNOTATION.to_string(),
+                    workload_spec::RESUME_AFTER_RESTART_VALUE.to_string(),
+                );
+            }
+            spec.command = Some(vec!["/bin/sleep".into(), "30".into()]);
+            spec
+        };
+        let running = |ctx: Arc<ServerCtx>| async move {
+            match handle_message(YubabaToKamaji::List { request_id: RequestId(9) }, &ctx).await {
+                KamajiToYubaba::WorkloadList { entries, .. } => entries
+                    .into_iter()
+                    .filter(|e| e.state == WorkloadState::Running)
+                    .map(|e| e.id.0)
+                    .collect::<Vec<_>>(),
+                other => panic!("expected WorkloadList, got {other:?}"),
+            }
+        };
+
+        let first = fresh_ctx();
+        for (i, (id, resume)) in [("inner-door", true), ("headscale", false)].iter().enumerate() {
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(200 + i as u64),
+                    id: WorkloadId::new(*id),
+                    spec: workload_spec::Workload::container(native_spec(id, *resume)),
+                    mesh: None,
+                },
+                &first,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::DeployAck { .. }), "{reply:?}");
+        }
+        let native = first.native.clone().unwrap();
+        for id in ["inner-door", "headscale"] {
+            native
+                .teardown_workload(&workload_spec::MeshIdent(id.into()))
+                .await
+                .unwrap();
+        }
+
+        let second = fresh_ctx();
+        assert!(running(Arc::clone(&second)).await.is_empty(), "the restart killed both");
+        assert_eq!(second.resume_native_workloads().await, 1);
+        assert_eq!(
+            running(Arc::clone(&second)).await,
+            vec!["inner-door".to_string()],
+            "only the opted-in workload comes back"
+        );
+
+        let reply = handle_message(
+            YubabaToKamaji::Stop {
+                request_id: RequestId(210),
+                id: WorkloadId::new("inner-door"),
+            },
+            &second,
+        )
+        .await;
+        assert!(matches!(reply, KamajiToYubaba::Ack { .. }), "{reply:?}");
+        assert!(
+            second.native_records.as_ref().unwrap().recorded().is_empty(),
+            "a stopped workload must not be resumed by the next restart"
+        );
     }
 
     /// True when `pid` names no live process — i.e. the child was killed *and*

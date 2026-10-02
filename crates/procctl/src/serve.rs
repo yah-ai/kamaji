@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{clear_stale_socket, control_sock_path, ProcStatus, STATUS_CMD};
+use crate::{abstract_name, clear_stale_socket, control_sock_path, ProcStatus, STATUS_CMD};
 
 /// A connected client that never sends its request line holds the listener
 /// thread. Bounded so a stuck peer costs one request's latency, not the
@@ -53,11 +53,15 @@ impl Drop for ControlServer {
         self.shutdown.store(true, Ordering::Release);
         // The listener thread is parked in a blocking `accept()`. Connecting to
         // ourselves is what wakes it; it then sees the flag and returns.
-        let _ = UnixStream::connect(&self.path);
+        let _ = connect(&self.path);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        // An abstract-namespace socket has no file; it vanishes with the
+        // listener. Unlinking `@name` would target a file in the cwd.
+        if abstract_name(&self.path).is_none() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -90,11 +94,7 @@ where
     F: Fn() -> ProcStatus + Send + 'static,
 {
     let path = path.into();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    clear_stale_socket(&path)?;
-    let listener = UnixListener::bind(&path)?;
+    let listener = bind(&path)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
@@ -120,6 +120,47 @@ where
         shutdown,
         thread: Some(thread),
     })
+}
+
+/// Bind `path`: a filesystem socket, or — on Linux and Android, for a path
+/// spelled `@name` — a socket in the abstract namespace.
+///
+/// The abstract form is the Android rail (R941). An app cannot put a socket
+/// anywhere the host can reach, and `adbd` cannot open one in the app's
+/// private data dir, but `adb forward tcp:N localabstract:<name>` reaches an
+/// abstract socket from the host. The supervisor hands the app `@<name>`; the
+/// app binds it here unchanged. Off Linux there is no abstract namespace, so
+/// `@name` is an ordinary relative path there — the same thing the platform
+/// would do with it anyway.
+fn bind(path: &Path) -> std::io::Result<UnixListener> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(name) = abstract_name(path) {
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+        return UnixListener::bind_addr(&addr);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    clear_stale_socket(path)?;
+    UnixListener::bind(path)
+}
+
+/// Connect to what [`bind`] bound — used only to wake the listener on drop.
+fn connect(path: &Path) -> std::io::Result<UnixStream> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(name) = abstract_name(path) {
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+        return UnixStream::connect_addr(&addr);
+    }
+    UnixStream::connect(path)
 }
 
 /// One connection: read request lines, answer each with one document line.
@@ -195,6 +236,31 @@ mod tests {
 
     fn ask_status(path: &Path) -> ProcStatus {
         serde_json::from_str(&ask(path, r#"{"cmd":"status"}"#)).unwrap()
+    }
+
+    /// `@name` binds the abstract namespace (the Android rail, R941): no file
+    /// appears, and the name is reachable by connecting to the same name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_at_path_binds_the_abstract_namespace() {
+        let name = format!("@procctl-test-{}", std::process::id());
+        let server = serve_at(&name, || ProcStatus::new(ProcState::Running)).unwrap();
+        assert!(!Path::new(&name).exists(), "abstract bind must not create a file");
+
+        let mut stream = connect(server.path()).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(b"{\"cmd\":\"status\"}\n").unwrap();
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply).unwrap();
+        let got: ProcStatus = serde_json::from_str(reply.trim()).unwrap();
+        assert_eq!(got.state, ProcState::Running);
+    }
+
+    #[test]
+    fn at_names_are_recognised_and_bare_at_is_not() {
+        assert_eq!(abstract_name(Path::new("@yah.dev")), Some("yah.dev"));
+        assert_eq!(abstract_name(Path::new("@")), None);
+        assert_eq!(abstract_name(Path::new("/tmp/x.sock")), None);
     }
 
     #[test]

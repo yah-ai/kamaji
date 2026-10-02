@@ -67,6 +67,21 @@
 //! @yah:handoff("DELIVERED TO ALL EIGHT LINUX FLEET NODES, and the consumer is live. Operator authorized a hotship on 2026-09-13 with the release (option B) still the intended destination — \"you can hotship for now, and feel free to hit ALL nodes, prod + dev\". `scripts/hotship.sh --binaries kamaji,yubaba` in two runs: stamp 0.8.40-h3 on the three prod voters (us-east-001, us-west-001, us-south-001, leader us-south-001 ordered last by the script) and 0.8.40-h4 on the five dev/LAN nodes (us-west-002, -003, -011, -013, -014). Every node re-joined healthy with `{\"status\":\"ok\",\"cluster_protocol\":7,\"state_epoch\":6}` and kamaji_version matching yubaba_version on each. VERIFIED BY CONTENT, NOT BY VERSION STRING, on all eight: `grep -a -c from_secret_mount /usr/local/bin/{kamaji,yubaba}` is non-zero everywhere (kamaji 1, yubaba 5 on x86_64 / 4 on aarch64 — a codegen difference, not a missing feature), where the pre-ship reading was 0 and 0. THE CONSUMER CLOSED THE SAME DAY: noisetable R131-T16 pasted W124 §8.1's block and `yah cloud workload deploy noisetable-account` was ACCEPTED where it returned BackendRefused the day before. kamaji's journal reached `hydrate-on-place outcome={\"outcome\":\"already_populated\"}`, then `durability tail started tier=\"stream\"`, then rounds ~30s apart with all four subjects `state:\"streamed\"`.")
 //! @yah:verify("TWO DEFECTS FOUND AND FIXED ON THE PATH, both loud rather than worked around. (1) `scripts/hotship.sh` WOULD HAVE SHIPPED A LINUX-MUSL BINARY TO A MAC. us-west-015 is aarch64 AND macOS, and `triple_for()` read `arch` alone — so a 9-node dry run printed \"would ship kamaji yubaba and restart\" for it, resolving `aarch64-unknown-linux-musl`. This is the SAME defect R755-B7 fixed in roll-node.sh, which hotship.sh never learned; a dry run proves the ARTIFACT and never that the NODE can run it. Added `node_os()` (the same `awk /^mesh_tags/,/\\]/` reader roll-node.sh uses) and a refusal in `triple_for`. Negative-controlled both directions: us-west-015 now exits with \"REFUSED: us-west-015 declares os:darwin\" naming the node and the reason, while a us-west-011 dry run is byte-for-byte unchanged. `bash -n` clean. us-west-015 was therefore EXCLUDED from the ship — \"all nodes\" is eight, not nine, and the ninth is structurally unable to take this artifact. (2) R858-B26's six unswept `from_secret_mount` call sites in microvm.rs are swept — recorded on B26 itself. That was not optional here: hotship builds kamaji WITH `microvm` (scripts/hotship.sh:279), and `cargo test -p kamaji --lib --all-features` went E0063 x6 -> 317 passed / 0 failed.")
 //! @yah:gotcha("THESE ARE HOTSHIP BYTES ON NO CDN MANIFEST — eight fleet nodes now run kamaji/yubaba that match no release, and noisetable's production sign-in durability depends on them. The operator's stated goal is still a real release (option B); this ticket bought time, it did not replace it. WHAT A RELEASE MUST CARRY, at minimum: R858-B26's counting fix (the thing shipped here), and it should be cut from a tree where `cargo test -p kamaji --lib --all-features` is green, which it now is. NOTHING WAS COMMITTED OR TAGGED — this camp is in git defer mode and the working tree carries R858-B26's fix (oss/yah-base/.../lib.rs, oss/yubaba/.../secret_mount.rs, oss/kamaji/.../hydrate.rs, validate.rs), my microvm.rs sweep and my scripts/hotship.sh guard, all uncommitted. A release cut from this tree is behaviorally what is on the nodes; a release cut after a peer sweep may not be.")
+//!
+//! @yah:ticket(R936-B13, "kamaji's durability credential is one node-wide S3 key pair, so a floater cannot hydrate off its home node and east's headscale pair is clobbered")
+//! @yah:status(review)
+//! @yah:at(2026-09-23T00:50:40Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R936)
+//! @yah:severity(high)
+//! @yah:next("MEASURED 2026-09-23 (R936-B12, @Glimmerstone:libra). kamaji hands its hydrate/tail helpers ONE S3_ACCESS_KEY/S3_SECRET_KEY pair from kamaji.service's env. On us-east-001 two drop-ins (51-headscale-durability-cred.conf and 51-noisetable-account-durability-cred.conf) each set that same pair from different EnvironmentFiles. The later one wins (inference from systemd drop-in order, not read), so a headscale hydrate/tail on east would use the noisetable key. south and west carry only the headscale pair, so a noisetable-account hydrate there fails. MEASURED: a noisetable-marketing-issues hydrate on west against s3://noisetable-account-backup/noisetable-issues returned 403 AccessDenied on latest.owner-claim. FIX: select credentials per store bucket. For example, when spawning a helper for s3://<bucket>/..., kamaji sets S3_ACCESS_KEY/S3_SECRET_KEY from S3_ACCESS_KEY__<BUCKET>/S3_SECRET_KEY__<BUCKET> when present and falls back to the bare pair. Then rewrite the drop-ins to bucket-scoped names on all three voters and place the noisetable-account-backup pair on south and west. A kamaji restart kills containers, but R936-B12's floater effector restarts an owned floater that it finds Dead or Absent. Tier: Warrior. This blocks R936-B12's acceptance drill.")
+//! @yah:handoff("CODE LANDED (uncommitted) by @Ashguard:dove (session:63942c01). oss/kamaji/crates/kamaji-bin/src/hydrate.rs: new `BucketCredentials` (from_env collects only S3_ACCESS_KEY__<BUCKET>/S3_SECRET_KEY__<BUCKET>; `bucket_env_suffix` = ASCII-uppercase, non-[A-Z0-9] -> '_', so yah-headscale -> YAH_HEADSCALE, noisetable-account-backup -> NOISETABLE_ACCOUNT_BACKUP), `for_bucket` errors naming each missing var (never a value; Debug prints names only), `apply` sets the helper's bare S3_ACCESS_KEY/S3_SECRET_KEY from its own bucket's pair and env_removes every other scoped var. NO bare-pair fallback: a bare S3_ACCESS_KEY in kamaji's env is ignored and main.rs warns loudly at startup. hydrate::run/preflight and tail::preflight/command/launch take the creds (ServerCtx.durability_credentials, set in main.rs via with_durability_credentials); a declared workload whose bucket has no pair is refused at deploy preflight before any restore/start. S3_ENDPOINT/S3_REGION stay node-wide (inherited).")
+//! @yah:verify("cd oss/kamaji && cargo test -p kamaji-bin --lib: baseline 232 passed -> 240 passed, 0 failed (+8: bucket suffix normalisation, per-bucket selection ignoring bare pair, half-pair names missing var and no value, hydrate preflight refusal, helper sees only its own pair (fake helper echo), run refuses without spawning, tail command env scoping + missing-var error, tail preflight refusal). cargo check -p kamaji-bin --bins with hotship features (containerd-integration,native-exec,bundle-serving,microvm,tenant-passway) EXIT 0.")
+//! @yah:handoff("PROD ROLLED 2026-09-23 00:47-00:50Z by @Ashguard:dove (session:63942c01), after @Ashguard:coffee released the window (B7 drill over, south back). Order south -> east -> west (headscale owner last). Per node: /tmp/r936b13-stage.sh over `sudo sh -s` stdin writes /etc/yah-cloud/durability-cred-yah-headscale.env and durability-cred-noisetable-account-backup.env (0600, keys renamed by sed from the existing headscale-durability.env / noisetable-account-durability.env, never printed), writes kamaji.service.d/51-durability-creds.conf (both EnvironmentFiles + the shared R2 S3_ENDPOINT, S3_REGION=auto), renames the old 51-headscale-durability-cred.conf / 51-noisetable-account-durability-cred.conf to *.rollback-r936b13, daemon-reload. Then scripts/hotship.sh --binaries kamaji one node at a time: south 0.8.42-h19, east h20, west h21. noisetable-account-durability.env (the source pair) was piped east -> south and west over ssh stdin. It was absent on both before, and nothing was printed.")
+//! @yah:handoff("VERIFIED PER NODE, key fingerprints only (sha256 prefix of the access key id): kamaji's /proc environ now carries only the 4 scoped vars plus endpoint/region, with no bare pair, and startup logs `durability credentials (per bucket) vars=[...]`. EAST: the noisetable-account containerd task (pid 5922) SURVIVED the kamaji restart, so the floater effector had nothing to restart. Its tail re-armed via R932 with bucket noisetable-account-backup, key fp 0600d9c7 (the noisetable key), and zero other scoped vars in the helper env. The floater record is unchanged (owner 3, epoch 1). WEST: kamaji's restart killed headscale, and yubaba re-elected and redeployed it within 8s. Its hydrate came back already_populated through the new code path, and its tail started streaming to appliance/prod/headscale (epoch 6) with key fp ec226679 (the headscale key). SOUTH owns nothing, and only passway was re-forked there. The door probe after every step showed all doors 200 except scrabcake.com 503 (known).")
+//! @yah:handoff("ACCEPTANCE on WEST: turso-backup-hydrate against s3://noisetable-account-backup/r936-b13-probe-1790124617, keyed from S3_ACCESS_KEY__NOISETABLE_ACCOUNT_BACKUP exactly as kamaji now selects it (secrets via exported env, never argv), into a scratch VOLUME_ROOT -> {\"outcome\":\"nothing_in_the_store\",\"epoch\":1}, exit 0, with no 403. It used a throwaway prefix deliberately: the helper has no dry/verify mode, and a hydrate on the live prefix takes the ownership claim, which would fence east's live tail. NEGATIVE CONTROL on the same bucket with the yah-headscale key -> 'lacked the necessary privileges' on PUT, exit 1, which is the original clobber reproduced. The probe claim object was deleted over curl --aws-sigv4 (-K - stdin), and both probe prefixes re-list KeyCount 0. The script is /tmp/r936b13-accept.sh.")
+//! @yah:gotcha("A bare S3_ACCESS_KEY/S3_SECRET_KEY in kamaji's env is now IGNORED (startup WARN). A new voter needs 51-durability-creds.conf with S3_ACCESS_KEY__<BUCKET>/S3_SECRET_KEY__<BUCKET> for every durability bucket: the bucket name ASCII-uppercased, with every non-alphanumeric turned into '_'. No in-tree script renders kamaji cred drop-ins (they are hand-placed, as before). stand-up-yubaba.sh does not write one. A declared workload whose bucket has no pair is refused at deploy preflight, naming the missing var.")
+//! @yah:gotcha("Kamaji natives inherit kamaji's env (no env_clear, per the retired noisetable drop-in's own comment), so every native on a voter now inherits BOTH buckets' scoped pairs where before it had one bare pair. This is pre-existing exposure, widened by one bucket. The durability helpers themselves are scrubbed to their own pair.")
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -102,7 +117,16 @@ pub enum HydratePlan {
 }
 
 /// The environment `turso-backup-hydrate` is invoked with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because [`crate::tail`] persists one per armed workload so a
+/// kamaji restart can re-arm it (R932). It is the *whole* of what the tail
+/// needs and it carries no credential material — the helper's key pair is
+/// selected from kamaji's environment by `bucket` at spawn time
+/// ([`BucketCredentials`]), never stored here — which is why the record is
+/// this and not the `WorkloadSpec` it was derived from. A spec on disk is the
+/// R876-B2 defect: that record materializes the workload's `env` verbatim,
+/// live secrets included.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HydrateArgs {
     /// Host path of the workload's single named volume.
     pub volume_root: PathBuf,
@@ -198,6 +222,112 @@ fn split_store_url(store: &str) -> Option<(String, String)> {
     Some((bucket.to_string(), prefix.to_string()))
 }
 
+/// Prefix of the env var carrying a bucket's access key: `S3_ACCESS_KEY__<BUCKET>`.
+pub const ACCESS_KEY_PREFIX: &str = "S3_ACCESS_KEY__";
+/// Prefix of the env var carrying a bucket's secret key: `S3_SECRET_KEY__<BUCKET>`.
+pub const SECRET_KEY_PREFIX: &str = "S3_SECRET_KEY__";
+
+/// The `<BUCKET>` suffix of a bucket's credential variables: ASCII-uppercased,
+/// every character outside `[A-Z0-9]` turned into `_`. So `yah-headscale` is
+/// `YAH_HEADSCALE` and `noisetable-account-backup` is
+/// `NOISETABLE_ACCOUNT_BACKUP`. S3 bucket names are lowercase letters, digits,
+/// `-` and `.`, so the only collisions are names differing only in `-` vs `.`,
+/// which no two buckets in one fleet should.
+pub fn bucket_env_suffix(bucket: &str) -> String {
+    bucket
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect()
+}
+
+/// R936-B13 — the S3 key pairs this node holds, one per store **bucket**.
+///
+/// There is no node-wide pair. A node can host workloads backed by different
+/// buckets under different keys (headscale and noisetable-account on
+/// us-east-001), and a floater re-homed onto a node must find its own bucket's
+/// key there. One `S3_ACCESS_KEY`/`S3_SECRET_KEY` for the whole node meant the
+/// later systemd drop-in silently won, and the other workload's helper got a
+/// 403 — or, worse, wrote with a key scoped to someone else's bucket.
+///
+/// Read once from kamaji's environment ([`Self::from_env`]); each helper is
+/// then handed exactly its own bucket's pair as the bare
+/// `S3_ACCESS_KEY`/`S3_SECRET_KEY` it has always read, and none of the others.
+/// Values never reach a log or an error — only variable names do.
+#[derive(Clone, Default)]
+pub struct BucketCredentials {
+    /// Env var name → value, only the `S3_ACCESS_KEY__*` / `S3_SECRET_KEY__*` ones.
+    vars: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for BucketCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketCredentials")
+            .field("vars", &self.vars.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl BucketCredentials {
+    /// Collect the bucket-scoped pairs from `vars` (name, value). Anything
+    /// else — including a bare `S3_ACCESS_KEY` — is ignored.
+    pub fn from_vars(vars: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            vars: vars
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(ACCESS_KEY_PREFIX) || k.starts_with(SECRET_KEY_PREFIX))
+                .collect(),
+        }
+    }
+
+    /// [`Self::from_vars`] over kamaji's own environment.
+    pub fn from_env() -> Self {
+        Self::from_vars(std::env::vars())
+    }
+
+    /// Every variable name held, for scrubbing a helper's inherited env and for
+    /// the startup log. Names only.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.vars.keys().map(String::as_str)
+    }
+
+    /// The `(access, secret)` pair for `bucket`, or an error naming the
+    /// variable that is missing. `Err` refuses the deploy: a helper started
+    /// without its bucket's key would either 403 (a hydrate that cannot reach a
+    /// verdict) or — with some other bucket's key — fail in a way that names
+    /// the wrong cause.
+    pub fn for_bucket(&self, bucket: &str) -> Result<(&str, &str), String> {
+        let suffix = bucket_env_suffix(bucket);
+        let access_name = format!("{ACCESS_KEY_PREFIX}{suffix}");
+        let secret_name = format!("{SECRET_KEY_PREFIX}{suffix}");
+        let get = |name: &str| self.vars.get(name).map(String::as_str).filter(|v| !v.is_empty());
+        let missing: Vec<&str> = [&access_name, &secret_name]
+            .into_iter()
+            .filter(|n| get(n).is_none())
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "this kamaji holds no S3 credential for bucket {bucket:?}: {} not set in its \
+                 environment (R936-B13: credentials are per bucket; set them in a \
+                 kamaji.service drop-in)",
+                missing.join(" and ")
+            ));
+        }
+        Ok((get(&access_name).unwrap(), get(&secret_name).unwrap()))
+    }
+
+    /// Point `cmd` at `bucket`'s pair as `S3_ACCESS_KEY`/`S3_SECRET_KEY`, and
+    /// strip every other bucket's pair it would otherwise inherit from kamaji.
+    pub fn apply(&self, cmd: &mut tokio::process::Command, bucket: &str) -> Result<(), String> {
+        let (access, secret) = self.for_bucket(bucket)?;
+        for name in self.names() {
+            cmd.env_remove(name);
+        }
+        cmd.env("S3_ACCESS_KEY", access).env("S3_SECRET_KEY", secret);
+        Ok(())
+    }
+}
+
 /// Outcome of a hydrate attempt, from kamaji's point of view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HydrateResult {
@@ -218,6 +348,7 @@ pub enum HydrateResult {
 /// when starting anyway is worst.
 pub async fn run(
     helper: Option<&std::path::Path>,
+    creds: &BucketCredentials,
     spec: &WorkloadSpec,
 ) -> Result<HydrateResult, String> {
     let args = match plan(spec)? {
@@ -228,18 +359,21 @@ pub async fn run(
         return Err(no_helper(spec, &args));
     };
 
-    let output = tokio::process::Command::new(helper)
-        .env("VOLUME_ROOT", &args.volume_root)
+    let mut cmd = tokio::process::Command::new(helper);
+    cmd.env("VOLUME_ROOT", &args.volume_root)
         .env("SUBJECTS", args.subjects.join(","))
         .env("TIER", args.tier.as_str())
         .env("OWNER", owner_label())
         .env("S3_BUCKET", &args.bucket)
         .env("BACKUP_PREFIX", &args.prefix)
-        // Credentials and endpoint are inherited from kamaji's own
-        // environment (S3_ACCESS_KEY / S3_SECRET_KEY / S3_ENDPOINT /
-        // S3_REGION) rather than set here. kamaji never reads them, so they do
-        // not pass through a supervisor that has no business holding them.
-        .stdin(Stdio::null())
+        // Endpoint and region are inherited from kamaji's environment
+        // (S3_ENDPOINT / S3_REGION). The key pair is not: it is selected per
+        // bucket (R936-B13).
+        .stdin(Stdio::null());
+    creds
+        .apply(&mut cmd, &args.bucket)
+        .map_err(|e| format!("workload {}: {e}", spec.name))?;
+    let output = cmd
         .output()
         .await
         .map_err(|e| {
@@ -266,11 +400,18 @@ pub async fn run(
 /// halves' preconditions together, before either does any work. `run` keeps its
 /// own copy of the check because it is public and a caller that skipped this
 /// must still be refused.
-pub fn preflight(helper: Option<&std::path::Path>, spec: &WorkloadSpec) -> Result<(), String> {
+pub fn preflight(
+    helper: Option<&std::path::Path>,
+    creds: &BucketCredentials,
+    spec: &WorkloadSpec,
+) -> Result<(), String> {
     match plan(spec)? {
         HydratePlan::NotDeclared => Ok(()),
         HydratePlan::Declared(args) if helper.is_none() => Err(no_helper(spec, &args)),
-        HydratePlan::Declared(_) => Ok(()),
+        HydratePlan::Declared(args) => creds
+            .for_bucket(&args.bucket)
+            .map(|_| ())
+            .map_err(|e| format!("workload {}: {e}", spec.name)),
     }
 }
 
@@ -284,27 +425,57 @@ fn no_helper(spec: &WorkloadSpec, args: &HydrateArgs) -> String {
     )
 }
 
-/// Label recorded in the ownership claim.
+/// Label recorded in the ownership claim: this node's identity, stable across
+/// kamaji restarts.
 ///
-/// Diagnostic only — the epoch is what fences, and two acquires under the same
-/// label are still two takeovers (see `turso_backup::claim::ClaimRecord`). So a
-/// missing node id degrades the 3am experience rather than the safety property,
-/// and is not worth refusing a deploy over.
+/// The epoch is what fences, and two acquires under one label are still two
+/// takeovers (see `turso_backup::claim::ClaimRecord`). But since R936-B2 the
+/// label is also how a hydrate knows whether this node's populated volume is
+/// the claim holder's own copy: a claim held under a DIFFERENT label means
+/// someone else streamed after this volume was written, and the volume is
+/// displaced and restored. So the label must be the node, never the process.
+/// The old `kamaji-pid-<pid>` fallback was what every prod claim carried (no
+/// systemd unit sets `HOSTNAME`), which would read every restart as a stranger.
 pub(crate) fn owner_label() -> String {
-    for key in ["KAMAJI_NODE_ID", "HOSTNAME"] {
-        if let Ok(v) = std::env::var(key) {
-            let token = v.split_whitespace().next().unwrap_or("");
-            if !token.is_empty() {
-                return token.to_string();
-            }
-        }
-    }
-    format!("kamaji-pid-{}", std::process::id())
+    owner_label_from(
+        |key| std::env::var(key).ok(),
+        std::fs::read_to_string("/etc/hostname").ok(),
+    )
+    .unwrap_or_else(|| format!("kamaji-pid-{}", std::process::id()))
+}
+
+/// [`owner_label`] with its host inputs passed in: `KAMAJI_NODE_ID`, then
+/// `HOSTNAME`, then `/etc/hostname`, first non-blank token of each.
+fn owner_label_from(
+    env: impl Fn(&str) -> Option<String>,
+    etc_hostname: Option<String>,
+) -> Option<String> {
+    ["KAMAJI_NODE_ID", "HOSTNAME"]
+        .into_iter()
+        .filter_map(|key| env(key))
+        .chain(etc_hostname)
+        .find_map(|v| v.split_whitespace().next().map(str::to_string))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R936-B2: with no env set (every prod kamaji.service), the label is the
+    /// node's hostname, so it survives a kamaji restart.
+    #[test]
+    fn owner_label_is_the_node_not_the_process() {
+        assert_eq!(
+            owner_label_from(|_| None, Some("vps-4c1efa56\n".into())).as_deref(),
+            Some("vps-4c1efa56")
+        );
+        let env = |k: &str| (k == "KAMAJI_NODE_ID").then(|| "us-west-001".to_string());
+        assert_eq!(
+            owner_label_from(env, Some("vps-4c1efa56".into())).as_deref(),
+            Some("us-west-001")
+        );
+        assert_eq!(owner_label_from(|_| Some("  ".into()), Some("\n".into())), None);
+    }
 
     /// `for_forge` is used purely as a constructor with every required field
     /// already filled — this module reads only `name`, `volumes` and
@@ -545,7 +716,7 @@ mod tests {
     /// an empty database and no error anywhere.
     #[tokio::test]
     async fn a_declared_workload_with_no_helper_is_refused_not_started() {
-        let err = run(None, &spec_with(declared(), vec![named("accounts")]))
+        let err = run(None, &creds(), &spec_with(declared(), vec![named("accounts")]))
             .await
             .unwrap_err();
         assert!(err.contains("--hydrate-helper"), "{err}");
@@ -556,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn an_undeclared_workload_proceeds_with_no_helper() {
         assert_eq!(
-            run(None, &spec_with(None, vec![named("accounts")]))
+            run(None, &creds(), &spec_with(None, vec![named("accounts")]))
                 .await
                 .unwrap(),
             HydrateResult::Proceed(None)
@@ -572,7 +743,7 @@ mod tests {
             "refuse",
             "#!/bin/sh\necho '{\"outcome\":\"refused\",\"reason\":\"torn_volume\"}'\nexit 2\n",
         );
-        let err = run(Some(&helper), &spec_with(declared(), vec![named("accounts")]))
+        let err = run(Some(&helper), &creds(), &spec_with(declared(), vec![named("accounts")]))
             .await
             .unwrap_err();
         assert!(err.contains("torn_volume"), "{err}");
@@ -585,7 +756,7 @@ mod tests {
             "ok",
             "#!/bin/sh\necho \"{\\\"outcome\\\":\\\"hydrated\\\",\\\"subjects\\\":$SUBJECTS}\"\n",
         );
-        let out = run(Some(&helper), &spec_with(declared(), vec![named("accounts")]))
+        let out = run(Some(&helper), &creds(), &spec_with(declared(), vec![named("accounts")]))
             .await
             .unwrap();
         let HydrateResult::Proceed(Some(line)) = out else {
@@ -600,11 +771,100 @@ mod tests {
     async fn an_unspawnable_helper_is_a_refusal() {
         let err = run(
             Some(std::path::Path::new("/nonexistent/turso-backup-hydrate")),
+            &creds(),
             &spec_with(declared(), vec![named("accounts")]),
         )
         .await
         .unwrap_err();
         assert!(err.contains("could not run hydrate helper"), "{err}");
+    }
+
+    /// The pair every declared test spec's bucket (`yah-backups`) needs, plus
+    /// another bucket's, which must never reach the helper.
+    fn creds() -> BucketCredentials {
+        BucketCredentials::from_vars([
+            ("S3_ACCESS_KEY__YAH_BACKUPS".to_string(), "ak-backups".to_string()),
+            ("S3_SECRET_KEY__YAH_BACKUPS".to_string(), "sk-backups".to_string()),
+            ("S3_ACCESS_KEY__YAH_HEADSCALE".to_string(), "ak-headscale".to_string()),
+            ("S3_SECRET_KEY__YAH_HEADSCALE".to_string(), "sk-headscale".to_string()),
+            ("S3_ACCESS_KEY".to_string(), "bare-ak".to_string()),
+        ])
+    }
+
+    /// R936-B13: the suffix normalisation, including the dashes every prod
+    /// bucket carries and the dot S3 also allows.
+    #[test]
+    fn a_bucket_name_normalises_to_an_env_suffix() {
+        assert_eq!(bucket_env_suffix("yah-headscale"), "YAH_HEADSCALE");
+        assert_eq!(bucket_env_suffix("noisetable-account-backup"), "NOISETABLE_ACCOUNT_BACKUP");
+        assert_eq!(bucket_env_suffix("logs.v2-eu"), "LOGS_V2_EU");
+        assert_eq!(bucket_env_suffix("abc123"), "ABC123");
+    }
+
+    /// Each bucket gets its own pair; the bare node-wide pair is not a fallback.
+    #[test]
+    fn credentials_are_selected_by_bucket_and_the_bare_pair_is_ignored() {
+        let c = creds();
+        assert_eq!(c.for_bucket("yah-backups").unwrap(), ("ak-backups", "sk-backups"));
+        assert_eq!(c.for_bucket("yah-headscale").unwrap(), ("ak-headscale", "sk-headscale"));
+        assert!(!c.names().any(|n| n == "S3_ACCESS_KEY"), "the bare pair must not be collected");
+        let err = c.for_bucket("noisetable-account-backup").unwrap_err();
+        assert!(err.contains("S3_ACCESS_KEY__NOISETABLE_ACCOUNT_BACKUP"), "{err}");
+        assert!(err.contains("S3_SECRET_KEY__NOISETABLE_ACCOUNT_BACKUP"), "{err}");
+    }
+
+    /// Half a pair (or an empty value) is missing, and the error names only
+    /// the missing half and never a value.
+    #[test]
+    fn a_half_pair_names_the_missing_variable_and_no_value() {
+        let c = BucketCredentials::from_vars([
+            ("S3_ACCESS_KEY__B".to_string(), "secret-value".to_string()),
+            ("S3_SECRET_KEY__B".to_string(), String::new()),
+        ]);
+        let err = c.for_bucket("b").unwrap_err();
+        assert!(err.contains("S3_SECRET_KEY__B"), "{err}");
+        assert!(!err.contains("S3_ACCESS_KEY__B"), "{err}");
+        assert!(!err.contains("secret-value"), "{err}");
+        assert!(!format!("{c:?}").contains("secret-value"));
+    }
+
+    /// A declared workload whose bucket has no credential is refused at
+    /// preflight, before anything is restored or started.
+    #[test]
+    fn preflight_refuses_a_bucket_with_no_credential() {
+        let spec = spec_with(declared(), vec![named("accounts")]);
+        let helper = std::path::Path::new("/bin/true");
+        assert!(preflight(Some(helper), &creds(), &spec).is_ok());
+        let err = preflight(Some(helper), &BucketCredentials::default(), &spec).unwrap_err();
+        assert!(err.contains("S3_ACCESS_KEY__YAH_BACKUPS"), "{err}");
+    }
+
+    /// The helper sees its own bucket's pair as the bare names it reads, and
+    /// no other bucket's scoped pair.
+    #[tokio::test]
+    async fn the_helper_gets_only_its_own_buckets_pair() {
+        let helper = fake_helper(
+            "creds",
+            "#!/bin/sh\necho \"$S3_ACCESS_KEY/$S3_SECRET_KEY/${S3_ACCESS_KEY__YAH_HEADSCALE:-none}\"\n",
+        );
+        let out = run(Some(&helper), &creds(), &spec_with(declared(), vec![named("accounts")]))
+            .await
+            .unwrap();
+        assert_eq!(out, HydrateResult::Proceed(Some("ak-backups/sk-backups/none".into())));
+    }
+
+    /// No credential for the bucket: refused, the helper never runs.
+    #[tokio::test]
+    async fn run_refuses_a_bucket_with_no_credential() {
+        let helper = fake_helper("nocreds", "#!/bin/sh\necho ran\n");
+        let err = run(
+            Some(&helper),
+            &BucketCredentials::default(),
+            &spec_with(declared(), vec![named("accounts")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("S3_ACCESS_KEY__YAH_BACKUPS"), "{err}");
     }
 
     fn fake_helper(tag: &str, script: &str) -> PathBuf {
