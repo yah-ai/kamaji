@@ -31,7 +31,6 @@
 //!
 //! @yah:relay(R896, "Evolvable kamaji wire envelope: stop the schema migrating into annotations")
 //! @yah:at(2026-09-11T22:26:53Z)
-//! @yah:status(handoff)
 //! @yah:assignee(agent:user-custom-char-gul2)
 //! @yah:next("From the 2026-09-11 yubaba/kamaji architecture review (chat session:d6fc1d54): the positional-postcard wire makes every WorkloadSpec field change a fleet-wide coordinated roll (R885-T6's three-node bump), so new schema-shaped facts now land in annotations instead of fields — yah.limits.*, yah.durability.*, yah.placement.* — a stringly second WorkloadSpec that bypasses the JSON schema, TS export and serde validation, with R885-T6's handoff naming the cost driver outright (\"annotation not field, because a field costs exactly the wire bump\"). Substrate MARKERS (yah.exec, yah.sandbox) are correct as annotations and stay. This track exists to make single-node hotships able to cross a field change, which is what keeps the chaos-survivability property cheap permanently.")
 //! @arch:see(oss/yah-base/crates/workload-spec/src/lib.rs)
@@ -46,7 +45,7 @@ pub use codec::{decode_frame, encode_frame, Error, MAX_FRAME_BYTES};
 pub use digest::{spec_digest, SpecDigest};
 pub use messages::{
     AckKind, DrainBudget, DrainOutcome, DrainPhase, ErrorCode, ExitStatus, KamajiToYubaba,
-    MeshAssignment, MicroVmHealth, NodeCapabilities, ProbeStatus, RequestId, WireguardPeer,
-    WorkloadEntry, WorkloadId, WorkloadState, YubabaToKamaji,
+    LogRecord, LogStreamTag, MeshAssignment, MicroVmHealth, NodeCapabilities, ProbeStatus,
+    RequestId, WireguardPeer, WorkloadEntry, WorkloadId, WorkloadState, YubabaToKamaji,
 };
 pub use version::ProtocolVersion;

@@ -491,6 +491,51 @@ pub enum YubabaToKamaji {
         request_id: RequestId,
         id: WorkloadId,
     },
+    /// Stream a workload's output from `cursor` onward (R729-F2, W257
+    /// "Decision (R729-S1)").
+    ///
+    /// The one request that is NOT one-request-one-reply: Kamaji answers with
+    /// any number of [`KamajiToYubaba::LogBatch`] frames and closes with exactly
+    /// one [`KamajiToYubaba::LogEnd`] once the workload is terminal **and** its
+    /// log source is drained. Send it only on a **dedicated** connection — the
+    /// shared control connection correlates each request to a single reply, and
+    /// a follow stream there would starve the `List` every `/state` poll sends.
+    ///
+    /// `id` is matched against both `WorkloadEntry.id` and `mesh_ident`, the
+    /// same split `GET /state` resolves (container `forge-<uuid>` vs mesh
+    /// `forge.<uuid>`). `cursor` is opaque, minted by Kamaji on a previous
+    /// [`LogRecord`]; `None` means full backfill.
+    ///
+    /// Appended last, so no existing discriminant moves, and gated on
+    /// [`NodeCapabilities::log_stream`] rather than a [`ProtocolVersion`] bump:
+    /// a caller that sees `log_stream == false` never sends it, so an older
+    /// Kamaji never has to decode it.
+    Logs {
+        request_id: RequestId,
+        id: WorkloadId,
+        cursor: Option<String>,
+    },
+}
+
+/// Which stdio stream a [`LogRecord`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStreamTag {
+    Stdout,
+    Stderr,
+}
+
+/// One line of workload output on the [`YubabaToKamaji::Logs`] stream.
+///
+/// Rides the name-keyed envelope (inside `LogBatch.records`), so a later field
+/// is free. `cursor` is the position just AFTER this record: resuming from it
+/// yields the next record, no duplicate and no gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRecord {
+    pub stream: LogStreamTag,
+    pub cursor: String,
+    pub ts_ms: u64,
+    pub line: String,
 }
 
 /// Kamaji → Yubaba message variants.
@@ -647,6 +692,24 @@ pub enum KamajiToYubaba {
         id: WorkloadId,
         hydrate: Option<String>,
     },
+    /// Zero or more lines answering [`YubabaToKamaji::Logs`] (R729-F2). An
+    /// empty batch is a keepalive, sent after a quiet interval so the reader
+    /// can tell a silent workload from a dead connection; `cursor` repeats the
+    /// last position so far (`None` before the first record).
+    LogBatch {
+        request_id: RequestId,
+        #[serde(with = "crate::tolerant")]
+        records: Vec<LogRecord>,
+        cursor: Option<String>,
+    },
+    /// The single clean close of a [`YubabaToKamaji::Logs`] stream: the
+    /// workload is terminal and its source is drained. Carries NO exit code on
+    /// purpose — the `/state` poll is the only exit-code writer (W257). The
+    /// connection closing without this frame is a drop, never a finish.
+    LogEnd {
+        request_id: RequestId,
+        cursor: Option<String>,
+    },
 }
 
 /// What one Kamaji can actually dispatch to (R858-T4).
@@ -688,6 +751,12 @@ pub struct NodeCapabilities {
     /// wire carried no capability query at all for this backend (unlike
     /// `native_exec`, which R858-T4 already covers here).
     pub microvm: MicroVmHealth,
+    /// Whether this Kamaji serves [`YubabaToKamaji::Logs`] (R729-F2). Defaults
+    /// to `false` — which genuinely means "cannot": a Kamaji that predates the
+    /// field does not know the variant, so a caller must not send it and should
+    /// answer its own `/logs` with 501.
+    #[serde(default)]
+    pub log_stream: bool,
 }
 
 /// Live microVM-backend health, folded into [`NodeCapabilities`] (R605-T27).
@@ -762,7 +831,9 @@ impl KamajiToYubaba {
             | Self::DeployStatusResult { request_id, .. }
             | Self::CapabilitiesReport { request_id, .. }
             | Self::WorkloadDescription { request_id, .. }
-            | Self::DeployAck { request_id, .. } => Some(*request_id),
+            | Self::DeployAck { request_id, .. }
+            | Self::LogBatch { request_id, .. }
+            | Self::LogEnd { request_id, .. } => Some(*request_id),
             Self::Error { request_id, .. } => *request_id,
             Self::Welcome { .. } | Self::WorkloadStarted { .. } | Self::WorkloadExited { .. } => {
                 None
@@ -845,6 +916,7 @@ mod reply_correlation_tests {
                         kvm_ok: None,
                         detail: None,
                     },
+                    log_stream: true,
                 },
             },
             // R870-B24: a `None` spec is still an ANSWER to a request, so it
@@ -888,5 +960,82 @@ mod reply_correlation_tests {
         for push in pushes {
             assert_eq!(push.reply_request_id(), None, "{push:?} is not a reply");
         }
+    }
+}
+
+/// R729-F2: the `Logs` variants are appended, not inserted, so every frame a
+/// pre-F2 peer produces still decodes to the same variant — the R850-T4
+/// renumbering is the failure this pins against.
+#[cfg(test)]
+mod log_stream_wire_tests {
+    use super::*;
+    use crate::{decode_frame, encode_frame};
+
+    #[test]
+    fn pre_existing_discriminants_do_not_move() {
+        // postcard writes the variant index as the first payload byte. These
+        // are the indices a V13 peer without the Logs variants writes.
+        let describe = postcard::to_allocvec(&YubabaToKamaji::Describe {
+            request_id: RequestId(1),
+            id: WorkloadId::new("w"),
+        })
+        .unwrap();
+        assert_eq!(describe[0], 9, "Describe must stay variant 9");
+        let ack = postcard::to_allocvec(&KamajiToYubaba::DeployAck {
+            request_id: RequestId(1),
+            id: WorkloadId::new("w"),
+            hydrate: None,
+        })
+        .unwrap();
+        assert_eq!(ack[0], 12, "DeployAck must stay variant 12");
+
+        let logs = postcard::to_allocvec(&YubabaToKamaji::Logs {
+            request_id: RequestId(1),
+            id: WorkloadId::new("w"),
+            cursor: None,
+        })
+        .unwrap();
+        assert_eq!(logs[0], 10, "Logs is appended after Describe");
+        let end = postcard::to_allocvec(&KamajiToYubaba::LogEnd {
+            request_id: RequestId(1),
+            cursor: None,
+        })
+        .unwrap();
+        assert_eq!(end[0], 14, "LogEnd is appended after LogBatch");
+    }
+
+    #[test]
+    fn log_frames_round_trip_and_correlate() {
+        let batch = KamajiToYubaba::LogBatch {
+            request_id: RequestId(9),
+            records: vec![LogRecord {
+                stream: LogStreamTag::Stdout,
+                cursor: "6:0".into(),
+                ts_ms: 42,
+                line: "multi\nline".into(),
+            }],
+            cursor: Some("6:0".into()),
+        };
+        let req = YubabaToKamaji::Logs {
+            request_id: RequestId(9),
+            id: WorkloadId::new("forge.abc"),
+            cursor: Some("s=xyz".into()),
+        };
+        let frame = encode_frame(&batch).unwrap();
+        let (back, n): (KamajiToYubaba, usize) = decode_frame(&frame).unwrap();
+        assert_eq!((back.clone(), n), (batch, frame.len()));
+        assert_eq!(back.reply_request_id(), Some(RequestId(9)));
+        let frame = encode_frame(&req).unwrap();
+        let (back, _): (YubabaToKamaji, usize) = decode_frame(&frame).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn capabilities_without_log_stream_mean_cannot() {
+        // A pre-F2 Kamaji's capability blob has no `log_stream` key.
+        let json = r#"{"native_exec":false,"native_exec_dir":null,
+            "microvm":{"attached":false,"kvm_ok":null,"detail":null}}"#;
+        let caps: NodeCapabilities = serde_json::from_str(json).unwrap();
+        assert!(!caps.log_stream);
     }
 }

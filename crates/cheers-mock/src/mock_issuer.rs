@@ -142,7 +142,6 @@ impl MockIssuer {
     pub async fn spawn(config: MockConfig) -> Result<Self, MockIssuerError> {
         let keypair = AsymmetricKeyPair::<V4>::generate().map_err(MockIssuerError::Keygen)?;
         let pubkey_bytes = pubkey_array(&keypair);
-        let jwks = build_jwks(&config.kid, &pubkey_bytes);
 
         let listener = tokio::net::TcpListener::bind(config.bind_addr)
             .await
@@ -158,6 +157,7 @@ impl MockIssuer {
             })?;
 
         let issuer_url = format!("http://{bound_addr}");
+        let jwks = build_jwks(&config.kid, &pubkey_bytes, &issuer_url);
         let state = Arc::new(AppState {
             jwks,
             protected_resource: config.expected_aud.as_ref().map(|aud| {
@@ -352,9 +352,11 @@ struct JwkKey {
     #[serde(rename = "use")]
     use_: &'static str,
     alg: &'static str,
+    principal: String,
+    role: &'static str,
 }
 
-fn build_jwks(kid: &str, pubkey: &[u8; 32]) -> JwksDoc {
+fn build_jwks(kid: &str, pubkey: &[u8; 32], issuer: &str) -> JwksDoc {
     JwksDoc {
         keys: vec![JwkKey {
             kty: "OKP",
@@ -363,6 +365,8 @@ fn build_jwks(kid: &str, pubkey: &[u8; 32]) -> JwksDoc {
             kid: kid.to_string(),
             use_: "sig",
             alg: "EdDSA",
+            principal: issuer.to_string(),
+            role: "issuer",
         }],
     }
 }
@@ -412,6 +416,7 @@ mod tests {
         assert_eq!(entry.get("kty").and_then(|v| v.as_str()), Some("OKP"));
         assert_eq!(entry.get("crv").and_then(|v| v.as_str()), Some("Ed25519"));
         assert_eq!(entry.get("kid").and_then(|v| v.as_str()), Some("mock-1"));
+        assert_eq!(entry.get("role").and_then(|v| v.as_str()), Some("issuer"));
         // x is base64url(32 bytes) — 43 chars without padding.
         let x = entry.get("x").and_then(|v| v.as_str()).unwrap();
         assert_eq!(x.len(), 43);

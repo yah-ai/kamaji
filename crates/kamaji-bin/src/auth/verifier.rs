@@ -1,11 +1,11 @@
 //! Token verifier — the load-bearing public surface of the auth module.
 //!
-//! Composes the JWKS cache, the rate-limited kid-miss refresh, and pasetors'
-//! PASETO v4.public signature check into one async `verify` call. Matches
+//! Binds cheers-verify's JWKS cache + [`KeySetVerifier`] (R731-F6) to kamaji's
+//! config and claim shape in one async `verify` call. Matches
 //! W159 §The wire — Layer 1 line-for-line:
 //!
-//! - Signature verifies against the JWKS (cheers key *or* a service-principal
-//!   pubkey published in the same JWKS).
+//! - Signature verifies against an issuer-role JWKS key (or a self-signer key
+//!   within its ceiling; assertion keys never verify here).
 //! - `iss` is the expected cheers AS.
 //! - `aud` matches this kamaji's resource URI.
 //! - `exp` is in the future.
@@ -28,202 +28,71 @@
 //!
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use pasetors::keys::AsymmetricPublicKey;
-use pasetors::token::UntrustedToken;
-use pasetors::version4::{PublicToken, V4};
-use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::Instant;
+use cheers_verify::{HttpJwksSource, JwksCache, JwksCacheConfig, KeySet, KeySetVerifier};
 
 use super::claims::McpClaims;
 use super::config::AuthConfig;
-use super::error::{AuthError, VerifyError};
-use super::jwks::{JwksCache, JwksDoc};
-
-/// Footer payload — we only care about `kid`. Other footer fields (alg, etc.)
-/// are accepted-and-ignored so a future minter can carry hints without
-/// breaking the verifier.
-#[derive(Debug, Deserialize)]
-struct Footer {
-    kid: String,
-}
+use super::error::{JwksError, VerifyError};
 
 /// The verifier. Construct once via [`AuthVerifier::boot`]; share via `Arc`.
-/// `verify` is `&self`-callable concurrently — JWKS reads are RwLock'd.
+///
+/// Since R731-F6 the W159 cache (first fetch, atomic refresh, rate-limited
+/// kid-miss refetch, restart from disk) and the key-role rules live in
+/// cheers-verify; this type binds them to kamaji's [`AuthConfig`] and claim
+/// shape. Role enforcement: issuer keys sign any `sub`, assertion keys are
+/// always refused, self-signer keys only for their own `sub` within a
+/// cheers-issued ceiling.
 #[derive(Debug)]
 pub struct AuthVerifier {
     config: AuthConfig,
-    jwks: Arc<RwLock<JwksCache>>,
-    http: reqwest::Client,
-    /// Last out-of-band refresh time (kid-miss path). `None` until first
-    /// kid-miss. Rate-limited by `config.kid_miss_rate_limit`.
-    kid_miss_last: Arc<Mutex<Option<Instant>>>,
+    cache: Arc<JwksCache>,
+    verifier: KeySetVerifier,
 }
 
 impl AuthVerifier {
-    /// Boot the verifier. Implements W159 §Restart resilience verbatim:
-    ///
-    /// - Cache present + fresh → start from cache, refresh in background.
-    /// - Cache present + stale → synchronous refresh before serving (best-effort;
-    ///   falls through to cache+warn on AS failure if `serve_stale_on_failure`).
-    /// - Cache present + AS unreachable → serve from stale cache with a warn.
-    /// - No cache + AS unreachable → [`AuthError::BootFetchFatal`].
-    pub async fn boot(config: AuthConfig) -> Result<Self, AuthError> {
+    /// Boot per W159 §Restart resilience (see `cheers_verify::JwksCache::boot`):
+    /// no cache + AS unreachable is [`JwksError::BootFetchFatal`].
+    pub async fn boot(config: AuthConfig) -> Result<Self, JwksError> {
         // Fail closed BEFORE any network fetch: a plaintext (`http://`,
         // non-loopback) issuer means the JWKS would be fetched over a channel
         // an on-path attacker can rewrite — a key-substitution → token-forgery
-        // vector. `refresh()` reuses this same validated config, so gating boot
+        // vector. Every later refresh reuses this source, so gating boot
         // covers every fetch path.
         config.validate_issuer()?;
-
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(AuthError::Fetch)?;
-
-        let on_disk = JwksCache::load_from_disk(&config.cache_path).await?;
-
-        let cache = match on_disk {
-            Some(cached) => {
-                let stale = cached
-                    .last_refresh()
-                    .elapsed()
-                    .map(|age| age > config.refresh_interval)
-                    .unwrap_or(true);
-                if stale {
-                    // Try a sync refresh; if AS unreachable, fall through to
-                    // cache with a warn (serve-stale arm).
-                    match fetch_jwks(&http, &config).await {
-                        Ok(doc) => {
-                            let next = JwksCache::from_doc(doc)?;
-                            if let Err(e) = next.write_atomic(&config.cache_path).await {
-                                tracing::warn!(error = ?e, "JWKS cache persist failed at boot");
-                            }
-                            next
-                        }
-                        Err(e) if config.serve_stale_on_failure => {
-                            tracing::warn!(
-                                error = ?e,
-                                "cheers AS unreachable at boot; serving from stale JWKS cache"
-                            );
-                            cached
-                        }
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    cached
-                }
-            }
-            None => {
-                // No cache. First-start fetch is fatal if it fails.
-                let doc =
-                    fetch_jwks(&http, &config)
-                        .await
-                        .map_err(|e| AuthError::BootFetchFatal {
-                            cache_path: config.cache_path.clone(),
-                            source: Box::new(e),
-                        })?;
-                let next = JwksCache::from_doc(doc)?;
-                next.write_atomic(&config.cache_path).await?;
-                next
-            }
+        let source = HttpJwksSource::new(config.jwks_url())?;
+        let cache_config = JwksCacheConfig {
+            cache_path: config.cache_path.clone(),
+            refresh_interval: config.refresh_interval,
+            kid_miss_rate_limit: config.kid_miss_rate_limit,
+            serve_stale_on_failure: config.serve_stale_on_failure,
         };
-
+        let cache = Arc::new(JwksCache::boot(Box::new(source), cache_config).await?);
         Ok(Self {
             config,
-            jwks: Arc::new(RwLock::new(cache)),
-            http,
-            kid_miss_last: Arc::new(Mutex::new(None)),
+            verifier: KeySetVerifier::from_cache(cache.clone()),
+            cache,
         })
     }
 
-    /// Verify a PASETO v4.public token. Returns parsed [`McpClaims`] on
-    /// success. Per-failure error variants map 1:1 to the W159 §Failure
-    /// responses table (F3 turns these into HTTP shapes).
+    /// Verify a PASETO v4.public token: kid lookup (one rate-limited refetch
+    /// on miss), key role, signature, `iss`, `aud`, `exp`. Per-failure error
+    /// variants map 1:1 to the W159 §Failure responses table.
     pub async fn verify(&self, token: &str, now: i64) -> Result<McpClaims, VerifyError> {
-        let untrusted = UntrustedToken::<pasetors::token::Public, V4>::try_from(token)
-            .map_err(|e| VerifyError::Malformed(format!("{e:?}")))?;
-
-        // Parse footer to get kid BEFORE signature verification — the footer
-        // is bound into the signature so a forged footer fails verify anyway.
-        let footer_bytes = untrusted.untrusted_footer();
-        if footer_bytes.is_empty() {
-            return Err(VerifyError::MissingKid);
-        }
-        let footer: Footer = serde_json::from_slice(footer_bytes)
-            .map_err(|e| VerifyError::Malformed(format!("footer: {e}")))?;
-
-        // Cache lookup with a single rate-limited refresh retry on miss.
-        let pubkey_bytes = {
-            let cache = self.jwks.read().await;
-            cache.get(&footer.kid).copied()
-        };
-        let pubkey_bytes = match pubkey_bytes {
-            Some(b) => b,
-            None => {
-                self.try_kid_miss_refresh().await;
-                let cache = self.jwks.read().await;
-                cache
-                    .get(&footer.kid)
-                    .copied()
-                    .ok_or_else(|| VerifyError::UnknownKid(footer.kid.clone()))?
-            }
-        };
-
-        let pubkey = AsymmetricPublicKey::<V4>::from(&pubkey_bytes)
-            .map_err(|e| VerifyError::Malformed(format!("pubkey: {e:?}")))?;
-
-        // Use the low-level v4 PublicToken API directly. The high-level
-        // `pasetors::public::verify` would route the payload through
-        // `Claims::from_string`, which rejects any registered claim
-        // (`iss`/`sub`/`aud`/`exp`/`iat`/`jti`/`nbf`) that isn't a string —
-        // incompatible with W159 §Canonical claim schema's i64 `exp`/`iat`.
-        // The signature + footer-binding check is identical between the two
-        // entry points (the high level wraps this one).
-        let trusted =
-            PublicToken::verify(&pubkey, &untrusted, None, None).map_err(|e| match e {
-                pasetors::errors::Error::TokenValidation => VerifyError::SignatureMismatch,
-                other => VerifyError::Malformed(format!("{other:?}")),
-            })?;
-
-        let claims: McpClaims = serde_json::from_str(trusted.payload())
-            .map_err(|e| VerifyError::BadClaims(e.to_string()))?;
-
-        // Standard-claim checks (W159 Layer 1).
-        if claims.iss != self.config.cheers_issuer {
-            return Err(VerifyError::BadIssuer {
-                expected: self.config.cheers_issuer.clone(),
-                got: claims.iss.clone(),
-            });
-        }
-        if claims.aud != self.config.expected_aud {
-            return Err(VerifyError::BadAudience {
-                expected: self.config.expected_aud.clone(),
-                got: claims.aud.clone(),
-            });
-        }
-        if claims.exp <= now {
-            return Err(VerifyError::Expired {
-                exp: claims.exp,
+        self.verifier
+            .verify(
+                token,
                 now,
-            });
-        }
-
-        Ok(claims)
+                &self.config.cheers_issuer,
+                Some(&self.config.expected_aud),
+            )
+            .await
     }
 
     /// Refresh JWKS from the AS. Used by the background refresh task and
-    /// directly available so an operator surface can trigger a manual
-    /// refresh (e.g. after a known-good key rotation).
-    pub async fn refresh(&self) -> Result<(), AuthError> {
-        let doc = fetch_jwks(&self.http, &self.config).await?;
-        let next = JwksCache::from_doc(doc)?;
-        next.write_atomic(&self.config.cache_path).await?;
-        let mut guard = self.jwks.write().await;
-        *guard = next;
-        Ok(())
+    /// directly available for a manual refresh after a known rotation.
+    pub async fn refresh(&self) -> Result<(), JwksError> {
+        self.cache.refresh().await
     }
 
     /// Spawn the background refresh task. Returns the join handle so the
@@ -246,43 +115,26 @@ impl AuthVerifier {
         })
     }
 
-    /// Read-only access to the cached JWKS — for operator surfaces and
-    /// tests. Holds a read lock for the duration of the closure.
-    pub async fn with_jwks<R>(&self, f: impl FnOnce(&JwksCache) -> R) -> R {
-        let guard = self.jwks.read().await;
-        f(&guard)
+    /// The key set verifies currently read — for operator surfaces and tests.
+    pub fn jwks(&self) -> Arc<KeySet> {
+        self.cache.keys()
     }
-
-    async fn try_kid_miss_refresh(&self) {
-        let mut last = self.kid_miss_last.lock().await;
-        let now = Instant::now();
-        if let Some(prev) = *last {
-            if now.duration_since(prev) < self.config.kid_miss_rate_limit {
-                tracing::debug!("kid-miss refresh suppressed by rate limit");
-                return;
-            }
-        }
-        *last = Some(now);
-        drop(last);
-        if let Err(e) = self.refresh().await {
-            tracing::warn!(error = ?e, "kid-miss JWKS refresh failed");
-        }
-    }
-}
-
-async fn fetch_jwks(http: &reqwest::Client, config: &AuthConfig) -> Result<JwksDoc, AuthError> {
-    let resp = http.get(config.jwks_url()).send().await?;
-    let resp = resp.error_for_status()?;
-    let doc: JwksDoc = resp.json().await?;
-    Ok(doc)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::jwks::{JwkKey, JwksDoc};
-    use base64ct::{Base64UrlUnpadded, Encoding};
+    use cheers_core::KeyRole;
+    use cheers_verify::{JwkKey, JwksDoc};
     use pasetors::keys::{AsymmetricKeyPair, AsymmetricSecretKey, Generate};
+    use pasetors::version4::{PublicToken, V4};
+
+    /// Persist `doc` as a fresh on-disk cache so `boot` serves it without an
+    /// HTTP fetch.
+    fn seed_cache(path: &std::path::Path, doc: JwksDoc) {
+        let set = KeySet::from_doc(doc).unwrap();
+        cheers_verify::jwks::write_atomic(path, &set, std::time::SystemTime::now()).unwrap();
+    }
 
     fn keypair() -> AsymmetricKeyPair<V4> {
         AsymmetricKeyPair::<V4>::generate().expect("keypair gen")
@@ -296,15 +148,17 @@ mod tests {
     }
 
     fn jwks_doc_for(kid: &str, kp: &AsymmetricKeyPair<V4>) -> JwksDoc {
+        jwks_doc_with_role(kid, kp, "https://cheers.test", KeyRole::Issuer)
+    }
+
+    fn jwks_doc_with_role(
+        kid: &str,
+        kp: &AsymmetricKeyPair<V4>,
+        principal: &str,
+        role: KeyRole,
+    ) -> JwksDoc {
         JwksDoc {
-            keys: vec![JwkKey {
-                kty: "OKP".into(),
-                crv: Some("Ed25519".into()),
-                x: Some(Base64UrlUnpadded::encode_string(&pubkey_bytes(kp))),
-                kid: Some(kid.into()),
-                use_: Some("sig".into()),
-                alg: Some("EdDSA".into()),
-            }],
+            keys: vec![JwkKey::ed25519(kid, &pubkey_bytes(kp), principal, role)],
         }
     }
 
@@ -346,13 +200,72 @@ mod tests {
         let cache_path = tmp.path().join("jwks.json");
         // Persist a synthetic cache so `boot` takes the cache-present arm
         // without making a real HTTP fetch.
-        let cache = JwksCache::from_doc(doc).unwrap();
-        cache.write_atomic(&cache_path).await.unwrap();
+        seed_cache(&cache_path, doc);
         let config = AuthConfig::new("https://cheers.test", "https://kamaji.test")
             .with_cache_path(cache_path);
         // Keep the temp dir alive via leak — tests exit before it matters.
         std::mem::forget(tmp);
         AuthVerifier::boot(config).await.unwrap()
+    }
+
+    /// R731-B1: a service principal's assertion key is in the published set,
+    /// but a token it signs claiming `sub=user:x` must not verify. The
+    /// platform (issuer) key in the same set still does.
+    #[tokio::test]
+    async fn rejects_token_signed_by_service_principal_assertion_key() {
+        let platform = keypair();
+        let svc = keypair();
+        let mut doc = jwks_doc_for("platform-1", &platform);
+        doc.keys.extend(
+            jwks_doc_with_role("svc-key-1", &svc, "svc:robot", KeyRole::Assertion).keys,
+        );
+        let verifier = build_verifier_with_doc(doc).await;
+        let payload = || {
+            good_payload(
+                "https://cheers.test",
+                "https://kamaji.test",
+                2_000_000_000,
+                1_700_000_000,
+                "user:x",
+                &["cloud:deploy"],
+            )
+        };
+
+        let forged = mint_token(&svc.secret, "svc-key-1", payload());
+        match verifier.verify(&forged, 1_800_000_000).await {
+            Err(VerifyError::KeyRoleRejected { kid, role, .. }) => {
+                assert_eq!(kid, "svc-key-1");
+                assert_eq!(role, KeyRole::Assertion);
+            }
+            other => panic!("expected KeyRoleRejected, got {other:?}"),
+        }
+
+        let legit = mint_token(&platform.secret, "platform-1", payload());
+        let claims = verifier.verify(&legit, 1_800_000_000).await.expect("platform key verifies");
+        assert_eq!(claims.sub, "user:x");
+    }
+
+    #[tokio::test]
+    async fn rejects_token_signed_by_self_signer_key() {
+        let kp = keypair();
+        let doc = jwks_doc_with_role("ss-1", &kp, "svc:robot", KeyRole::SelfSigner);
+        let verifier = build_verifier_with_doc(doc).await;
+        let token = mint_token(
+            &kp.secret,
+            "ss-1",
+            good_payload(
+                "https://cheers.test",
+                "https://kamaji.test",
+                2_000_000_000,
+                1_700_000_000,
+                "svc:robot",
+                &["cloud:deploy"],
+            ),
+        );
+        assert!(matches!(
+            verifier.verify(&token, 1_800_000_000).await,
+            Err(VerifyError::KeyRoleRejected { role: KeyRole::SelfSigner, .. })
+        ));
     }
 
     #[tokio::test]
@@ -537,46 +450,8 @@ mod tests {
         );
     }
 
-    /// W159: out-of-band refresh on kid miss is rate-limited to ≤1 per
-    /// `kid_miss_rate_limit` so attacker-controlled kid choices can't drive
-    /// the AS into the ground. With AS unreachable in tests, both calls
-    /// surface `UnknownKid`; what we verify is that the gate is set on the
-    /// first attempt — observable by introspecting `kid_miss_last`.
-    #[tokio::test]
-    async fn kid_miss_refresh_is_rate_limited() {
-        let kp = keypair();
-        let doc = jwks_doc_for("k1", &kp);
-        let verifier = build_verifier_with_doc(doc).await;
-        let bad = |kid: &str| {
-            mint_token(
-                &kp.secret,
-                kid,
-                good_payload(
-                    "https://cheers.test",
-                    "https://kamaji.test",
-                    2_000_000_000,
-                    1_700_000_000,
-                    "user:abc",
-                    &["cloud:read"],
-                ),
-            )
-        };
-        // First miss spends the gate.
-        let t1 = bad("k-miss-1");
-        let _ = verifier.verify(&t1, 1_800_000_000).await;
-        let gate_after_first = *verifier.kid_miss_last.lock().await;
-        assert!(gate_after_first.is_some(), "gate must arm after first miss");
-
-        // Second miss within the cooldown does not advance the gate (the
-        // verifier returns early without calling refresh).
-        let t2 = bad("k-miss-2");
-        let _ = verifier.verify(&t2, 1_800_000_000).await;
-        let gate_after_second = *verifier.kid_miss_last.lock().await;
-        assert_eq!(
-            gate_after_first, gate_after_second,
-            "second kid-miss within cooldown must not re-arm the gate"
-        );
-    }
+    // The kid-miss rate-limit test moved with the cache to cheers-verify
+    // (`jwks::tests::kid_miss_refresh_is_rate_limited`, R731-F6).
 
     #[tokio::test]
     async fn boot_no_cache_no_as_is_fatal() {
@@ -588,7 +463,7 @@ mod tests {
         // `Result::unwrap_err` requires `T: Debug`; avoid that bound on
         // `AuthVerifier` by matching the result form directly.
         match result {
-            Err(AuthError::BootFetchFatal { .. }) => {}
+            Err(JwksError::BootFetchFatal { .. }) => {}
             Err(other) => panic!("expected BootFetchFatal, got {other:?}"),
             Ok(_) => panic!("expected boot failure with no cache + unreachable AS"),
         }
@@ -656,8 +531,7 @@ mod tests {
                 serde_json::from_str(GOLDEN_JWKS_JSON).expect("golden jwks.json parses");
             let tmp = tempfile::tempdir().unwrap();
             let cache_path = tmp.path().join("jwks.json");
-            let cache = JwksCache::from_doc(doc).unwrap();
-            cache.write_atomic(&cache_path).await.unwrap();
+            seed_cache(&cache_path, doc);
             let config = AuthConfig::new(GOLDEN_ISS, expected_aud).with_cache_path(cache_path);
             std::mem::forget(tmp);
             AuthVerifier::boot(config).await.unwrap()

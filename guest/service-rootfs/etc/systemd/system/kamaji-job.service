@@ -1,0 +1,33 @@
+# The job document's argv, run under this image's own init (R605-F32).
+#
+# kamaji hands every guest the same contract whatever image it boots: a
+# job.json on the scratch disk in, a job-status.json on it out, and the VM
+# resetting is the instance ending. In the minimal job image kamaji-guest-init
+# is PID 1 and does all three itself. Here systemd is PID 1 — so the node
+# provisioning path a metal box runs (apt, sshd, systemd units) runs inside the
+# guest unchanged — and kamaji-guest-init runs as this unit in `--unit` mode:
+# it loads the document, mounts the scratch disk, runs argv, reports, and exits.
+#
+# The two *Action= lines are what keep the contract: the argv ending, either
+# way, becomes systemd's CLEAN reboot (units stopped, root unmounted), which
+# ends at the same PSCI / i8042 reset the minimal image's init issues, so the
+# VMM exits and kamaji's supervisor applies the spec's restart policy. Without
+# them a service guest whose workload died would sit there reporting Running.
+[Unit]
+Description=kamaji job document: this guest's workload argv
+# The kernel configured eth0 from `ip=` before userspace started, so there is
+# nothing to wait for beyond the local filesystems and the network target.
+After=local-fs.target network.target
+SuccessAction=reboot
+FailureAction=reboot
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/kamaji/kamaji-guest-init --unit
+# The guest console is the workload's log on the host (console.log beside
+# vm-config.json), exactly as it is for the minimal image.
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

@@ -48,6 +48,15 @@ fn main() {
     // *host* by someone poking at an artifact, that is a real mess. Inside the
     // guest it is always PID 1, so the guard costs nothing where it runs for
     // real.
+    // R605-F32: the job runner under a real init (the service image's
+    // `kamaji-job.service`). Never PID 1 by design, and it never resets the
+    // machine itself — its exit is handed to systemd, whose unit file decides
+    // that the instance is over — so the PID 1 guard below does not apply.
+    if std::env::args().skip(1).any(|a| a == "--unit") {
+        let outcome = boot::run(boot::Mode::Unit);
+        std::process::exit(outcome.code);
+    }
+
     if std::process::id() != 1 && std::env::var_os("KAMAJI_GUEST_INIT_FORCE").is_none() {
         eprintln!(
             "kamaji-guest-init is PID 1 inside a kamaji microVM guest: it mounts the scratch \
@@ -58,7 +67,7 @@ fn main() {
         std::process::exit(EXIT_NOT_A_GUEST);
     }
 
-    let outcome = boot::run();
+    let outcome = boot::run(boot::Mode::Init);
     if std::process::id() == 1 {
         // As PID 1 there is no exit: returning from init is a kernel panic, and
         // a panic is a worse way to end a successful build than a clean reset.
@@ -75,7 +84,7 @@ fn main() {
     }
     eprintln!(
         "kamaji-guest-init is a Linux guest init: it mounts, pivots and resets a Firecracker VM. \
-         Build it for x86_64-unknown-linux-musl — see oss/kamaji/guest/build-guest-image.sh."
+         Build it for x86_64- or aarch64-unknown-linux-musl — see oss/kamaji/guest/build-guest-image.sh."
     );
     std::process::exit(EXIT_NOT_A_GUEST);
 }

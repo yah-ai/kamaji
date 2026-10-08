@@ -232,6 +232,7 @@ impl From<VerifyError> for Deny {
             VerifyError::Malformed(_) => "malformed token",
             VerifyError::MissingKid => "missing key id",
             VerifyError::UnknownKid(_) => "unknown key id",
+            VerifyError::KeyRoleRejected { .. } => "key not authorized to sign this token",
             VerifyError::SignatureMismatch => "signature verification failed",
             VerifyError::Expired { .. } => "token expired",
             VerifyError::BadIssuer { .. } => "issuer mismatch",

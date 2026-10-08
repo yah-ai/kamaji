@@ -76,7 +76,7 @@ fn why_not() -> Option<String> {
             return Some(format!("no {what} at {}", path.display()));
         }
     }
-    if let Err(e) = kamaji::microvm::find_vmm() {
+    if let Err(e) = kamaji::microvm::find_vmm(&dir) {
         return Some(e.to_string());
     }
     ensure_sbin_on_path();
@@ -119,9 +119,16 @@ fn which(bin: &str) -> Option<PathBuf> {
 fn node_config(state_dir: PathBuf) -> MicroVmConfig {
     let dir = microvm_dir();
     MicroVmConfig {
-        vmm_bin: kamaji::microvm::find_vmm().expect("checked by why_not"),
+        vmm_bin: kamaji::microvm::find_vmm(&dir).expect("checked by why_not"),
         kernel_image: dir.join("vmlinux"),
         rootfs_image: dir.join("rootfs.ext4"),
+        // This node's service image is the minimal job image, deliberately and
+        // as a configuration (R605-F32): the claims here are about the restart
+        // loop and about kamaji-guest-init's durable root (R605-F33), which is
+        // the init that image boots. A member-capable service image is
+        // `microvm_member_e2e`'s subject. The sha256 checks below still guard
+        // the right file — the shared image every job boots.
+        service_rootfs_image: Some(dir.join("rootfs.ext4")),
         toolchain_image: Some(dir.join(kamaji::microvm::TOOLCHAIN_IMAGE_FILE))
             .filter(|p| p.exists()),
         state_dir,

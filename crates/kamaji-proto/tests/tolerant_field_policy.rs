@@ -148,6 +148,7 @@ fn node_capabilities_required_fields_are_a_deliberate_set() {
             kvm_ok: Some(false),
             detail: Some("permission denied".into()),
         },
+        log_stream: true,
     };
     // A capability nobody reported must not read as one somebody did — see
     // NodeCapabilities' doc. These two stay loud.
@@ -170,4 +171,18 @@ fn mesh_assignment_required_fields_are_a_deliberate_set() {
     };
     assert_required("MeshAssignment", &mesh, &["mesh_ip"]);
     assert_required("WireguardPeer", &peer, &["public_key"]);
+}
+
+#[test]
+fn log_record_required_fields_are_a_deliberate_set() {
+    // R729-F2: every field of a log line is load-bearing — a record without
+    // its cursor cannot be resumed past, and one without its line is not a
+    // record. All four stay loud.
+    let rec = kamaji_proto::LogRecord {
+        stream: kamaji_proto::LogStreamTag::Stderr,
+        cursor: "12:34".into(),
+        ts_ms: 1,
+        line: "hello".into(),
+    };
+    assert_required("LogRecord", &rec, &["cursor", "line", "stream", "ts_ms"]);
 }

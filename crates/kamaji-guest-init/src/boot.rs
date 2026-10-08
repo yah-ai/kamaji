@@ -58,8 +58,11 @@
 //! ## Why the VM reboots rather than powers off
 //!
 //! `kamaji::microvm`'s supervisor treats *the VMM process exiting* as job
-//! completion, and the VMM exits when the guest hits the i8042 reset port —
-//! which is what `reboot=k` on the kernel command line selects. `RB_POWER_OFF`
+//! completion, and the VMM exits when the guest resets: on x86_64 by hitting the
+//! i8042 reset port, which is what `reboot=k` on the kernel command line
+//! selects; on aarch64 by a PSCI `SYSTEM_RESET` call, which KVM hands
+//! Firecracker as a system event and which needs nothing on the command line
+//! (measured on us-west-014, R605-F32 — see `kamaji::microvm::GuestArch`). `RB_POWER_OFF`
 //! would take the ACPI path instead and, if the VMM does not implement it, leave
 //! the guest spinning in `machine_halt` with the supervisor waiting forever. So
 //! [`halt`] reboots, and only falls back to power-off and then to killing itself
@@ -175,6 +178,31 @@ pub enum RootShape {
     /// The real root block device, mounted read-write, no overlay.
     /// Service-shaped: writes to `/` survive the reset.
     Durable,
+    /// The root belongs to the image's own init, which mounted it and will
+    /// unmount it on its clean reboot ([`Mode::Unit`], R605-F32). Nothing to
+    /// stage and nothing to commit.
+    Managed,
+}
+
+/// Who started this process, which decides how much of the machine it owns
+/// (R605-F32).
+///
+/// The job document is the same contract in both modes — argv, env, mounts,
+/// resolver in; `job-status.json` out; the VM resetting is the instance ending.
+/// What differs is only whether this process is also the operating system.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// PID 1 of the minimal image: mounts the kernel filesystems, stages the
+    /// root, runs the job, and resets the VM itself.
+    Init,
+    /// A unit under the image's own init — systemd, in the service image a
+    /// cluster member boots, so that the provisioning path a metal node runs
+    /// (apt, sshd, systemd units) runs inside the guest unchanged. The OS is
+    /// already up and owns `/`, `/proc`, `/run` and the reset; this process
+    /// only loads the document, runs argv, reports, and EXITS. The unit's
+    /// `SuccessAction=`/`FailureAction=reboot` turns that exit into systemd's
+    /// clean reboot, which ends at the same PSCI/i8042 reset [`halt`] uses.
+    Unit,
 }
 
 /// Exit codes. Distinguishable on purpose — a schema refusal and a failed mount
@@ -201,15 +229,22 @@ pub mod exit {
 /// [`halt`]: an init that gives up without halting leaves the VMM resident and
 /// the supervisor waiting for a completion signal that will never come, which
 /// presents as "the build hung" for as long as the node's teardown grace.
-pub fn run() -> Outcome {
-    log!("kamaji-guest-init {} — PID {}", env!("CARGO_PKG_VERSION"), std::process::id());
+pub fn run(mode: Mode) -> Outcome {
+    log!(
+        "kamaji-guest-init {} — PID {} ({mode:?} mode)",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
 
-    // The kernel mounts devtmpfs before running init when built with
-    // CONFIG_DEVTMPFS_MOUNT, which is how /dev/console exists for our own
-    // stderr. Re-mounting it is idempotent and covers a kernel built without.
-    let _ = mount("devtmpfs", "/dev", "devtmpfs", 0, None);
-    ensure_console();
-    let _ = mount("proc", "/proc", "proc", 0, None);
+    if mode == Mode::Init {
+        // The kernel mounts devtmpfs before running init when built with
+        // CONFIG_DEVTMPFS_MOUNT, which is how /dev/console exists for our own
+        // stderr. Re-mounting it is idempotent and covers a kernel built
+        // without.
+        let _ = mount("devtmpfs", "/dev", "devtmpfs", 0, None);
+        ensure_console();
+        let _ = mount("proc", "/proc", "proc", 0, None);
+    }
     if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
         // Printed because two load-bearing facts about this boot are only
         // observable here: whether the VMM injected `root=` itself, and whether
@@ -218,9 +253,12 @@ pub fn run() -> Outcome {
     }
 
     // `pivot_root` and `MS_MOVE` both refuse to operate on a shared mount, and
-    // what the kernel hands init is not guaranteed private.
-    if let Err(e) = mount("none", "/", "", libc::MS_REC | libc::MS_PRIVATE, None) {
-        log!("warning: could not make / private ({e}) — pivot_root may refuse");
+    // what the kernel hands init is not guaranteed private. (Not in unit mode:
+    // there `/` is the OS's, which needs no pivot and gets no move.)
+    if mode == Mode::Init {
+        if let Err(e) = mount("none", "/", "", libc::MS_REC | libc::MS_PRIVATE, None) {
+            log!("warning: could not make / private ({e}) — pivot_root may refuse");
+        }
     }
 
     let (disk, raw) = match find_job_disk() {
@@ -263,13 +301,18 @@ pub fn run() -> Outcome {
         job.workdir.as_deref().unwrap_or("/")
     );
 
-    // Probed before the pivot, because the toolchain has to be a lower layer of
-    // the overlay the pivot lands in. Absent is normal: a node that has staged
-    // no toolchain.ext4 still boots and still runs argv, it just has no
-    // compiler.
-    let toolchain = find_toolchain_disk(&disk);
-
-    let shape = match stage_writable_root(&job, toolchain.is_some()) {
+    let staged = match mode {
+        Mode::Init => {
+            // Probed before the pivot, because the toolchain has to be a lower
+            // layer of the overlay the pivot lands in. Absent is normal: a node
+            // that has staged no toolchain.ext4 still boots and still runs
+            // argv, it just has no compiler.
+            let toolchain = find_toolchain_disk(&disk);
+            stage_writable_root(&job, toolchain.is_some())
+        }
+        Mode::Unit => adopt_managed_root(&job, &disk),
+    };
+    let shape = match staged {
         Ok(shape) => shape,
         Err(e) => {
             log!("MOUNT SETUP FAILED: {e}");
@@ -468,6 +511,30 @@ fn adopt_durable_root(job: &Job, toolchain: bool) -> Result<(), String> {
     }
     log!("durable root in place: the root block device itself, read-write, no overlay");
     Ok(())
+}
+
+/// Unit mode's whole root staging: put the scratch disk where the document
+/// asked, and touch nothing else (R605-F32).
+///
+/// Remounted rather than moved. systemd makes `/` a SHARED mount at boot, and
+/// the kernel refuses `MS_MOVE` of a mount whose parent is shared (`EINVAL`) —
+/// so [`adopt_durable_root`]'s move from the staging mount cannot work here,
+/// and making `/` private to allow it would change propagation for every
+/// service the OS runs. Unmounting the probe mount and mounting the device
+/// again at its real place needs neither.
+fn adopt_managed_root(job: &Job, disk: &str) -> Result<RootShape, String> {
+    if job.workspace_mount.trim_end_matches('/') != STAGE_MOUNT {
+        umount(STAGE_MOUNT, 0).map_err(|e| format!("releasing the probe mount of {disk}: {e}"))?;
+        std::fs::create_dir_all(&job.workspace_mount)
+            .map_err(|e| format!("mkdir {}: {e}", job.workspace_mount))?;
+        mount(disk, &job.workspace_mount, "ext4", 0, None)
+            .map_err(|e| format!("mounting {disk} at {}: {e}", job.workspace_mount))?;
+    }
+    log!(
+        "root left to the image's own init; scratch disk {disk} at {}",
+        job.workspace_mount
+    );
+    Ok(RootShape::Managed)
 }
 
 /// Build the overlay root and become it.

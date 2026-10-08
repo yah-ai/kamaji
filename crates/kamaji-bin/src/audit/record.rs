@@ -97,6 +97,7 @@ fn verify_error_tag(err: &VerifyError) -> &'static str {
         VerifyError::Malformed(_) => "malformed",
         VerifyError::MissingKid => "missing_kid",
         VerifyError::UnknownKid(_) => "unknown_kid",
+        VerifyError::KeyRoleRejected { .. } => "key_role_rejected",
         VerifyError::SignatureMismatch => "signature_mismatch",
         VerifyError::Expired { .. } => "expired",
         VerifyError::BadIssuer { .. } => "bad_issuer",

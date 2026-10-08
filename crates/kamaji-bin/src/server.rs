@@ -43,7 +43,6 @@
 //!
 //! @yah:relay(R599, "mesofact bundles: content-addressed distribution + kamaji JIT serving")
 //! @yah:at(2026-07-06T11:19:35Z)
-//! @yah:status(open)
 //! @arch:see(.yah/docs/working/W272-mesofact-bundles-kamaji-jit-serving.md)
 //!
 //! @yah:ticket(R599-F4, "Mesofact workload variant carries {bundle_digest, runtime, lifecycle}; kamaji-bin dispatches it to the native backend (un-reject the InvalidSpec arm)")
@@ -519,7 +518,12 @@ pub struct ServerCtx {
     /// startup can replay them ([`ServerCtx::resume_native_workloads`]).
     /// `None` = nothing is recorded (tests, a node without `--native-exec-dir`).
     #[cfg(feature = "native-exec")]
-    pub native_records: Option<crate::deploy_records::NativeDeployRecords>,
+    pub native_records: Option<crate::deploy_records::ResumeRecords>,
+    /// R605-F16: the microVM twin of `native_records` — service-shaped guests
+    /// that opted in, replayed by [`ServerCtx::resume_microvm_workloads`].
+    /// `None` = nothing is recorded (tests, a node without `--microvm-dir`).
+    #[cfg(feature = "microvm")]
+    pub microvm_records: Option<crate::deploy_records::ResumeRecords>,
     /// Optional Firecracker microVM backend (R605-F8 / W325 §5). `None`
     /// outside the `microvm` feature build, or when kamaji is started without
     /// `--microvm-dir`.
@@ -941,6 +945,8 @@ impl ServerCtx {
             #[cfg(feature = "native-exec")]
             native_records: None,
             #[cfg(feature = "microvm")]
+            microvm_records: None,
+            #[cfg(feature = "microvm")]
             microvm: None,
         }
     }
@@ -969,6 +975,8 @@ impl ServerCtx {
             native: None,
             #[cfg(feature = "native-exec")]
             native_records: None,
+            #[cfg(feature = "microvm")]
+            microvm_records: None,
             #[cfg(feature = "microvm")]
             microvm: None,
         }
@@ -1088,9 +1096,21 @@ impl ServerCtx {
     #[cfg(feature = "native-exec")]
     pub fn with_native_deploy_records(
         mut self,
-        records: crate::deploy_records::NativeDeployRecords,
+        records: crate::deploy_records::ResumeRecords,
     ) -> Self {
         self.native_records = Some(records);
+        self
+    }
+
+    /// Record resumable service-shaped microVM deploys under `records`
+    /// (R605-F16). The binary calls this beside [`Self::with_microvm`]; a
+    /// context without it records nothing and resumes nothing.
+    #[cfg(feature = "microvm")]
+    pub fn with_microvm_deploy_records(
+        mut self,
+        records: crate::deploy_records::ResumeRecords,
+    ) -> Self {
+        self.microvm_records = Some(records);
         self
     }
 
@@ -1398,6 +1418,20 @@ async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>) -> Result<()> {
         // Drain every complete frame currently in `buf` before issuing another read.
         loop {
             match decode_frame::<YubabaToKamaji>(&buf) {
+                // R729-F2: `Logs` is the one request that is not one-reply, so
+                // it never reaches `handle_message`. It takes over this
+                // connection — the caller opened a dedicated one — and the
+                // connection ends with the stream.
+                Ok((
+                    YubabaToKamaji::Logs {
+                        request_id,
+                        id,
+                        cursor,
+                    },
+                    _,
+                )) => {
+                    return serve_logs(request_id, id, cursor, &ctx, &mut wr).await;
+                }
                 Ok((msg, consumed)) => {
                     let reply = handle_message(msg, &ctx).await;
                     let frame = encode_frame(&reply).context("encode reply")?;
@@ -1504,6 +1538,8 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
                     native_exec,
                     native_exec_dir,
                     microvm,
+                    // R729-F2: this build serves `Logs` for every backend.
+                    log_stream: true,
                 },
             }
         }
@@ -1694,6 +1730,98 @@ fn recipe_is_not_deployable(request_id: kamaji_proto::RequestId) -> KamajiToYuba
 /// Excludes the spec-digest stamp, which stays at the `List` arm: it is what a
 /// caller compares against its own declaration, and nothing on the resume path
 /// reads it.
+/// The live entry `id` names — matched on `WorkloadEntry.id` OR `mesh_ident`,
+/// the same split yubaba's `GET /state` resolves (R590-B9).
+async fn find_live_entry(ctx: &Arc<ServerCtx>, id: &WorkloadId) -> Option<WorkloadEntry> {
+    live_workload_entries(ctx)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|e| e.id == *id || e.mesh_ident.as_deref() == Some(id.as_str()))
+}
+
+/// Serve one `Logs` request on its dedicated connection (R729-F2, W257).
+///
+/// Terminal means the workload is listed in an exited state OR is no longer
+/// listed at all (native/microVM teardown forgets it; its files remain). A
+/// `List` failure is NOT terminal — reading "could not ask" as "finished"
+/// would end a live run's stream early — so the stream just keeps following.
+async fn serve_logs<W: tokio::io::AsyncWrite + Unpin>(
+    request_id: kamaji_proto::RequestId,
+    id: WorkloadId,
+    cursor: Option<String>,
+    ctx: &Arc<ServerCtx>,
+    wr: &mut W,
+) -> Result<()> {
+    let entry = find_live_entry(ctx, &id).await;
+    #[cfg(feature = "native-exec")]
+    let native_dir = ctx.native.as_ref().map(|n| n.exec_dir().to_path_buf());
+    #[cfg(not(feature = "native-exec"))]
+    let native_dir: Option<std::path::PathBuf> = None;
+    #[cfg(feature = "microvm")]
+    let microvm_dir = ctx.microvm.as_ref().map(|m| m.state_dir().to_path_buf());
+    #[cfg(not(feature = "microvm"))]
+    let microvm_dir: Option<std::path::PathBuf> = None;
+
+    let source = crate::logs::resolve_source(
+        native_dir.as_deref(),
+        microvm_dir.as_deref(),
+        id.as_str(),
+        entry
+            .as_ref()
+            .map(|e| (e.id.as_str(), e.mesh_ident.as_deref())),
+    );
+    let reader = source.ok_or_else(|| (ErrorCode::UnknownWorkload, format!("no log source for {}", id.as_str())))
+        .and_then(|s| {
+            crate::logs::SourceReader::new(s, cursor.as_deref(), crate::logs::journalctl_query())
+                .map_err(|e| (ErrorCode::Internal, e.to_string()))
+        });
+    let reader = match reader {
+        Ok(r) => r,
+        Err((code, message)) => {
+            let frame = encode_frame(&KamajiToYubaba::Error {
+                request_id: Some(request_id),
+                code,
+                message,
+            })
+            .context("encode logs error")?;
+            wr.write_all(&frame).await.context("write logs error")?;
+            return Ok(());
+        }
+    };
+
+    let ctx = Arc::clone(ctx);
+    let is_terminal = move || {
+        let ctx = Arc::clone(&ctx);
+        let id = id.clone();
+        async move {
+            match live_workload_entries(&ctx).await {
+                Ok(entries) => match entries
+                    .iter()
+                    .find(|e| e.id == id || e.mesh_ident.as_deref() == Some(id.as_str()))
+                {
+                    None => true,
+                    Some(e) => matches!(
+                        e.state,
+                        WorkloadState::Exited | WorkloadState::Failed | WorkloadState::OomKilled
+                    ),
+                },
+                Err(_) => false,
+            }
+        }
+    };
+    crate::logs::run_stream(
+        reader,
+        request_id,
+        cursor,
+        is_terminal,
+        wr,
+        crate::logs::POLL_INTERVAL,
+        crate::logs::KEEPALIVE,
+    )
+    .await
+}
+
 pub(crate) async fn live_workload_entries(
     ctx: &Arc<ServerCtx>,
 ) -> std::result::Result<Vec<WorkloadEntry>, String> {
@@ -1844,31 +1972,41 @@ async fn deploy_workload(
     let record = spec.clone();
     let reply = dispatch_deploy(ctx, request_id, id.clone(), spec, mesh).await;
     if let KamajiToYubaba::DeployAck { .. } = &reply {
-        record_native_deploy(ctx, &id, &record, mesh);
+        record_resumable_deploy(ctx, &id, &record, mesh);
         ctx.registry.lock().await.set_deployed_spec(id, record);
     }
     reply
 }
 
-/// R936-B11: persist an acked native-exec deploy that asked to outlive kamaji.
-/// A failed write does not fail the deploy — the workload IS running — but it
-/// is logged by name, because it means the next restart will not bring it back.
+/// R936-B11 / R605-F16: persist an acked native-exec or service-shaped microVM
+/// deploy that asked to outlive kamaji. Each store decides by its own backend,
+/// so at most one of them records a given workload. A failed write does not
+/// fail the deploy — the workload IS running — but it is logged by name,
+/// because it means the next restart will not bring it back.
 #[allow(unused_variables)]
-fn record_native_deploy(
+fn record_resumable_deploy(
     ctx: &Arc<ServerCtx>,
     id: &WorkloadId,
     workload: &workload_spec::Workload,
     mesh: Option<&kamaji_proto::MeshAssignment>,
 ) {
-    #[cfg(feature = "native-exec")]
-    if let Some(records) = &ctx.native_records {
-        if let Some(rec) = crate::deploy_records::NativeDeployRecord::for_deploy(id, workload, mesh)
-        {
+    let stores: [Option<&crate::deploy_records::ResumeRecords>; 2] = [
+        #[cfg(feature = "native-exec")]
+        ctx.native_records.as_ref(),
+        #[cfg(not(feature = "native-exec"))]
+        None,
+        #[cfg(feature = "microvm")]
+        ctx.microvm_records.as_ref(),
+        #[cfg(not(feature = "microvm"))]
+        None,
+    ];
+    for records in stores.into_iter().flatten() {
+        if let Some(rec) = records.for_deploy(id, workload, mesh) {
             if let Err(e) = records.record(&rec) {
                 warn!(
                     id = %id.0, error = %e,
-                    "native workload is running but its deploy record could not be written; \
-                     it will NOT be resumed after the next kamaji restart (R936-B11)"
+                    "workload is running but its deploy record could not be written; \
+                     it will NOT be resumed after the next kamaji restart (R936-B11/R605-F16)"
                 );
             }
         }
@@ -2267,8 +2405,31 @@ async fn deploy_container_backend(
         // or an address outside this node's range — leaves the pre-R881
         // behaviour, where runc unshares an empty namespace and the workload is
         // reachable from nothing.
-        let netns = match build_container_netns(ctx, id, spec, mesh).await {
-            Ok(netns) => netns,
+        //
+        // R908-T1: the address yubaba placed the workload at reaches the process
+        // as `YAH_MESH_IP`, so a host-networked workload binds its node's mesh
+        // address without naming it. A Deploy that carried no assignment gets
+        // the same loopback sentinel the docker arm's `runtime_mesh` uses.
+        //
+        // R931-B9: the image is ensured (pulled if missing) BEFORE the netns is
+        // wired — see `ordered_container_deploy` for why the order is the fix.
+        let mesh_ip = mesh.map_or(std::net::Ipv4Addr::LOCALHOST, |m| m.mesh_ip);
+        let ordered = ordered_container_deploy(
+            || async {
+                backend
+                    .ensure_image(spec)
+                    .await
+                    .map_err(|e| format!("containerd: {e:#}"))
+            },
+            || build_container_netns(ctx, id, spec, mesh),
+            |netns| {
+                let backend = backend.clone();
+                async move { backend.deploy(id, spec, netns.as_deref(), mesh_ip).await }
+            },
+        )
+        .await;
+        let deployed = match ordered {
+            Ok(deployed) => deployed,
             Err(message) => {
                 return KamajiToYubaba::Error {
                     request_id: Some(request_id),
@@ -2277,12 +2438,7 @@ async fn deploy_container_backend(
                 };
             }
         };
-        // R908-T1: the address yubaba placed the workload at reaches the process
-        // as `YAH_MESH_IP`, so a host-networked workload binds its node's mesh
-        // address without naming it. A Deploy that carried no assignment gets
-        // the same loopback sentinel the docker arm's `runtime_mesh` uses.
-        let mesh_ip = mesh.map_or(std::net::Ipv4Addr::LOCALHOST, |m| m.mesh_ip);
-        return match backend.deploy(id, spec, netns.as_deref(), mesh_ip).await {
+        return match deployed {
             Ok(_pid) => KamajiToYubaba::DeployAck {
                 request_id,
                 id: id.clone(),
@@ -2359,6 +2515,30 @@ async fn deploy_container_backend(
 /// then could not, which is a refused deploy rather than a silent fallback: the
 /// workload would come up unreachable, and shipping unreachable workloads that
 /// look healthy is the defect this relay exists to remove.
+/// R931-B9: the order a container deploy's steps run in, separated out so it is
+/// testable without containerd. Wiring the netns is destructive to a running
+/// generation — `setup_commands` opens with `teardown_commands`, deleting the
+/// incumbent's namespace and veth — so every step that can refuse without
+/// touching the node (today: the image being present or pullable) must run
+/// before it. Measured live on noisetable R795-T8: a deploy of an image the
+/// node lacked deleted the running workload's network, then failed, and prod
+/// served 503 until the old digest was redeployed.
+#[cfg_attr(not(feature = "containerd-integration"), allow(dead_code))]
+async fn ordered_container_deploy<T, I, W, D>(
+    ensure_image: impl FnOnce() -> I,
+    wire_netns: impl FnOnce() -> W,
+    deploy: impl FnOnce(Option<std::path::PathBuf>) -> D,
+) -> Result<T, String>
+where
+    I: std::future::Future<Output = Result<(), String>>,
+    W: std::future::Future<Output = Result<Option<std::path::PathBuf>, String>>,
+    D: std::future::Future<Output = T>,
+{
+    ensure_image().await?;
+    let netns = wire_netns().await?;
+    Ok(deploy(netns).await)
+}
+
 #[cfg(feature = "containerd-integration")]
 async fn build_container_netns(
     ctx: &Arc<ServerCtx>,
@@ -3186,6 +3366,53 @@ impl ServerCtx {
     }
 }
 
+#[cfg(feature = "microvm")]
+impl ServerCtx {
+    /// R605-F16: replay every recorded service-shaped microVM deploy through
+    /// the microVM arm — the guest twin of `resume_native_workloads`. Call once
+    /// at startup, before the UDS answers. A replay boots the SAME member: a
+    /// service guest's private root is reused rather than reseeded
+    /// (`RootDisk::provision`), and its TAP is rebuilt idempotently. Records
+    /// replay in name order. Returns how many came back.
+    pub async fn resume_microvm_workloads(self: &Arc<Self>) -> usize {
+        let Some(records) = &self.microvm_records else {
+            return 0;
+        };
+        let mut resumed = 0;
+        for record in records.recorded() {
+            let id = WorkloadId::new(&record.id);
+            let Some(spec) = record.workload.container_spec() else {
+                warn!(id = %record.id, "microVM deploy record holds no container spec; skipped");
+                continue;
+            };
+            info!(id = %record.id, "resuming recorded microVM deploy after restart (R605-F16)");
+            match deploy_microvm(
+                self,
+                kamaji_proto::RequestId(0),
+                &id,
+                spec,
+                record.mesh.as_ref(),
+            )
+            .await
+            {
+                KamajiToYubaba::DeployAck { .. } => {
+                    self.registry
+                        .lock()
+                        .await
+                        .set_deployed_spec(id, record.workload.clone());
+                    resumed += 1;
+                }
+                other => warn!(
+                    id = %record.id, reply = ?other,
+                    "recorded microVM deploy failed to resume; its record is kept so the next \
+                     restart retries it"
+                ),
+            }
+        }
+        resumed
+    }
+}
+
 /// Materialize the W272 bundle tree from the node store (R599-F1) and resolve
 /// the serve binary path (W272 §2/§3), shared by the keep-alive and on-demand
 /// deploy paths. Returns `(bundle_dir, serve_bin)` or, as `Err`, the reason.
@@ -3625,6 +3852,8 @@ fn bundle_workload_spec(
         },
         labels: Default::default(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: Default::default(),
         files: Vec::new(),
     }
@@ -4536,6 +4765,19 @@ pub(crate) async fn stop_workload(
                 message: format!("microvm teardown: {e}"),
             };
         }
+        // R605-F16: a stopped guest must not come back on the next restart.
+        if let Some(records) = &ctx.microvm_records {
+            if let Err(e) = records.forget(&id) {
+                return KamajiToYubaba::Error {
+                    request_id: Some(request_id),
+                    code: ErrorCode::BackendRefused,
+                    message: format!(
+                        "microVM stopped but its deploy record could not be removed \
+                         (it would be resumed after the next kamaji restart): {e}"
+                    ),
+                };
+            }
+        }
     }
     // Route teardown to the docker backend (R626-F1). `teardown_workload`
     // swallows "no such container", so routing every Stop to it — including
@@ -5253,7 +5495,10 @@ mod tests {
                 ServerCtx::new()
                     .with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir.path())))
                     .with_native_deploy_records(
-                        crate::deploy_records::NativeDeployRecords::under(dir.path()),
+                        crate::deploy_records::ResumeRecords::under(
+                            crate::deploy_records::ResumeBackend::Native,
+                            dir.path(),
+                        ),
                     ),
             )
         };
@@ -6317,6 +6562,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -9899,5 +10146,62 @@ mod tests {
                 other => panic!("expected BackendRefused, got {other:?}"),
             }
         }
+    }
+}
+
+/// R931-B9: a container deploy that fails before it can start must leave the
+/// running generation's network alone. These drive `ordered_container_deploy`
+/// with recording fakes; "wired" stands for `build_container_netns`, whose
+/// `setup_commands` deletes the incumbent's namespace and veth.
+#[cfg(test)]
+mod ordered_container_deploy_tests {
+    use super::ordered_container_deploy;
+    use std::cell::RefCell;
+
+    #[tokio::test]
+    async fn a_failed_image_pull_never_rewires_the_incumbent_netns() {
+        let steps = RefCell::new(Vec::new());
+        let out: Result<(), String> = ordered_container_deploy(
+            || async {
+                steps.borrow_mut().push("image");
+                Err("ctr images pull: not found".to_string())
+            },
+            || async {
+                steps.borrow_mut().push("wired");
+                Ok(None)
+            },
+            |_| async {
+                steps.borrow_mut().push("deploy");
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap_err(), "ctr images pull: not found");
+        assert_eq!(*steps.borrow(), vec!["image"], "nothing past the image step may run");
+    }
+
+    #[tokio::test]
+    async fn a_good_image_wires_then_deploys_into_that_netns() {
+        let steps = RefCell::new(Vec::new());
+        let ns = std::path::PathBuf::from("/run/netns/w");
+        let out = ordered_container_deploy(
+            || async {
+                steps.borrow_mut().push("image");
+                Ok(())
+            },
+            || async {
+                steps.borrow_mut().push("wired");
+                Ok(Some(ns.clone()))
+            },
+            |netns| {
+                let steps = &steps;
+                async move {
+                    steps.borrow_mut().push("deploy");
+                    netns
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), Some(ns.clone()));
+        assert_eq!(*steps.borrow(), vec!["image", "wired", "deploy"]);
     }
 }

@@ -41,7 +41,6 @@
 //!
 //! @yah:relay(R626, "Unify persistent-service supervision under kamaji (wire the docker/OrbStack backend) + camp-daemon-managed desired state (scale 0↔N)")
 //! @yah:at(2026-07-22T19:13:56Z)
-//! @yah:status(open)
 //! @yah:gotcha("The obvious first guess is wrong: OrbStack containers are NOT supervised by kamaji today. They run under yubaba's pond tier via the docker-CLI ContainerRuntime (oss/yubaba/crates/yubaba/src/pond.rs). kamaji's containerd backend is a different path — don't start by reading it.")
 //! @yah:gotcha("pond.rs already treats PondPhase::Failed as terminal specifically to 'prevent a concurrent reconciler from resurrecting a dead workload' (pond.rs:136) — a narrow precedent for desired-state. Read it, but do NOT generalize Failed into the stop mechanism: a deliberate stop is not a failure and must not be reported as one.")
 //! @yah:assumes("That kamaji/src/docker.rs is functionally complete and current — asserted from its module doc + API surface, NOT exercised. It is feature-gated and unwired, so it may never have run against a live OrbStack daemon. Verify end-to-end before building on it.")
@@ -820,6 +819,7 @@ impl Kamaji for DockerRuntime {
                     stream: LogStreamKind::Stdout,
                     message: line.to_string(),
                     correlation_id: None,
+                    cursor: None,
                 });
             }
         }
@@ -832,6 +832,7 @@ impl Kamaji for DockerRuntime {
                     stream: LogStreamKind::Stderr,
                     message: line.to_string(),
                     correlation_id: None,
+                    cursor: None,
                 });
             }
         }
@@ -1418,6 +1419,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }

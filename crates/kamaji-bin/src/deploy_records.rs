@@ -1,18 +1,24 @@
 //! Deploy records: the admission input kamaji persists so a workload survives
-//! kamaji itself (R755-B5 for serve bundles, R936-B11 for native-exec).
+//! kamaji itself (R755-B5 for serve bundles, R936-B11 for native-exec, R605-F16
+//! for service-shaped microVM guests).
 //!
-//! Every native workload and every served bundle lives in `kamaji.service`'s
-//! cgroup, so a kamaji restart (a reboot, a control-plane roll) kills them all.
-//! Nothing else on the node remembers them: yubaba keeps no spec for a direct
-//! `/workloads/deploy`. A record is the only memory there is, and startup
-//! replays it through the same deploy path the original request took.
+//! Every native workload, every served bundle and every microVM's Firecracker
+//! process lives in `kamaji.service`'s cgroup, so a kamaji restart (a reboot, a
+//! control-plane roll) kills them all. Nothing else on the node remembers them:
+//! yubaba keeps no spec for a direct `/workloads/deploy`. A record is the only
+//! memory there is, and startup replays it through the same deploy path the
+//! original request took.
 //!
-//! **Native records are opt-in per workload** —
-//! [`workload_spec::RESUME_AFTER_RESTART_ANNOTATION`]. A native workload whose
+//! **Native and microVM records are opt-in per workload** —
+//! [`workload_spec::RESUME_AFTER_RESTART_ANNOTATION`]. A workload whose
 //! placement yubaba decides (the headscale appliance follows the raft ingress
 //! owner) must never come back on a node just because it last ran there; after
 //! a failover that is a second coordinator. The inner door is pinned to its
-//! front door by construction, so it opts in.
+//! front door by construction, so it opts in; so does a dev-cluster member VM,
+//! whose writable root lives on this node's disk and nowhere else.
+//!
+//! R605-F16 found the microVM half missing the hard way: rolling us-west-011's
+//! kamaji SIGKILLed both member VMs and nothing brought them back.
 
 use std::path::{Path, PathBuf};
 
@@ -111,27 +117,65 @@ pub fn read_records<T: serde::de::DeserializeOwned>(dir: &Path, what: &str) -> V
     out
 }
 
-/// R936-B11: everything a native-exec `Deploy` handed kamaji, for a workload
-/// that asked to be resumed ([`workload_spec::WorkloadSpec::wants_resume_after_restart`]).
+/// Which backend a [`ResumeRecords`] store replays through. The store knows
+/// its backend, so a native record can never be replayed as a guest or the
+/// reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeBackend {
+    /// R936-B11: `yah.exec = native`.
+    Native,
+    /// R605-F16: `yah.exec = microvm`, service-shaped guests only.
+    MicroVm,
+}
+
+impl ResumeBackend {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Native => "native deploy",
+            Self::MicroVm => "microVM deploy",
+        }
+    }
+}
+
+/// Everything a resumable `Deploy` handed kamaji, for a workload that asked to
+/// be resumed ([`workload_spec::WorkloadSpec::wants_resume_after_restart`]).
+/// The on-disk shape is the R936-B11 native record's, unchanged.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NativeDeployRecord {
+pub struct ResumeRecord {
     pub id: String,
     pub workload: workload_spec::Workload,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<kamaji_proto::MeshAssignment>,
 }
 
-impl NativeDeployRecord {
-    /// The record for a `Deploy` that should outlive kamaji, or `None` when
-    /// the workload is not native-exec or did not opt in. The one place the
-    /// opt-in is decided, so the write and the replay cannot disagree.
+impl ResumeRecord {
+    /// The record for a `Deploy` that should outlive kamaji on `backend`, or
+    /// `None` when the workload is not that backend's or did not opt in. The
+    /// one place the opt-in is decided, so the write and the replay cannot
+    /// disagree.
+    ///
+    /// A microVM is recorded only when it is SERVICE-shaped. A job guest's
+    /// completion is its exit, and its record would outlive that exit until a
+    /// Stop that never comes — so replaying one would run the job again on
+    /// every restart.
     pub fn for_deploy(
+        backend: ResumeBackend,
         id: &WorkloadId,
         workload: &workload_spec::Workload,
         mesh: Option<&kamaji_proto::MeshAssignment>,
     ) -> Option<Self> {
         let spec = workload.container_spec()?;
-        (spec.wants_native_exec() && spec.wants_resume_after_restart()).then(|| Self {
+        let ours = match backend {
+            ResumeBackend::Native => spec.wants_native_exec(),
+            ResumeBackend::MicroVm => {
+                spec.wants_microvm()
+                    && !matches!(
+                        spec.effective_archetype(),
+                        workload_spec::LifecycleArchetype::Job
+                    )
+            }
+        };
+        (ours && spec.wants_resume_after_restart()).then(|| Self {
             id: id.0.clone(),
             workload: workload.clone(),
             mesh: mesh.cloned(),
@@ -139,18 +183,21 @@ impl NativeDeployRecord {
     }
 }
 
-/// The on-disk set of [`NativeDeployRecord`]s — a sibling of the native
+/// The on-disk set of one backend's [`ResumeRecord`]s — a sibling of that
 /// backend's per-ident dirs, dot-prefixed so it can never be an ident.
 #[derive(Debug, Clone)]
-pub struct NativeDeployRecords {
+pub struct ResumeRecords {
+    backend: ResumeBackend,
     dir: PathBuf,
 }
 
-impl NativeDeployRecords {
-    /// Records kept under `<native_exec_dir>/.deploys`.
-    pub fn under(native_exec_dir: &Path) -> Self {
+impl ResumeRecords {
+    /// Records kept under `<backend_dir>/.deploys` — the native-exec dir, or
+    /// the microVM dir (whose guests live in `<microvm_dir>/vms`).
+    pub fn under(backend: ResumeBackend, backend_dir: &Path) -> Self {
         Self {
-            dir: native_exec_dir.join(".deploys"),
+            backend,
+            dir: backend_dir.join(".deploys"),
         }
     }
 
@@ -158,7 +205,17 @@ impl NativeDeployRecords {
         &self.dir
     }
 
-    pub fn record(&self, record: &NativeDeployRecord) -> std::io::Result<()> {
+    /// This store's record for a `Deploy`, per [`ResumeRecord::for_deploy`].
+    pub fn for_deploy(
+        &self,
+        id: &WorkloadId,
+        workload: &workload_spec::Workload,
+        mesh: Option<&kamaji_proto::MeshAssignment>,
+    ) -> Option<ResumeRecord> {
+        ResumeRecord::for_deploy(self.backend, id, workload, mesh)
+    }
+
+    pub fn record(&self, record: &ResumeRecord) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
         write_owner_only(&self.dir, &record.id, &bytes)
     }
@@ -167,8 +224,8 @@ impl NativeDeployRecords {
         remove_record(&self.dir, id)
     }
 
-    pub fn recorded(&self) -> Vec<NativeDeployRecord> {
-        read_records(&self.dir, "native deploy")
+    pub fn recorded(&self) -> Vec<ResumeRecord> {
+        read_records(&self.dir, self.backend.noun())
     }
 }
 
@@ -177,11 +234,18 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
     use workload_spec::{
-        NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE, RESUME_AFTER_RESTART_ANNOTATION,
-        RESUME_AFTER_RESTART_VALUE,
+        LifecycleArchetype, MICROVM_EXEC_VALUE, NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE,
+        RESUME_AFTER_RESTART_ANNOTATION, RESUME_AFTER_RESTART_VALUE,
     };
 
     fn workload(annotations: &[(&str, &str)]) -> workload_spec::Workload {
+        workload_shaped(annotations, None)
+    }
+
+    fn workload_shaped(
+        annotations: &[(&str, &str)],
+        archetype: Option<LifecycleArchetype>,
+    ) -> workload_spec::Workload {
         use workload_spec::{
             ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
             StopPolicy, TierTag, WorkloadSpec,
@@ -218,7 +282,7 @@ mod tests {
             requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
-            archetype: None,
+            archetype,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: Millis::from_secs(5),
@@ -234,6 +298,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: annotations
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -263,12 +329,42 @@ mod tests {
         let id = WorkloadId::new("w");
         let native = (NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE);
         let resume = (RESUME_AFTER_RESTART_ANNOTATION, RESUME_AFTER_RESTART_VALUE);
-        assert!(NativeDeployRecord::for_deploy(&id, &workload(&[native, resume]), None).is_some());
-        assert!(NativeDeployRecord::for_deploy(&id, &workload(&[native]), None).is_none());
-        assert!(NativeDeployRecord::for_deploy(&id, &workload(&[resume]), None).is_none());
-        assert!(NativeDeployRecord::for_deploy(
+        let native_rec = |w: &workload_spec::Workload| {
+            ResumeRecord::for_deploy(ResumeBackend::Native, &id, w, None)
+        };
+        assert!(native_rec(&workload(&[native, resume])).is_some());
+        assert!(native_rec(&workload(&[native])).is_none());
+        assert!(native_rec(&workload(&[resume])).is_none());
+        assert!(native_rec(&workload(&[native, (RESUME_AFTER_RESTART_ANNOTATION, "yes")])).is_none());
+    }
+
+    /// R605-F16: a microVM is recorded only when it opted in AND is
+    /// service-shaped, and each store only ever records its own backend's
+    /// workloads.
+    #[test]
+    fn only_service_shaped_microvms_that_opted_in_are_recorded() {
+        let id = WorkloadId::new("vm-us-west-111");
+        let vm = (NATIVE_EXEC_ANNOTATION, MICROVM_EXEC_VALUE);
+        let resume = (RESUME_AFTER_RESTART_ANNOTATION, RESUME_AFTER_RESTART_VALUE);
+        let vm_rec = |w: &workload_spec::Workload| {
+            ResumeRecord::for_deploy(ResumeBackend::MicroVm, &id, w, None)
+        };
+        let server = Some(LifecycleArchetype::Server);
+        assert!(vm_rec(&workload_shaped(&[vm, resume], server)).is_some());
+        assert!(vm_rec(&workload_shaped(&[vm, resume], Some(LifecycleArchetype::Appliance))).is_some());
+        // A job guest's completion is its exit; replaying it would re-run it.
+        assert!(vm_rec(&workload_shaped(&[vm, resume], Some(LifecycleArchetype::Job))).is_none());
+        assert!(vm_rec(&workload_shaped(&[vm], server)).is_none());
+        // Each store records only its own backend's workloads.
+        assert!(vm_rec(&workload_shaped(
+            &[(NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE), resume],
+            server
+        ))
+        .is_none());
+        assert!(ResumeRecord::for_deploy(
+            ResumeBackend::Native,
             &id,
-            &workload(&[native, (RESUME_AFTER_RESTART_ANNOTATION, "yes")]),
+            &workload_shaped(&[vm, resume], server),
             None
         )
         .is_none());
@@ -279,12 +375,12 @@ mod tests {
     #[test]
     fn records_round_trip_owner_only_and_skip_junk() {
         let root = scratch("rt");
-        let records = NativeDeployRecords::under(&root);
+        let records = ResumeRecords::under(ResumeBackend::Native, &root);
         let w = workload(&[
             (NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE),
             (RESUME_AFTER_RESTART_ANNOTATION, RESUME_AFTER_RESTART_VALUE),
         ]);
-        let rec = NativeDeployRecord::for_deploy(&WorkloadId::new("door-a"), &w, None).unwrap();
+        let rec = records.for_deploy(&WorkloadId::new("door-a"), &w, None).unwrap();
         records.record(&rec).unwrap();
         std::fs::write(records.dir().join("broken.json"), b"{not json").unwrap();
         std::fs::write(records.dir().join(".door-b.json.tmp.1.2"), b"{}").unwrap();

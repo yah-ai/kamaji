@@ -6,7 +6,8 @@
 //! PASETO footer so the cache lookup is O(1) before signature verification.
 //!
 //! F2 scope: JWKS fetch + on-disk cache + atomic refresh + kid-miss refresh +
-//! signature verification. Scope check, `owns:[...]` check, and the 401/403
+//! signature verification — since R731-F6 implemented by cheers-verify's
+//! `JwksCache` + `KeySetVerifier`, wrapped in [`verifier::AuthVerifier`]. Scope check, `owns:[...]` check, and the 401/403
 //! response shapes are F3. The HTTPS server / JSON-RPC dispatch loop is later.
 //!
 //! @yah:ticket(R593-F6, "Token binding in kamaji-bin auth: presenting NodeId must be enrolled to the token subject where policy demands")
@@ -34,7 +35,6 @@ pub mod claims;
 pub mod config;
 pub mod deny;
 pub mod error;
-pub mod jwks;
 pub mod metadata;
 pub mod policy;
 pub mod verifier;
@@ -42,8 +42,7 @@ pub mod verifier;
 pub use claims::{ActorClaim, AuthStrength, McpClaims, OwnsClaim};
 pub use config::AuthConfig;
 pub use deny::{Deny, DenyKind, DEFAULT_REALM};
-pub use error::{AuthError, VerifyError};
-pub use jwks::{JwkKey, JwksCache, JwksDoc};
+pub use error::{JwksError, VerifyError};
 pub use metadata::{ProtectedResourceMetadata, SCOPE_VOCABULARY};
 pub use policy::{enforce, CallerNode, Requirement, NODE_RESOURCE_KIND};
 pub use verifier::AuthVerifier;

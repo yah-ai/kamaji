@@ -96,18 +96,18 @@ bundle-serving = [
 tenant-passway = ["kamaji/native-integration"]
 
 [dependencies]
-kamaji-proto = { path = "../kamaji-proto", version = "0.8.42" }
+kamaji-proto = { path = "../kamaji-proto", version = "0.8.43" }
 # R555-F4 (W235 §(c)): `admission-verify` brings in the Ed25519 half of
 # `workload_spec::admission`. Not optional — deciding what is allowed to run
 # is kamaji's job description, and a build that could silently omit the
 # admission gate is a build an operator cannot tell apart from one that has it.
-workload-spec = { package = "yah-workload-spec", version = "0.8.42", features = ["admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.43", features = ["admission-verify"] }
 # R715-F3 / W315 — the process-control channel. `client` is the consumer half
 # the probe runner dials; `kamaji` gives it the ProcState -> WorkloadState
 # conversion as an exhaustive match, which is what keeps "believed verbatim"
 # true. Pure std + serde + tokio (already linked), so no RSS cost worth
 # weighing against W154's memory budget.
-kamaji-procctl = { path = "../procctl", version = "0.8.42", features = ["client", "kamaji"] }
+kamaji-procctl = { path = "../procctl", version = "0.8.43", features = ["client", "kamaji"] }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -118,13 +118,15 @@ tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# R426-F2 — cheers JWT verifier surface. PASETO v4.public (matches cheers's
-# edge-verifiable-auth.md session-token envelope; W159 §Canonical claim schema).
-# reqwest fetches cheers's JWKS at boot and on refresh; base64ct decodes the
-# Ed25519 public key from the JWK `x` field. All MIT/Apache-2.0.
-pasetors = { version = "0.7", features = ["serde"] }
+# reqwest is the audit forwarder's client (the JWKS fetch moved to
+# cheers-verify's `jwks-http` source in R731-F6).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-base64ct = { version = "1", features = ["alloc"] }
+# R731-B1 — the JWK `role` enum (issuer | assertion | self-signer) lives in
+# cheers-core so this verifier and cheers's JWKS publisher share one type.
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.43" }
+# R731-F6 — the W159 JWKS cache + KeySetVerifier (key-role enforcement, §D5)
+# moved here from this crate's auth/jwks.rs; `jwks-http` is the reqwest source.
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.43", features = ["jwks-http"] }
 
 # Containerd gRPC client (optional — only with containerd-integration feature).
 # Mirrors yubaba's optional dep so both processes can share crates.io artifacts.
@@ -132,7 +134,7 @@ containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.42", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.43", default-features = false }
 # The kamaji library crate. NOT optional as of R885-B1: the cgroup v2 driver
 # moved into it (`kamaji::cgroup`) so the live `kamaji::native::NativeRuntime`
 # could reach it, and this crate re-exports it unconditionally. With
@@ -140,14 +142,14 @@ kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, 
 # link — the backend-bearing features below each turn on the one they need
 # (socket-custody for the passway fd handoff, native-integration for fork+exec,
 # and so on).
-kamaji = { path = "../kamaji", default-features = false, version = "0.8.42" }
+kamaji = { path = "../kamaji", default-features = false, version = "0.8.43" }
 
 # R599-F10 node bundle backend (only linked with the `bundle-serving` feature).
 # yah-object-store is the R2/in-memory blob store; yah-mesofact-bundle (store
 # feature) materializes a W272 bundle from it into the node cache. Both live in
 # oss/yah-base, redirected to path by the root [patch.crates-io] block.
-yah-object-store = { version = "0.8.42", optional = true }
-yah-mesofact-bundle = { version = "0.8.42", optional = true }
+yah-object-store = { version = "0.8.43", optional = true }
+yah-mesofact-bundle = { version = "0.8.43", optional = true }
 
 # Linux-only syscall surface used by the native driver (R406-T5).
 # All permissive (MIT / Apache-2.0). The `landlock` crate is a thin wrapper over
@@ -169,6 +171,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Tests mint PASETO v4.public tokens; verification itself is cheers-verify's.
+pasetors = "0.7"
 # R428-F2 adds `test-util` (paused-clock timer control for the audit forwarder tests).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "fs", "signal", "time", "test-util", "process"] }
 

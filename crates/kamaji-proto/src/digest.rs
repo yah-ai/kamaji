@@ -83,7 +83,21 @@ const DIGEST_DOMAIN: &[u8] = b"kamaji-proto/spec-digest/v2\0";
 ///
 /// [`WorkloadEntry::spec_digest`]: crate::WorkloadEntry::spec_digest
 pub fn spec_digest(spec: &Workload) -> Option<SpecDigest> {
-    let encoded = crate::tolerant::canonical_json(spec).ok()?;
+    let mut value = serde_json::to_value(spec).ok()?;
+    // R960-F6: `WorkloadSpec::db` is always serialized (postcard is positional),
+    // so an empty one would put `"db": []` into every spec's digest and read as
+    // "changed" on every node recorded before the field existed. An empty `db`
+    // means what an absent one meant; hash it as absent. A non-empty `db`
+    // does change the digest, which is right: the spec did change.
+    // R960-F8: `capabilities` is always serialized for the same reason.
+    if let Some(obj) = value.as_object_mut() {
+        for key in ["db", "capabilities"] {
+            if obj.get(key).is_some_and(|v| v.as_array().is_some_and(Vec::is_empty)) {
+                obj.remove(key);
+            }
+        }
+    }
+    let encoded = serde_json::to_vec(&value).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(DIGEST_DOMAIN);
     hasher.update(&encoded);
@@ -107,6 +121,48 @@ mod tests {
             env: BTreeMap::new(),
             discover: None,
         })
+    }
+
+    fn container(db: Vec<workload_spec::WorkloadDb>) -> Workload {
+        let mut spec = workload_spec::WorkloadSpec::for_forge(
+            "b3",
+            workload_spec::ImageRef {
+                registry: "ghcr.io".into(),
+                repository: "yah/forge".into(),
+                tag: "v1".into(),
+                digest: "sha256:abc123".into(),
+            },
+            workload_spec::TierTag("private".into()),
+            vec![8080],
+        );
+        spec.db = db;
+        Workload::container(spec)
+    }
+
+    /// R960-F6: a spec with no `[[db]]` rows must digest exactly as it did
+    /// before the field existed (the bytes a pre-field node recorded), or the
+    /// first sweep after a yubaba roll redeploys the whole fleet.
+    #[test]
+    fn an_empty_db_digests_as_if_the_field_did_not_exist() {
+        let w = container(vec![]);
+        let mut value = serde_json::to_value(&w).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("db").is_some(), "db is always serialized");
+        assert!(
+            value.as_object_mut().unwrap().remove("capabilities").is_some(),
+            "capabilities is always serialized"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(DIGEST_DOMAIN);
+        hasher.update(serde_json::to_vec(&value).unwrap());
+        let pre_field: SpecDigest = hasher.finalize().into();
+        assert_eq!(spec_digest(&w), Some(pre_field));
+
+        let with_row = container(vec![workload_spec::WorkloadDb {
+            name: "a".into(),
+            subject: "a.db".into(),
+            workbench: workload_spec::WorkbenchKind::None,
+        }]);
+        assert_ne!(spec_digest(&with_row), Some(pre_field), "a real db row is a real change");
     }
 
     #[test]

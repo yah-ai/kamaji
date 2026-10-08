@@ -28,7 +28,8 @@
 //!
 //! | | job-shaped | service-shaped |
 //! |---|---|---|
-//! | **root device** | the node's one `rootfs.ext4`, **read-only** | a private copy under the workload's VM dir, **writable** |
+//! | **root device** | the node's one `rootfs.ext4`, **read-only** | a private copy of the node's `service-rootfs.ext4` under the workload's VM dir, **writable** (R605-F32) |
+//! | **PID 1** | kamaji-guest-init, which is the job runner | systemd in the service image, with kamaji-guest-init as the job-runner unit |
 //! | **durable guest state** | none by design | the scratch disk **and the root** — see [`RootDisk`] |
 //! | **VMM process exit** | the job finished; read its verdict and stop | the instance ended; restart per [`RestartPolicy`] |
 //! | [`restart_workload`](MicroVmRuntime::restart_workload) | refused, naming why | re-boots the guest in place |
@@ -71,8 +72,9 @@
 //!    guest boots the node's configured kernel with the node's configured
 //!    rootfs attached **read-only**, so no job can leave anything behind in it
 //!    for the next one; a service-shaped guest boots the same kernel with a
-//!    private writable copy of that rootfs, which no other workload can see. See
-//!    [`MicroVmConfig`] and [`RootDisk`].
+//!    private writable copy of the node's *service* image, which no other
+//!    workload can see. See [`MicroVmConfig`] and [`RootDisk`]. The kernel's
+//!    format and command line are per-arch — see [`GuestArch`].
 //! 2. **A way in and out for files.** A container gets a bind mount; a guest
 //!    kernel cannot see the host filesystem at all. Each job gets a scratch
 //!    ext4 disk built from its bind-mount sources, attached as the second block
@@ -101,7 +103,8 @@
 //! | need | why | failure if absent |
 //! |---|---|---|
 //! | `/dev/kvm` read-write | ask the kernel for a VM | probe reports unavailable ([`crate::probe`]) |
-//! | `CAP_NET_ADMIN` | create the TAP device and its route | deploy fails naming the `ip` command that refused |
+//! | `CAP_NET_ADMIN` | create the TAP device and address it (native ioctls, see [`net::create_tap`]) | deploy fails naming the ioctl that refused |
+//! | `iptables` | NAT the guest out of the uplink | kamaji starts with guests air-gapped, saying why ([`GuestNetwork::discover`]) |
 //! | `mkfs.ext4`, `debugfs` (e2fsprogs) | build and unpack the scratch disk | deploy fails naming the missing binary |
 //!
 //! Note what is *not* on that list: root. The scratch disk is built with
@@ -115,7 +118,7 @@
 //! Everything in this module that decides *what* to run — slot arithmetic, the
 //! Firecracker config document, the job contract, memory clamping, argv — is
 //! pure and unit-tested on any host. Everything that *does* it — `mkfs.ext4`,
-//! `ip tuntap`, spawning the VMM — is a shell-out to a Linux tool, and is
+//! the TAP ioctls, `iptables`, spawning the VMM — is Linux-only, and is
 //! verified on a node. The split is deliberate: the parts that are wrong
 //! *quietly* are the pure ones.
 //!
@@ -205,7 +208,6 @@
 //! @yah:gotcha("NOTHING GATES THE microVM BACKEND BY ARCH, which becomes a live hazard the moment this work reaches arm64. `rg target_arch oss/kamaji/crates/` returns NOTHING — there is no cfg(target_arch) anywhere in the crate. So a kamaji built with --features microvm on an aarch64 node attaches the backend and hands firecracker an x86 cmdline: microvm.rs:568-569 hardcodes `console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux`, where i8042.* names an x86 controller and reboot=k is the i8042 keyboard reset, pinned by test at microvm.rs:1919-1926. INFERRED and needing measurement: aarch64 firecracker resets via PSCI, so reboot=k is likely wrong there. Measured 2026-09-10 by R605-F16's triage.")
 //! @yah:gotcha("THE ONLY NODE WHERE ANY OF THIS CAN BE TESTED IS us-west-003, AND IT HAS A LANDMINE. It runs tree build 0.8.38-h2 with /etc/systemd/system/kamaji.service.d/10-microvm.conf setting KAMAJI_MICROVM_DIR. NO PUBLISHED kamaji carries the microvm feature, and that env var on a feature-off binary is FATAL AT STARTUP (kamaji-bin/src/main.rs:827 bails before the socket binds); Restart=on-failure + StartLimitBurst=5 then gives up in 60s, leaving the node with no workload supervisor. So: do NOT run scripts/roll-node.sh against it, and NEVER ship kamaji without yubaba from the same tree — ProtocolVersion::CURRENT is V9 and a skewed pair fails every call at connect with HandshakeRefused while still reporting active with NRestarts=0. Use scripts/hotship.sh --binaries yubaba,kamaji.")
 //! @yah:gotcha("THE NODE'S CHECKOUT IS NOT THE CAMP'S TREE and syncing it fails misleadingly. ~/yah on us-west-003 was stale at 8675e1a0; verify it carries the symbols you are testing before trusting any result. Syncing oss/kamaji ALONE fails with an unpublished `yah-workload-spec 0.8.37` error naming a crate you never touched — the cause is the root [patch.crates-io] redirect to ../yah-base, whose copy on the node is stale, so sync oss/yah-base TOO. The node has NO rsync; use tar over ssh, and do not copy target/ (2.1G vs ~1.8M of crates). Also: ssh needs `-i ~/.ssh/yah -o IdentitiesOnly=yes` or it fails 'Permission denied (publickey)' in a way that reads as the box being down, and journalctl as the unprivileged user returns EMPTY rather than an error — use sudo or you will conclude a working thing is broken.")
-//! @yah:depends_on(R605-F16)
 //! @yah:gotcha("A LIVE PEER APPENDED TO THE kamaji-proto ENUMS WHILE THIS TICKET WAS IN FLIGHT, 2026-09-10 — @Ashguard:dove (session:1e4618c6) working R870-B24. This is a seam, not a break; their kamaji workspace was green when they ran it (cargo test --workspace all pass, kamaji-bin lib 244). WHAT LANDED: kamaji-proto/src/messages.rs gained `YubabaToKamaji::Describe { request_id, id }` and `KamajiToYubaba::WorkloadDescription { request_id, id, spec: Option<Workload> }`, both appended LAST, with WorkloadDescription classified as a correlated reply in reply_request_id(); NO ProtocolVersion bump, so V9 stays R605-T27's, because appending a variant keeps postcard indices stable. kamaji-bin/src/server.rs: `Registry.digests` became `Registry.specs: HashMap<WorkloadId, DeployedSpec>` (the whole Workload plus its precomputed digest), and `set_spec_digest`/`remove_spec_digest` became `set_deployed_spec`/`remove_deployed_spec`/`deployed_spec`; stamp_spec_digests is behaviourally unchanged. kamaji/src/sibling.rs gained `KamajiClient::describe(&id)`. EXPLICITLY UNTOUCHED BY THEM and therefore safe for this ticket: microvm.rs, kamaji/src/lib.rs, native.rs, supervise.rs, kamaji-bin/src/main.rs. THREE CONSEQUENCES. (1) If the archetype work appends to either enum, RE-READ THE ENUM AT EDIT TIME and append after theirs — two independent \"appended last\" edits shift postcard indices against each other, and the resulting skew fails every yubaba->kamaji call at connect with HandshakeRefused while systemctl still reports active with NRestarts=0, i.e. it does NOT look like a restart loop. (2) Any new reply variant MUST be classified in reply_request_id() or it is SILENTLY dropped as a push (R746-B11). (3) Think hard before bumping ProtocolVersion: V9 is what us-west-003 runs as 0.8.38-h2 and that is the only node this can be tested on, so a bump forces a paired yubaba+kamaji re-ship (scripts/hotship.sh --binaries yubaba,kamaji, never kamaji alone) before anything works there.")
 //! @yah:handoff("DONE AND PROVEN ON REAL HARDWARE (us-west-003, firecracker v1.16.1, guest kernel 6.1.187, 2026-09-11T01:15-01:30Z). All four job-shaped sites are now archetype-dependent, driven by ONE value: VmShape::of_spec(spec), which reads WorkloadSpec::effective_archetype() — Job stays job-shaped, Server/Appliance are service-shaped. Nothing is a flag, an Option param or a fallback.")
 //! @yah:handoff("THE SUPERVISION IS SHARED, NOT DUPLICATED — this was the brief's cheapest-correct-outcome and it is what landed. New oss/kamaji/crates/kamaji/src/supervise.rs holds the restart-loop state machine that used to live inside native.rs (Ctrl<I>, park, supervise, backoff_delay, now_ms, ALWAYS_RESTART_DELAY), lifted verbatim and made generic over a `Supervised` trait with five members: start / wait / stop / settle / discard. native.rs lost 299 lines and gained a 65-line `NativeProcess` impl; microvm.rs gained a `GuestBoot` impl. The policy decision, the exponential backoff, the Restarting publication, the parked phase and the control-message handling are now identical between the two backends BY CONSTRUCTION rather than by inspection. native's own suite (always_policy_respawns_after_exit, on_failure_gives_up_after_max_attempts, restart_workload_replaces_running_process, graceful_upgrade_swaps_process_and_signals_old, ...) passes unchanged, which is the evidence the lift preserved behaviour.")
@@ -305,6 +307,11 @@ pub const TOOLCHAIN_IMAGE_FILE: &str = "toolchain.ext4";
 /// exact Debian package versions the image was assembled from.
 pub const TOOLCHAIN_MANIFEST_FILE: &str = "kamaji-toolchain.json";
 
+/// Filename of the node's service root image inside the microVM directory,
+/// beside `vmlinux`, `rootfs.ext4` and [`TOOLCHAIN_IMAGE_FILE`]. See
+/// [`MicroVmConfig::service_rootfs_image`].
+pub const SERVICE_ROOTFS_IMAGE_FILE: &str = "service-rootfs.ext4";
+
 /// Grace period between asking the VMM to stop and killing it.
 const TERM_GRACE: Duration = Duration::from_secs(10);
 
@@ -399,12 +406,22 @@ impl VmShape {
 /// the right place for bulk state: this backend neither rebuilds nor extracts it
 /// between a service's restarts, and it is sized for a build where the root is
 /// sized for a root.
+///
+/// # Which image a service's root starts as (R605-F32)
+///
+/// [`MicroVmConfig::service_rootfs_image`], never the job image. F31 seeded
+/// from the job image because the job image was the only one a node had; the
+/// shape now picks the *source* exactly as it already picked the attachment,
+/// so a node can boot builds in a minimal image and members in a full one.
 #[derive(Debug, Clone)]
 pub struct RootDisk {
     /// Image the guest boots as `/dev/vda`.
     pub path: PathBuf,
     /// Whether Firecracker attaches it read-only.
     pub read_only: bool,
+    /// The node image [`Self::path`] is first copied from, for a service; `None`
+    /// for a job, which boots the node image in place.
+    pub seed: Option<PathBuf>,
 }
 
 impl RootDisk {
@@ -418,17 +435,33 @@ impl RootDisk {
 
     /// Which root image `shape` boots, given the node's config and the
     /// workload's own state directory.
-    pub fn for_shape(cfg: &MicroVmConfig, shape: VmShape, vm_dir: &Path) -> Self {
-        match shape {
+    ///
+    /// Fails for a service on a node that stages no service image — see
+    /// [`MicroVmConfig::service_rootfs_image`] for why that is a refusal and
+    /// not a fall back to the job image.
+    pub fn for_shape(cfg: &MicroVmConfig, shape: VmShape, vm_dir: &Path) -> Result<Self> {
+        Ok(match shape {
             VmShape::Job => Self {
                 path: cfg.rootfs_image.clone(),
                 read_only: true,
+                seed: None,
             },
-            VmShape::Service => Self {
-                path: vm_dir.join(Self::SERVICE_ROOT_FILE),
-                read_only: false,
-            },
-        }
+            VmShape::Service => {
+                let seed = cfg.service_rootfs_image.clone().ok_or_else(|| {
+                    anyhow!(
+                        "this node stages no service root image, so it cannot boot a \
+                         service-shaped (server/appliance) microVM — stage one as \
+                         <microvm-dir>/{SERVICE_ROOTFS_IMAGE_FILE} (oss/kamaji/guest/\
+                         build-guest-image.sh --only service-rootfs)"
+                    )
+                })?;
+                Self {
+                    path: vm_dir.join(Self::SERVICE_ROOT_FILE),
+                    read_only: false,
+                    seed: Some(seed),
+                }
+            }
+        })
     }
 
     /// Put the bytes where [`Self::path`] says they are.
@@ -441,10 +474,10 @@ impl RootDisk {
     /// erase whatever the appliance had accumulated. That is the same promise
     /// `LifecycleArchetype::Appliance` already makes everywhere else in the
     /// fleet: stable identity, and a volume that follows it.
-    pub async fn provision(&self, cfg: &MicroVmConfig) -> Result<()> {
-        if self.read_only {
+    pub async fn provision(&self) -> Result<()> {
+        let Some(seed) = &self.seed else {
             return Ok(());
-        }
+        };
         if tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
             tracing::info!(
                 root = %self.path.display(),
@@ -452,19 +485,17 @@ impl RootDisk {
             );
             return Ok(());
         }
-        tokio::fs::copy(&cfg.rootfs_image, &self.path)
-            .await
-            .with_context(|| {
-                format!(
-                    "seeding a private root for a service-shaped guest: copying {} to {}",
-                    cfg.rootfs_image.display(),
-                    self.path.display()
-                )
-            })?;
+        tokio::fs::copy(seed, &self.path).await.with_context(|| {
+            format!(
+                "seeding a private root for a service-shaped guest: copying {} to {}",
+                seed.display(),
+                self.path.display()
+            )
+        })?;
         tracing::info!(
-            from = %cfg.rootfs_image.display(),
+            from = %seed.display(),
             root = %self.path.display(),
-            "seeded a service guest's private writable root from the node image"
+            "seeded a service guest's private writable root from the node's service image"
         );
         Ok(())
     }
@@ -484,11 +515,26 @@ impl RootDisk {
 pub struct MicroVmConfig {
     /// Path to the `firecracker` binary.
     pub vmm_bin: PathBuf,
-    /// Uncompressed guest kernel (`vmlinux`). Firecracker boots an ELF kernel,
-    /// not a `bzImage`.
+    /// Uncompressed guest kernel, always named `vmlinux` on disk. On x86_64
+    /// that is the ELF vmlinux (not a `bzImage`); on aarch64 it is the arm64
+    /// boot `Image`, which is what Firecracker loads there (R605-F32).
     pub kernel_image: PathBuf,
-    /// Guest root filesystem image, attached **read-only**.
+    /// The **job** root filesystem image, attached **read-only** and shared
+    /// by every job-shaped guest on the node.
     pub rootfs_image: PathBuf,
+    /// The image a **service-shaped** guest's private root is seeded from
+    /// (R605-F32), or `None` on a node that stages none.
+    ///
+    /// A separate image rather than the job one, because the two shapes want
+    /// different operating systems: a job wants the minimal image whose init
+    /// IS the job runner, and a long-lived guest that hosts a cluster member
+    /// wants a real init, so the node provisioning path a metal box runs
+    /// (systemd units, apt, sshd) runs inside it unchanged. A node that stages
+    /// none **refuses** service-shaped deploys rather than seeding them from
+    /// [`Self::rootfs_image`]: that fallback would quietly boot a member in an
+    /// image that cannot host one. A node that wants busybox services can
+    /// stage the job image here too, which is a configuration, not a fallback.
+    pub service_rootfs_image: Option<PathBuf>,
     /// Build-toolchain volume, attached **read-only** as a second data drive, or
     /// `None` on a node that has not staged one.
     ///
@@ -581,8 +627,17 @@ impl GuestNetwork {
     /// This is what a node should use: the interface guest traffic will actually
     /// leave by is a property of the host's routing table, not something a
     /// build-runtime should be guessing from a naming convention.
+    ///
+    /// It also refuses when `iptables` is not installed, because guest NAT is
+    /// still a shell-out to it (the TAP itself is not — see
+    /// [`net::create_tap`]). Without that check, a node missing it attaches the
+    /// backend, advertises guest networking, and fails every networked deploy;
+    /// with it, the node starts with guests air-gapped and its startup log
+    /// names the missing binary.
     pub fn discover() -> Result<Self> {
-        Ok(Self::for_uplink(net::default_route_uplink()?))
+        let uplink = net::default_route_uplink()?;
+        net::find_on_path("iptables")?;
+        Ok(Self::for_uplink(uplink))
     }
 }
 
@@ -871,6 +926,93 @@ pub struct NetworkInterface {
     pub guest_mac: String,
 }
 
+/// The CPU architecture of a guest, which is always the host's (R605-F32).
+///
+/// Not a node setting and not a spec field: KVM runs guests of the host's own
+/// arch only, so the kamaji binary's compile target IS the guest's arch, and
+/// [`Self::host`] reads it off `cfg!(target_arch)`. It is a value rather than a
+/// pair of `#[cfg]`'d constants so that both command lines stay testable on
+/// whichever arch the tests happen to run on — the x86 set is pinned on the
+/// arm64 camp Mac, and the arm64 set on an x86 CI box.
+///
+/// # What differs, and how it was decided
+///
+/// Only the platform-reset half of the command line. `console=ttyS0` and
+/// `panic=1` are shared: Firecracker exposes a 16550A UART as the first serial
+/// port on both arches (through the device tree on arm64, which is why the
+/// guest kernel needs `CONFIG_SERIAL_OF_PLATFORM` there), and `panic=1` is the
+/// half of the completion contract [`vmm_config`] explains — a panicked guest
+/// must reset rather than hang reporting `Running`.
+///
+/// The x86 set's `reboot=k i8042.noaux i8042.nomux pci=off` all name x86
+/// hardware: `reboot=k` selects the reset through the i8042 keyboard
+/// controller's port, which is the event Firecracker's x86 VMM treats as the
+/// guest going away, and the `i8042.*` pair stops the guest probing that
+/// controller's aux/mux ports, which Firecracker does not emulate. On arm64
+/// there is no i8042 at all, and the reset is a PSCI `SYSTEM_RESET` call that
+/// KVM hands Firecracker as a system event — selected by the guest kernel's
+/// PSCI driver, not by anything on the command line. See
+/// [`Self::base_boot_args`] for what was measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestArch {
+    X86_64,
+    Aarch64,
+}
+
+impl GuestArch {
+    /// The arch of every guest this kamaji can boot.
+    ///
+    /// An error, not a default, on any other arch: falling back to one of the
+    /// two command lines below is exactly the hazard R605-F31 recorded, where a
+    /// kamaji on a new arch hands Firecracker another arch's reset path and the
+    /// symptom is a guest that never reports finishing.
+    pub fn host() -> Result<Self> {
+        if cfg!(target_arch = "x86_64") {
+            Ok(Self::X86_64)
+        } else if cfg!(target_arch = "aarch64") {
+            Ok(Self::Aarch64)
+        } else {
+            bail!(
+                "microVM backend: no guest boot recipe for {} — guests are booted for x86_64 \
+                 and aarch64 only (oss/kamaji/guest/build-guest-image.sh)",
+                std::env::consts::ARCH
+            )
+        }
+    }
+
+    /// The command line every guest of this arch boots with, before the
+    /// per-slot `ip=` argument.
+    ///
+    /// x86_64 is byte-for-byte what R605-F14 measured booting on us-west-003
+    /// and what every x86 proof since was taken against.
+    ///
+    /// aarch64 was measured by R605-F32 on us-west-014 (Raspberry Pi 5,
+    /// Firecracker v1.16.0, guest kernel 6.1.187 built from
+    /// `kernel/base-aarch64-6.1.config`), booting each candidate line with
+    /// only the root drive attached so the init halts at once and the reset
+    /// path is the only thing under test:
+    ///
+    /// - Firecracker itself appends `pci=off root=/dev/vda ro
+    ///   earlycon=uart,mmio,0x40002000` on aarch64, so `pci=off` is the VMM's
+    ///   to give — and the arm64 kernel answers it with `PCI: Unknown option
+    ///   'off'` regardless.
+    /// - The x86 line boots and resets cleanly too: `reboot=k` and `i8042.*`
+    ///   are accepted and inert. Their absence here is because they name
+    ///   hardware this guest does not have, not because they break it.
+    /// - The reset is PSCI with or without `reboot=k`: `reboot: Restarting
+    ///   system`, then Firecracker logs `Received KVM_SYSTEM_EVENT: type: 2`
+    ///   and exits 0 — the VMM exit the supervisor reads as an instance end.
+    /// - `panic=1` is load-bearing exactly as on x86: `init=/nonexistent`
+    ///   panics, reboots after one second, and the VMM exits 0; the same
+    ///   boot without `panic=1` was still running when killed at 25s.
+    pub fn base_boot_args(self) -> &'static str {
+        match self {
+            Self::X86_64 => "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux",
+            Self::Aarch64 => "console=ttyS0 panic=1",
+        }
+    }
+}
+
 /// Build the VM definition for one guest.
 ///
 /// # Why the boot args are the same for both shapes
@@ -893,9 +1035,7 @@ pub struct NetworkInterface {
 /// `panic=1` for services would buy exactly one thing: a panicked service guest
 /// that hangs forever and reports `Running`.
 ///
-/// (`i8042.*` and `reboot=k` name x86 hardware. This backend is x86_64-only in
-/// practice today — see the module's board annotation and R605-F32, which owns
-/// the arm64 guest image and the `reboot=` value that goes with it.)
+/// The rest of the command line is per-arch, and why is [`GuestArch`]'s story.
 pub fn vmm_config(
     cfg: &MicroVmConfig,
     spec: &WorkloadSpec,
@@ -903,8 +1043,7 @@ pub fn vmm_config(
     workspace_disk: &Path,
     root: &RootDisk,
 ) -> Result<VmmConfig> {
-    let mut boot_args =
-        String::from("console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux");
+    let mut boot_args = String::from(GuestArch::host()?.base_boot_args());
     if let Some(slot) = slot {
         boot_args.push(' ');
         boot_args.push_str(&slot.kernel_ip_arg());
@@ -1407,6 +1546,13 @@ pub struct MicroVmRuntime {
 }
 
 impl MicroVmRuntime {
+    /// Per-workload scratch root; a guest's console is
+    /// `<state_dir>/<mesh ident>/console.log` (R729-F2 follows it by path,
+    /// since the `vms` map forgets a guest at teardown).
+    pub fn state_dir(&self) -> &Path {
+        &self.cfg.state_dir
+    }
+
     /// Construct the backend, checking the node's configuration up front.
     ///
     /// Deliberately fallible, and deliberately *not* the same check as
@@ -1420,6 +1566,10 @@ impl MicroVmRuntime {
     /// typo'd rootfs path advertises no microVM backend and never wins a
     /// placement, instead of accepting builds and failing every one of them.
     pub fn new(cfg: MicroVmConfig) -> Result<Self> {
+        // A kamaji on an arch with no guest recipe advertises no backend,
+        // rather than accepting workloads and booting each with another
+        // arch's command line (R605-F31's recorded hazard).
+        GuestArch::host()?;
         for (what, path) in [
             ("VMM binary", &cfg.vmm_bin),
             ("guest kernel", &cfg.kernel_image),
@@ -1449,10 +1599,25 @@ impl MicroVmRuntime {
                 );
             }
         }
+        // Same rule as the toolchain: absent is a configuration (this node runs
+        // jobs only), named-but-missing is an operator's typo.
+        if let Some(service) = &cfg.service_rootfs_image {
+            if !service.exists() {
+                bail!(
+                    "microVM backend: service root image not found at {} — remove it from the \
+                     node's config to run job-shaped guests only, or stage one with \
+                     oss/kamaji/guest/build-guest-image.sh --only service-rootfs",
+                    service.display()
+                );
+            }
+        }
         if cfg.max_guest_memory_mb == 0 {
             bail!("microVM backend: max_guest_memory_mb is 0 — no guest could be booted");
         }
         log_provenance("rootfs", &cfg.rootfs_image);
+        if let Some(service) = &cfg.service_rootfs_image {
+            log_provenance("service rootfs", service);
+        }
         if let Some(toolchain) = &cfg.toolchain_image {
             log_provenance("toolchain", toolchain);
         }
@@ -1542,11 +1707,17 @@ impl Kamaji for MicroVmRuntime {
         }
 
         let ident = spec.expose.mesh.identity.clone();
+        let vm_dir = self.cfg.state_dir.join(sanitize(&ident.0));
+        // Which root this guest boots, decided before anything is torn down or
+        // allocated: a service on a node with no service image is refused here
+        // with the running instance (if any) left alone.
+        let root = RootDisk::for_shape(&self.cfg, shape, &vm_dir)
+            .with_context(|| format!("workload {}", spec.name))?;
+
         // Idempotent, like every other backend's deploy.
         self.teardown_workload(&ident).await?;
 
         let slot = self.allocate_slot().await?;
-        let vm_dir = self.cfg.state_dir.join(sanitize(&ident.0));
         tokio::fs::create_dir_all(&vm_dir)
             .await
             .with_context(|| format!("creating microVM state dir {}", vm_dir.display()))?;
@@ -1581,11 +1752,10 @@ impl Kamaji for MicroVmRuntime {
             .await
             .with_context(|| format!("writing {JOB_FILE} into {}", disk.display()))?;
 
-        // 3. Root device: the node's shared read-only image for a job, this
+        // 3. Root device: the node's shared read-only job image for a job, this
         //    workload's own writable copy for a service (seeded from the node's
-        //    if it has none yet, kept as-is if it has).
-        let root = RootDisk::for_shape(&self.cfg, shape, &vm_dir);
-        root.provision(&self.cfg).await?;
+        //    service image if it has none yet, kept as-is if it has).
+        root.provision().await?;
 
         // 4. Host networking for this slot.
         if let (Some(slot), Some(net)) = (slot.as_ref(), self.cfg.network.as_ref()) {
@@ -2290,10 +2460,32 @@ pub mod net {
 
     /// The host's IPv4 forwarding switch.
     ///
-    /// Written through `/proc` rather than by shelling out to `sysctl`: this
-    /// module already depends on `ip` and `iptables` being installed, and
-    /// `procps` is one more package a minimal node can be missing for no reason.
+    /// Written through `/proc` rather than by shelling out to `sysctl`, for the
+    /// same reason the TAP is made with ioctls rather than `ip`: every host
+    /// binary this backend depends on is one a minimal or A/B-updated node can
+    /// be missing.
     const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+
+    /// Resolve `bin` against `PATH`, failing with a message naming it.
+    ///
+    /// The startup-time half of [`run`]'s "is it installed on this node?":
+    /// asked once, when the backend attaches, instead of at the first deploy
+    /// that needs it.
+    pub fn find_on_path(bin: &str) -> Result<PathBuf> {
+        std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(|d| Path::new(d).join(bin))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no `{bin}` on PATH — guest NAT needs it, so this node cannot give a \
+                     guest a network (on Debian it is the `{bin}` package, which docker.io \
+                     depends on)"
+                )
+            })
+    }
 
     /// Create and bring up the TAP for `slot`, and NAT it out `net.uplink`.
     ///
@@ -2308,17 +2500,24 @@ pub mod net {
     /// 4. **`FORWARD` accepts** for the pair, because a node whose `FORWARD`
     ///    policy is `DROP` — which is any node with docker installed — drops
     ///    them just as silently with forwarding on.
+    ///
+    /// Piece 1 is ioctls against `/dev/net/tun` and an `AF_INET` socket, not
+    /// `ip tuntap` / `ip addr` / `ip link` (R605-F36). The Pi appliances are
+    /// A/B-updated images, and us-west-014's system slot shipped without
+    /// iproute2 at all, so a backend that shelled out to `ip` would attach on
+    /// that node and then fail every networked deploy. The kernel interface
+    /// the `ip` commands used is three ioctls; depending on the binary bought
+    /// nothing but that failure. NAT is still `iptables` (see
+    /// [`GuestNetwork::discover`] for how its absence is reported) because
+    /// nf_tables over netlink is not a contained replacement.
     pub async fn create_tap(slot: &GuestSlot, net: &GuestNetwork) -> Result<()> {
         // Idempotent: a leaked TAP from a previous kamaji generation must not
-        // wedge the slot forever. `ip tuntap del` on a nonexistent device is a
-        // no-op we deliberately ignore.
+        // wedge the slot forever. Destroying a nonexistent device is a no-op
+        // we deliberately ignore.
         let _ = delete_tap(slot, net).await;
 
-        run("ip", &["tuntap", "add", &slot.tap, "mode", "tap"])
-            .await
-            .context("ip tuntap add failed — this needs CAP_NET_ADMIN")?;
-        run("ip", &["addr", "add", &format!("{}/30", slot.host_ip), "dev", &slot.tap]).await?;
-        run("ip", &["link", "set", &slot.tap, "up"]).await?;
+        tap::create(&slot.tap)?;
+        tap::assign(&slot.tap, slot.host_ip)?;
 
         enable_ip_forwarding()
             .await
@@ -2342,7 +2541,157 @@ pub mod net {
             let _ = run("iptables", &rule).await;
         }
         let _ = run("iptables", &masquerade_rule("-D", slot, net)).await;
-        run("ip", &["tuntap", "del", &slot.tap, "mode", "tap"]).await
+        tap::destroy(&slot.tap)
+    }
+
+    /// The TAP device itself, through the kernel's own interface.
+    ///
+    /// What `ip tuntap add|del` and `ip addr add` + `ip link set up` did,
+    /// minus the binary: `TUNSETIFF` names and creates the device on a
+    /// `/dev/net/tun` fd, `TUNSETPERSIST` keeps it after that fd closes (so
+    /// Firecracker can attach by name, exactly as it did to an `ip`-made one),
+    /// and the address, netmask and `IFF_UP` are `SIOCSIF*` on any `AF_INET`
+    /// socket. Flags match `ip tuntap add mode tap`: `IFF_TAP | IFF_NO_PI`.
+    /// Firecracker re-attaches with `IFF_VNET_HDR` added, which the kernel
+    /// accepts on a persistent device — it only refuses a multi-queue
+    /// mismatch.
+    #[cfg(target_os = "linux")]
+    mod tap {
+        use std::ffi::CString;
+        use std::io;
+        use std::net::Ipv4Addr;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        use anyhow::{anyhow, bail, Context, Result};
+
+        const TUN_DEV: &str = "/dev/net/tun";
+        /// The /30 every slot's host end sits on.
+        const SLOT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 252);
+
+        /// An `ifreq` naming `name`, payload zeroed.
+        fn ifreq(name: &str) -> Result<libc::ifreq> {
+            let bytes = name.as_bytes();
+            if bytes.is_empty() || bytes.len() >= libc::IFNAMSIZ || bytes.contains(&0) {
+                bail!("{name:?} is not a valid interface name (1-15 bytes, no NUL)");
+            }
+            // SAFETY: ifreq is plain old data — an all-zero value is a valid
+            // empty request.
+            let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+            for (dst, src) in req.ifr_name.iter_mut().zip(bytes) {
+                *dst = *src as libc::c_char;
+            }
+            Ok(req)
+        }
+
+        fn ioctl(fd: &OwnedFd, op: libc::Ioctl, req: &mut libc::ifreq, what: &str) -> Result<()> {
+            // SAFETY: every op used here takes a `struct ifreq *`, and `req`
+            // is a live, correctly-sized one for the duration of the call.
+            if unsafe { libc::ioctl(fd.as_raw_fd(), op, req as *mut libc::ifreq) } < 0 {
+                let err = io::Error::last_os_error();
+                let hint = if err.raw_os_error() == Some(libc::EPERM) {
+                    " — this needs CAP_NET_ADMIN"
+                } else {
+                    ""
+                };
+                return Err(anyhow!("{what} failed: {err}{hint}"));
+            }
+            Ok(())
+        }
+
+        /// A `/dev/net/tun` fd bound to `name` as a TAP. If no such device
+        /// exists the kernel creates one, owned by this fd.
+        fn attach(name: &str) -> Result<OwnedFd> {
+            let path = CString::new(TUN_DEV).expect("static path has no NUL");
+            // SAFETY: a valid C string and flags; the result is checked.
+            let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+            if raw < 0 {
+                return Err(io::Error::last_os_error())
+                    .with_context(|| format!("opening {TUN_DEV} — is the tun module present?"));
+            }
+            // SAFETY: `raw` is a freshly opened fd that nothing else owns.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let mut req = ifreq(name)?;
+            req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+            ioctl(&fd, libc::TUNSETIFF, &mut req, &format!("TUNSETIFF {name}"))?;
+            Ok(fd)
+        }
+
+        fn set_persist(fd: &OwnedFd, name: &str, on: bool) -> Result<()> {
+            // SAFETY: TUNSETPERSIST takes its argument by value, not by pointer.
+            if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, libc::c_ulong::from(on)) } < 0 {
+                return Err(io::Error::last_os_error())
+                    .with_context(|| format!("TUNSETPERSIST({on}) {name}"));
+            }
+            Ok(())
+        }
+
+        /// Create persistent TAP `name`.
+        pub fn create(name: &str) -> Result<()> {
+            let fd = attach(name)?;
+            set_persist(&fd, name, true)
+        }
+
+        /// Remove TAP `name`. A device that does not exist is not an error:
+        /// attaching creates a non-persistent one, which vanishes when the fd
+        /// drops.
+        pub fn destroy(name: &str) -> Result<()> {
+            let fd = attach(name)?;
+            set_persist(&fd, name, false)
+        }
+
+        /// Give `name` the host end of its slot's /30 and bring it up.
+        pub fn assign(name: &str, host_ip: Ipv4Addr) -> Result<()> {
+            // SAFETY: plain socket(2); the result is checked.
+            let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            if raw < 0 {
+                return Err(io::Error::last_os_error()).context("socket(AF_INET) for TAP setup");
+            }
+            // SAFETY: `raw` is a freshly created fd that nothing else owns.
+            let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+
+            let mut req = ifreq(name)?;
+            req.ifr_ifru.ifru_addr = sockaddr(host_ip);
+            ioctl(&sock, libc::SIOCSIFADDR as libc::Ioctl, &mut req, &format!("SIOCSIFADDR {name}"))?;
+
+            let mut req = ifreq(name)?;
+            req.ifr_ifru.ifru_netmask = sockaddr(SLOT_NETMASK);
+            ioctl(&sock, libc::SIOCSIFNETMASK as libc::Ioctl, &mut req, &format!("SIOCSIFNETMASK {name}"))?;
+
+            let mut req = ifreq(name)?;
+            ioctl(&sock, libc::SIOCGIFFLAGS as libc::Ioctl, &mut req, &format!("SIOCGIFFLAGS {name}"))?;
+            // SAFETY: SIOCGIFFLAGS just filled the flags member of the union.
+            unsafe { req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short };
+            ioctl(&sock, libc::SIOCSIFFLAGS as libc::Ioctl, &mut req, &format!("SIOCSIFFLAGS {name}"))
+        }
+
+        fn sockaddr(ip: Ipv4Addr) -> libc::sockaddr {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr { s_addr: u32::from(ip).to_be() },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr_in and sockaddr are both 16 bytes, and an
+            // AF_INET sockaddr is by definition a sockaddr_in.
+            unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sin) }
+        }
+    }
+
+    /// TAP devices are a Linux kernel interface; a guest only ever runs there.
+    #[cfg(not(target_os = "linux"))]
+    mod tap {
+        use anyhow::{bail, Result};
+        use std::net::Ipv4Addr;
+
+        pub fn create(name: &str) -> Result<()> {
+            bail!("cannot create TAP {name}: TAP devices are Linux-only")
+        }
+        pub fn destroy(_name: &str) -> Result<()> {
+            Ok(())
+        }
+        pub fn assign(name: &str, _host_ip: Ipv4Addr) -> Result<()> {
+            bail!("cannot address TAP {name}: TAP devices are Linux-only")
+        }
     }
 
     /// Turn on IPv4 forwarding if it is off.
@@ -2511,6 +2860,47 @@ enp2s0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
             }
         }
 
+        /// The native TAP path does what `ip tuntap add` + `ip addr add` +
+        /// `ip link set up` did, with no iproute2 involved (R605-F36).
+        ///
+        /// Runs for real only as root on Linux (CI containers run privileged,
+        /// a node runs kamaji as root); skips elsewhere, saying so. The
+        /// kernel's connected route is the readback: it exists only once the
+        /// address and the /30 netmask are both on the device.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_tap_is_created_addressed_and_removed_without_iproute2() {
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } != 0 || !Path::new("/dev/net/tun").exists() {
+                eprintln!("SKIP: needs root and /dev/net/tun");
+                return;
+            }
+            let name = "yahtaptest0";
+            let sys = Path::new("/sys/class/net").join(name);
+            let _ = tap::destroy(name);
+
+            tap::create(name).expect("create");
+            assert!(sys.exists(), "TUNSETPERSIST must keep the device after the fd closes");
+            tap::assign(name, Ipv4Addr::new(172, 30, 255, 1)).expect("assign");
+
+            let flags = std::fs::read_to_string(sys.join("flags")).unwrap();
+            let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).unwrap();
+            assert_eq!(flags & libc::IFF_UP as u32, libc::IFF_UP as u32, "device must be up");
+            // 172.30.255.0/30, little-endian hex as /proc/net/route prints it.
+            let routes = std::fs::read_to_string(PROC_ROUTE).unwrap();
+            assert!(
+                routes.lines().any(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    f.first() == Some(&name) && f.get(1) == Some(&"00FF1EAC") && f.get(7) == Some(&"FCFFFFFF")
+                }),
+                "no connected 172.30.255.0/30 route on {name}:\n{routes}"
+            );
+
+            tap::destroy(name).expect("destroy");
+            assert!(!sys.exists(), "destroy must remove the persistent device");
+            tap::destroy(name).expect("destroying an absent TAP is a no-op");
+        }
+
         /// Return traffic is state-matched, not blanket-accepted.
         #[test]
         fn the_return_forward_rule_does_not_open_a_path_into_the_guest() {
@@ -2544,20 +2934,29 @@ const VMM_FALLBACK_DIRS: [&str; 3] = ["/usr/local/bin", "/usr/bin", "/opt/firecr
 /// provisioned node would refuse to start at all. Same shape as the `eth0`
 /// uplink default: a path guessed once, never exercised, wrong everywhere.
 ///
-/// `PATH` first, so an operator can override by placing one earlier.
-pub fn find_vmm() -> Result<PathBuf> {
+/// The node's own `microvm_dir` is searched first, then `PATH`, then the
+/// fallback dirs. The microVM dir already holds every other piece of guest
+/// material (kernel, rootfs, service and toolchain images), and on the Pi
+/// appliances it is the only one of these locations guaranteed to be on the
+/// data disk: their system slot is a flashed A/B image, and when us-west-014's
+/// SD card died and was reflashed (2026-09-22) its `/usr/local/bin/firecracker`
+/// symlink went with the card while the binary it pointed at survived on the
+/// NVMe (R605-F36). us-west-011/013 still keep `/usr/local/bin` on the SD. A
+/// VMM staged beside the kernel survives whatever the kernel survives. A node that installs it system-wide (us-west-003) is
+/// unaffected, since its dir holds no `firecracker`.
+pub fn find_vmm(microvm_dir: &Path) -> Result<PathBuf> {
     let path = std::env::var("PATH").unwrap_or_default();
-    let found = path
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .chain(VMM_FALLBACK_DIRS)
-        .map(|dir| Path::new(dir).join("firecracker"))
+    let found = std::iter::once(microvm_dir)
+        .chain(path.split(':').filter(|d| !d.is_empty()).map(Path::new))
+        .chain(VMM_FALLBACK_DIRS.iter().map(Path::new))
+        .map(|dir| dir.join("firecracker"))
         .find(|p| p.is_file());
     found.ok_or_else(|| {
         anyhow!(
-            "no `firecracker` on PATH or in {} — a microVM node needs the VMM installed; \
-             upstream ships no Debian package, so this is normally an install from the \
-             release tarball into /usr/local/bin",
+            "no `firecracker` in {}, on PATH, or in {} — a microVM node needs the VMM \
+             installed; upstream ships no Debian package, so stage the release tarball's \
+             binary in the microVM dir (or install it into /usr/local/bin)",
+            microvm_dir.display(),
             VMM_FALLBACK_DIRS.join(", ")
         )
     })
@@ -2596,6 +2995,7 @@ mod tests {
             vmm_bin: PathBuf::from("/usr/bin/firecracker"),
             kernel_image: PathBuf::from("/var/lib/yah/microvm/vmlinux"),
             rootfs_image: PathBuf::from("/var/lib/yah/microvm/rootfs.ext4"),
+            service_rootfs_image: Some(PathBuf::from("/var/lib/yah/microvm/service-rootfs.ext4")),
             toolchain_image: None,
             state_dir: PathBuf::from("/var/lib/yah/microvm/vms"),
             network: Some(GuestNetwork::for_uplink("eth0")),
@@ -2653,24 +3053,30 @@ mod tests {
 
     /// What a job-shaped guest boots: the node's one shared image, read-only.
     fn job_root() -> RootDisk {
-        RootDisk::for_shape(&cfg(), VmShape::Job, &vm_dir())
+        RootDisk::for_shape(&cfg(), VmShape::Job, &vm_dir()).unwrap()
     }
 
     /// What a service-shaped guest boots: its own copy, writable.
     fn service_root() -> RootDisk {
-        RootDisk::for_shape(&cfg(), VmShape::Service, &vm_dir())
+        RootDisk::for_shape(&cfg(), VmShape::Service, &vm_dir()).unwrap()
     }
 
     /// A constructible backend rooted in `tmp` — the guest material only has to
     /// *exist* for `MicroVmRuntime::new`, which is what these tests need.
     fn runtime_on(tmp: &tempfile::TempDir) -> MicroVmRuntime {
         let mut c = cfg();
-        for p in ["firecracker", "vmlinux", "rootfs.ext4"] {
+        for p in [
+            "firecracker",
+            "vmlinux",
+            "rootfs.ext4",
+            SERVICE_ROOTFS_IMAGE_FILE,
+        ] {
             std::fs::write(tmp.path().join(p), b"").unwrap();
         }
         c.vmm_bin = tmp.path().join("firecracker");
         c.kernel_image = tmp.path().join("vmlinux");
         c.rootfs_image = tmp.path().join("rootfs.ext4");
+        c.service_rootfs_image = Some(tmp.path().join(SERVICE_ROOTFS_IMAGE_FILE));
         c.state_dir = tmp.path().join("vms");
         MicroVmRuntime::new(c).unwrap()
     }
@@ -2873,6 +3279,82 @@ mod tests {
         );
     }
 
+    /// R605-F32: a service's private root starts as the node's SERVICE image,
+    /// and a job still boots the job image in place with nothing to seed.
+    #[test]
+    fn a_service_root_is_seeded_from_the_service_image_not_the_job_image() {
+        assert_eq!(
+            service_root().seed.as_deref(),
+            Some(Path::new("/var/lib/yah/microvm/service-rootfs.ext4"))
+        );
+        assert_eq!(job_root().seed, None, "a job boots the node image in place");
+    }
+
+    /// No service image staged means no service-shaped guest — refused, never
+    /// seeded from the job image, which cannot host what a service is for.
+    #[test]
+    fn a_node_with_no_service_image_refuses_a_service_rather_than_falling_back() {
+        let jobs_only = MicroVmConfig {
+            service_rootfs_image: None,
+            ..cfg()
+        };
+        let err = RootDisk::for_shape(&jobs_only, VmShape::Service, &vm_dir())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(SERVICE_ROOTFS_IMAGE_FILE), "{err}");
+        // Jobs are unaffected by the absence.
+        assert!(RootDisk::for_shape(&jobs_only, VmShape::Job, &vm_dir()).is_ok());
+    }
+
+    /// Named but missing is an operator's typo, refused at construction like a
+    /// missing toolchain — not a node that silently runs jobs only.
+    #[test]
+    fn a_named_but_missing_service_image_refuses_construction() {
+        let tmp = tempfile::tempdir().unwrap();
+        for p in ["firecracker", "vmlinux", "rootfs.ext4"] {
+            std::fs::write(tmp.path().join(p), b"").unwrap();
+        }
+        let c = MicroVmConfig {
+            vmm_bin: tmp.path().join("firecracker"),
+            kernel_image: tmp.path().join("vmlinux"),
+            rootfs_image: tmp.path().join("rootfs.ext4"),
+            service_rootfs_image: Some(tmp.path().join(SERVICE_ROOTFS_IMAGE_FILE)),
+            state_dir: tmp.path().join("vms"),
+            ..cfg()
+        };
+        let err = match MicroVmRuntime::new(c) {
+            Ok(_) => panic!("a missing service image must refuse construction"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("service root image not found"), "{err}");
+    }
+
+    /// Seeding copies the service image once, and a redeploy KEEPS the root —
+    /// it is the workload's state, and re-seeding would erase it.
+    #[tokio::test]
+    async fn provisioning_seeds_once_and_never_overwrites_a_services_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc_image = tmp.path().join(SERVICE_ROOTFS_IMAGE_FILE);
+        std::fs::write(&svc_image, b"pristine service image").unwrap();
+        let c = MicroVmConfig {
+            service_rootfs_image: Some(svc_image),
+            ..cfg()
+        };
+        let vm = tmp.path().join("vms/s");
+        std::fs::create_dir_all(&vm).unwrap();
+        let root = RootDisk::for_shape(&c, VmShape::Service, &vm).unwrap();
+
+        root.provision().await.unwrap();
+        assert_eq!(std::fs::read(&root.path).unwrap(), b"pristine service image");
+
+        std::fs::write(&root.path, b"state the appliance accumulated").unwrap();
+        root.provision().await.unwrap();
+        assert_eq!(
+            std::fs::read(&root.path).unwrap(),
+            b"state the appliance accumulated"
+        );
+    }
+
     /// The shape comes from the archetype, through the one seam the rest of the
     /// fleet uses to ask the same question.
     #[test]
@@ -2940,13 +3422,52 @@ mod tests {
 
     #[test]
     fn boot_args_make_a_panicking_guest_exit_rather_than_hang() {
-        // `panic=1 reboot=k` is what turns "the VMM process ended" into a
-        // completion signal. Without it a crashed guest is indistinguishable
-        // from a slow build until teardown.
+        // `panic=1` (plus, on x86, `reboot=k`) is what turns "the VMM process
+        // ended" into a completion signal. Without it a crashed guest is
+        // indistinguishable from a slow build until teardown.
         let vm = vmm_config(&cfg(), &spec("b"), None, Path::new("/w/d.ext4"), &job_root()).unwrap();
         assert!(vm.boot_source.boot_args.contains("panic=1"));
-        assert!(vm.boot_source.boot_args.contains("reboot=k"));
         assert!(vm.boot_source.boot_args.contains("console=ttyS0"));
+        assert!(vm
+            .boot_source
+            .boot_args
+            .starts_with(GuestArch::host().unwrap().base_boot_args()));
+    }
+
+    /// The x86 command line is byte-for-byte the one every x86 proof from
+    /// R605-F14 to F33 was taken against. R605-F32 moved it behind
+    /// [`GuestArch`]; this is what proves the move changed nothing for x86,
+    /// and it runs on every host, the arm64 camp Mac included.
+    #[test]
+    fn the_x86_command_line_is_exactly_what_f14_measured() {
+        assert_eq!(
+            GuestArch::X86_64.base_boot_args(),
+            "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux"
+        );
+    }
+
+    /// The aarch64 command line is the one R605-F32 measured booting and
+    /// resetting cleanly on us-west-014, and it carries none of the x86
+    /// hardware names — the hazard R605-F31 recorded was exactly an arm64
+    /// kamaji handing Firecracker the x86 set.
+    #[test]
+    fn the_aarch64_command_line_is_what_f32_measured_and_names_no_x86_hardware() {
+        let args = GuestArch::Aarch64.base_boot_args();
+        assert_eq!(args, "console=ttyS0 panic=1");
+        for x86_only in ["reboot=k", "i8042", "pci=off"] {
+            assert!(!args.contains(x86_only), "{x86_only} names x86 hardware: {args}");
+        }
+    }
+
+    /// The guest arch is the compile target's, not a default.
+    #[test]
+    fn the_guest_arch_is_the_hosts() {
+        let expect = match std::env::consts::ARCH {
+            "x86_64" => GuestArch::X86_64,
+            "aarch64" => GuestArch::Aarch64,
+            other => panic!("no microVM guest recipe for {other}; this test needs one"),
+        };
+        assert_eq!(GuestArch::host().unwrap(), expect);
     }
 
     /// R605-F31 expected the boot args to become archetype-dependent and they
@@ -3328,15 +3849,7 @@ mod tests {
     #[test]
     fn backend_tag_is_microvm() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut c = cfg();
-        for p in ["firecracker", "vmlinux", "rootfs.ext4"] {
-            std::fs::write(tmp.path().join(p), b"").unwrap();
-        }
-        c.vmm_bin = tmp.path().join("firecracker");
-        c.kernel_image = tmp.path().join("vmlinux");
-        c.rootfs_image = tmp.path().join("rootfs.ext4");
-        c.state_dir = tmp.path().join("vms");
-        let rt = MicroVmRuntime::new(c).unwrap();
+        let rt = runtime_on(&tmp);
         assert_eq!(rt.backend(), Backend::MicroVm);
     }
 
@@ -3413,15 +3926,7 @@ mod tests {
     #[tokio::test]
     async fn teardown_of_an_unknown_workload_is_a_noop() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut c = cfg();
-        for p in ["firecracker", "vmlinux", "rootfs.ext4"] {
-            std::fs::write(tmp.path().join(p), b"").unwrap();
-        }
-        c.vmm_bin = tmp.path().join("firecracker");
-        c.kernel_image = tmp.path().join("vmlinux");
-        c.rootfs_image = tmp.path().join("rootfs.ext4");
-        c.state_dir = tmp.path().join("vms");
-        let rt = MicroVmRuntime::new(c).unwrap();
+        let rt = runtime_on(&tmp);
         rt.teardown_workload(&MeshIdent("never-deployed".into()))
             .await
             .expect("teardown must be idempotent");

@@ -136,6 +136,9 @@ pub struct ContainerdRuntime {
     /// socket there via [`kcc::PodOptions::collector_socket`]; doing either
     /// without the other produces a workload pointed at nothing.
     collector: crate::observe::Collector,
+    /// The socket `channel` dials; image pulls go through `ctr` against the
+    /// same containerd (R931-B9).
+    socket: PathBuf,
 }
 
 /// One container's restart history.
@@ -249,9 +252,11 @@ impl ContainerdRuntime {
     /// On macOS with Colima, the socket is typically at
     /// `~/.colima/default/containerd.sock`.
     pub async fn connect_at(socket: impl AsRef<std::path::Path>) -> Result<Self> {
-        let channel = kcc::connect(socket).await?;
+        let socket = socket.as_ref().to_path_buf();
+        let channel = kcc::connect(&socket).await?;
         Ok(ContainerdRuntime {
             channel,
+            socket,
             namespace: YAH_NAMESPACE.to_string(),
             log_base: PathBuf::from(LOG_BASE),
             ledger: RestartLedger::new(),
@@ -384,10 +389,12 @@ impl ContainerdRuntime {
     ) -> Result<DeployResult> {
         let image_ref = Self::image_ref(spec);
 
-        // Ensure the image is in the containerd image store (callers pre-pull;
-        // see R091-F3). Delegates to `kamaji-containerd-core` (R592-T1).
+        // Ensure the image is in the containerd image store, pulling it if
+        // missing (R931-B9). `deploy_workload` already did this before its
+        // teardown, so there it is a lookup; the graceful-upgrade path relies
+        // on it here. Delegates to `kamaji-containerd-core` (R592-T1).
         let image_target_digest =
-            kcc::resolve_image_target_digest(&self.channel, &self.namespace, &image_ref).await?;
+            kcc::ensure_image(&self.channel, &self.namespace, &self.socket, &image_ref).await?;
 
         // Image OCI config (ENTRYPOINT/CMD/ENV/WORKDIR/USER) merged per OCI
         // convention (R590-B8). Best-effort; unreadable → spec-only argv/env.
@@ -919,6 +926,13 @@ impl Kamaji for ContainerdRuntime {
             anyhow::bail!("workload {}: {message}", spec.expose.mesh.identity.0);
         }
 
+        // R931-B9: the image must be present (pulled if not) BEFORE the
+        // teardown below — a missing or unpullable image used to surface only
+        // after the incumbent was already gone.
+        kcc::ensure_image(&self.channel, &self.namespace, &self.socket, &Self::image_ref(spec))
+            .await
+            .with_context(|| format!("workload {}: image unavailable", spec.name))?;
+
         // Idempotent redeploy: reap any prior generation(s) — BOTH pod slots —
         // reset the slot cell, and release any held custody listen socket.
         let _ = self.teardown_workload(&spec.expose.mesh.identity).await;
@@ -1426,6 +1440,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -1686,6 +1702,7 @@ mod tests {
             tail: Some(100),
             follow: false,
             stream: Some(LogStreamKind::Stdout),
+            cursor: None,
         };
         let mut log_stream = rt
             .stream_logs(&spec.expose.mesh.identity, opts)

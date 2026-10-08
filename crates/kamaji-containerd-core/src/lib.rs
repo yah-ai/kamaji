@@ -85,6 +85,32 @@
 //! @yah:verify("NOT PROVEN BY ME, and it is the one leg the ticket called the real oracle: that the message ARRIVES. I cannot read human@yah.dev's mailbox and the Mailgun event log needs the noisetable camp's credential — its log showed zero events ever, so a non-502 with no delivered event would mean the failure moved rather than went away. The operator can settle it by looking for a noisetable sign-in mail sent at 07:0x UTC 2026-09-11; if none arrived, this ticket is not done and the next suspect is Mailgun-side (domain verification / From: header, per the noisetable mirror's own gotcha), not DNS.")
 //! @yah:gotcha("THE BUG WAS REAL AND THE FIX IS WHAT MOVED IT — the discriminator is that nothing else changed between the 502 and the 200: same image digest, same spec, same node, same Mailgun account. Only the bound resolver file differs.")
 //! @yah:verify("LIVE EVIDENCE, in the order it was taken. (1) OCI spec of the running container, read with `ctr -n yah c info noisetable-account`: mount `{destination: /etc/resolv.conf, type: bind, source: /run/systemd/resolve/resolv.conf, options: [rbind, ro, nosuid, nodev]}` — the new branch, naming the upstream file, where every previous deploy named /etc/resolv.conf. Network namespace entry carries `path: /var/run/netns/noisetable-account`. (2) Inside the container's mount ns: /etc/resolv.conf = `nameserver 213.186.33.99` + `search .`, where it was `nameserver 127.0.0.53` before. (3) Inside its netns: `getent hosts smtp.mailgun.org` returns `34.149.236.64` — this is the exact command the ticket named and it had never returned an address. (4) `curl -X POST https://api.noisetable.com/api/v1/auth/magic-link/request -H 'Origin: https://noisetable.com' -d '{\"email\":\"human@yah.dev\"}'` => HTTP 200 {\"ok\":true}, against a baseline of 502 {\"error\":\"mailer_transport\",\"message\":\"... failed to lookup address information: Try again\"}. The mailer submits synchronously, so a 200 means the SMTP transport resolved, connected and was accepted.")
+//!
+//! @yah:ticket(R931-B9, "workload deploy of a freshly pushed cr.yah.dev image fails 'pre-pull required' and tears down the running workload; no operator pre-pull verb")
+//! @yah:status(review)
+//! @yah:at(2026-10-06T20:44:57Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R931)
+//! @yah:severity(high)
+//! @yah:handoff("MEASURED 2026-10-06 from noisetable R795-T8. Pushed cr.yah.dev/noisetable-issues:20261006.1-amd64-dev (sha256:0a35a2cd13cbe0b45ec74162ef47b93f7bb450c8eae217fdd17084f81d2afd99) with `yah cloud cr push`, set it in .yah/infra/workloads/noisetable-marketing-issues.toml, ran `yah cloud workload deploy noisetable-marketing-issues --where node:us-west-001`: yubaba 500 'kamaji deploy_workload: BackendRefused: containerd: image not found in containerd ... pre-pull required' (kamaji-containerd-core/src/lib.rs:234). Three defects: (1) no yah verb pulls a pushed image onto a node, so every new image needs out-of-band ctr pull; (2) a failed deploy left the previously running workload gone: /api/issues returned 503 'no ready upstreams' until the old digest was redeployed (the old image was still in containerd); (3) without --where, placement resolved us-east-001 though the issues volume lives on us-west-001, so a successful deploy there would silently start on an empty DB. Also observed: `mirror up --component issues` re-announces the inner door, replacing passway-inner-noisetable-marketing on all 3 nodes, and noisetable.com / and /app/ returned 503 for ~20s. Prod now runs the OLD digest 7e724af4... again.")
+//! @yah:next("Give yubaba admission a pull step for digest-pinned refs from cr.yah.dev (or a `yah cloud workload pull`), and make a failed deploy leave the running workload untouched.")
+//! @yah:next("OPERATOR DECISION 2026-10-06 (relayed from noisetable by @Glimmerstone:eclipse, session:5b0da90e): fix this in the yah camp; no manual ctr pull workaround. Done means: (1) a deploy of a digest-pinned cr.yah.dev ref pulls the image itself; (2) a deploy that fails at admission or pull leaves the running workload serving, with a test that reproduces the teardown red first; (3) placement honours the workload's volume, so noisetable-marketing-issues without --where lands on us-west-001 or refuses, and never silently starts on an empty volume elsewhere. Split (3) into its own R931 bug if it lives in a different crate.")
+//! @yah:next("Also measured: `mirror up --component issues` re-announced passway-inner-noisetable-marketing on all 3 nodes and blacked out noisetable.com / and /app/ for ~20s. A component-scoped deploy should not replace the inner door when its route set is unchanged. File this as its own R931 bug unless it shares the fix.")
+//! @yah:next("Rollout: if the fix runs node-side (kamaji), getting it onto us-west-001/us-east-001 is an operator action. Land and test the code, then say exactly what has to roll where. The gated consumer is noisetable R795-T8 (`board.show R795-T8 --path /Users/leif/ss/noisetable`), which re-runs once this is live.")
+//! @yah:handoff("ROOT CAUSE of the teardown: kamaji-bin server.rs deploy_container_backend called build_container_netns BEFORE the image check. container_net setup_commands opens with teardown_commands, which deletes the incumbent's netns/veth. So a deploy with a missing image cut the running workload off the network, then failed (503 'no ready upstreams'). yubaba and ContainerdBackend::deploy_generation already kept the incumbent; the netns step was the destructive one.")
+//! @yah:handoff("FIX (1) pull: kamaji-containerd-core gains lookup_image_target_digest (NotFound -> None), ImageStore trait, ensure_image_with (pull-if-missing), CtrImageStore (shells `ctr --address <sock> --namespace yah images pull <ref>`, 15-min timeout, kill_on_drop), and ensure_image. tokio gains the `process` feature. resolve_image_target_digest is kept, strict, for restore_incumbent. kamaji-bin ContainerdBackend: new socket field and ensure_image(spec); deploy_generation uses kcc::ensure_image.")
+//! @yah:handoff("FIX (2) ordering: new server.rs ordered_container_deploy(ensure_image, wire_netns, deploy) runs the image step before netns wiring; the containerd arm routes through it.")
+//! @yah:handoff("Wider than the ticket: the inlined kamaji/src/containerd.rs (desktop / yubaba attach_runtime) had the same flaw. deploy_workload called teardown_workload before create_and_start resolved the image. It now runs kcc::ensure_image before the teardown, and create_and_start uses ensure_image. ContainerdRuntime gains a socket field.")
+//! @yah:handoff("Split out: (3) placement-vs-volume -> R931-B10 (app/yah/cli/src/cloud.rs). Inner-door re-announce blackout -> R931-B11 (app/yah/cli/src/mesh.rs). Neither shares this fix.")
+//! @yah:handoff("ROLLOUT (operator): node-side only. Hotship kamaji (kamaji-bin built with containerd-integration) to us-west-001 and us-east-001. yubaba needs no change for this fix. Nodes must have `ctr` on kamaji's PATH, which ships with containerd. Then noisetable R795-T8 re-runs its deploy of sha256:0a35a2cd... without pre-pulling.")
+//! @yah:verify("BASELINE (before edits): cargo test -p kamaji-bin -p kamaji-containerd-core --features containerd-integration = 323 pass (266+52+2+2+1), 0 fail.")
+//! @yah:verify("AFTER: 328 pass (268+55+2+2+1), 0 fail = +2 ordering tests in server.rs ordered_container_deploy_tests and +3 in kcc ensure_image_tests. Also the kamaji crate with containerd-integration: 226 pass, 0 fail (not in the baseline run).")
+//! @yah:verify("RED FIRST: ordered_container_deploy was extracted with the ORIGINAL order (wire_netns then ensure_image). Both tests failed: left [wired, image] vs right [image]; left [wired, image, deploy] vs right [image, wired, deploy]. Swapping the order turned both green.")
+//! @yah:verify("MUTATION: removing the pull call from ensure_image_with turned a_missing_image_is_pulled_then_resolved and a_failed_pull_names_the_ref_and_the_cause red (1 pass, 2 fail). Restored, and all green.")
+//! @yah:verify("NOT VERIFIED: (a) no live containerd pull; build hosts have no containerd. CtrImageStore assumes anonymous read from cr.yah.dev, consistent with earlier manual `ctr pull` with no creds. (b) Root-workspace `cargo check -p yubaba` crashed inside cargo's own feature resolver (resolver/features.rs:325) before compiling anything. The kamaji API that yubaba uses is unchanged.")
+//! @yah:assumes("cr.yah.dev serves pulls anonymously; if it needs auth, CtrImageStore needs a --user/hosts.toml credential source")
+//! @yah:assumes("`ctr` is on kamaji.service's PATH on cloud nodes")
+//! @yah:verify("2026-10-06 hot-ship 0.8.43-h1 kamaji -> us-west-001 only (dry run EXIT=0, real run EXIT=0, no proto-skew override). sha256=f2fa1524cab71bd0e350d1d8fe2571c199dba05bd9b4c596fd0377c0b486373d. /usr/local/bin/kamaji mtime 2026-10-02 03:53:35 UTC -> 2026-10-06 21:15:29 UTC; grep -c -a 'ctr images pull ' 0 -> 2; systemctl is-active kamaji = active; raft leader 1 term 135, all 3 peers live; yubaba /health ok kamaji_version 0.8.43-h1; https://noisetable.com/api/issues HTTP 200 with chloro-edit-failure rows.")
 
 #![cfg(feature = "containerd-integration")]
 
@@ -214,31 +240,135 @@ pub fn chain_id(diff_ids: &[String]) -> String {
 }
 
 /// Look up `image_ref` in containerd's image store and return its target
-/// descriptor digest — callers walk that (manifest → config → diff_ids) to
-/// prepare the rootfs snapshot via [`prepare_rootfs`]. Callers are expected
-/// to have pre-pulled the image via `ctr images pull` or a provider
-/// bootstrap; a missing image surfaces as an error naming the ref.
-pub async fn resolve_image_target_digest(
+/// descriptor digest, or `None` when containerd has no image under that name.
+/// Any other failure (socket, permissions) is an error, never `None` — only a
+/// genuine NotFound may trigger a pull.
+pub async fn lookup_image_target_digest(
     channel: &Channel,
     namespace: &str,
     image_ref: &str,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let mut imgs = images_client(channel);
     let req = GetImageRequest {
         name: image_ref.to_string(),
     };
     let req = with_namespace!(req, namespace);
-    let image = imgs
-        .get(req)
+    let image = match imgs.get(req).await {
+        Ok(resp) => resp
+            .into_inner()
+            .image
+            .ok_or_else(|| anyhow!("containerd returned no image record for {image_ref}"))?,
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => {
+            return Err(anyhow!(status)).with_context(|| format!("looking up image {image_ref}"))
+        }
+    };
+    Ok(Some(
+        image
+            .target
+            .ok_or_else(|| anyhow!("image {image_ref} has no target descriptor"))?
+            .digest,
+    ))
+}
+
+/// Look up `image_ref` and return its target descriptor digest — callers walk
+/// that (manifest → config → diff_ids) to prepare the rootfs snapshot via
+/// [`prepare_rootfs`]. A missing image is an error here; the deploy path uses
+/// [`ensure_image`] instead, which pulls it (R931-B9). This strict form is for
+/// paths where pulling would be wrong, e.g. restoring an incumbent whose image
+/// must already be on the node.
+pub async fn resolve_image_target_digest(
+    channel: &Channel,
+    namespace: &str,
+    image_ref: &str,
+) -> Result<String> {
+    lookup_image_target_digest(channel, namespace, image_ref)
+        .await?
+        .ok_or_else(|| anyhow!("image not found in containerd: {image_ref}"))
+}
+
+/// The two image-store operations [`ensure_image_with`] drives, behind a trait
+/// so the pull-if-missing decision is testable without a containerd socket
+/// (same reason as [`TaskOps`]).
+#[allow(async_fn_in_trait)]
+pub trait ImageStore {
+    /// Target descriptor digest, or `None` when the image is absent.
+    async fn lookup(&mut self, image_ref: &str) -> Result<Option<String>>;
+    async fn pull(&mut self, image_ref: &str) -> Result<()>;
+}
+
+/// R931-B9: return `image_ref`'s target digest, pulling it first when the node
+/// does not have it. Before this, every freshly pushed image needed an
+/// out-of-band `ctr images pull` on each node, and the deploy failed with
+/// "pre-pull required" when nobody had done it.
+pub async fn ensure_image_with<S: ImageStore>(store: &mut S, image_ref: &str) -> Result<String> {
+    if let Some(digest) = store.lookup(image_ref).await? {
+        return Ok(digest);
+    }
+    store
+        .pull(image_ref)
         .await
-        .with_context(|| format!("image not found in containerd: {image_ref} — pre-pull required"))?
-        .into_inner()
-        .image
-        .ok_or_else(|| anyhow!("containerd returned no image record for {image_ref}"))?;
-    Ok(image
-        .target
-        .ok_or_else(|| anyhow!("image {image_ref} has no target descriptor"))?
-        .digest)
+        .with_context(|| format!("pulling {image_ref} (not present in containerd)"))?;
+    store.lookup(image_ref).await?.ok_or_else(|| {
+        anyhow!("pulled {image_ref}, but containerd still has no image under that name")
+    })
+}
+
+/// Upper bound on one image pull. Generous: a cold multi-hundred-MB image over
+/// a slow link is legitimate, a wedged registry is not.
+pub const IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// The production [`ImageStore`]: lookups over gRPC, pulls via `ctr images
+/// pull` against the same socket and namespace. `ctr` ships with containerd, so
+/// any node kamaji can deploy on has it; it resolves the registry, fetches the
+/// content and unpacks into the default (overlayfs) snapshotter, which is the
+/// one [`prepare_rootfs`] reads.
+pub struct CtrImageStore<'a> {
+    pub channel: &'a Channel,
+    pub namespace: &'a str,
+    pub socket: &'a Path,
+}
+
+impl ImageStore for CtrImageStore<'_> {
+    async fn lookup(&mut self, image_ref: &str) -> Result<Option<String>> {
+        lookup_image_target_digest(self.channel, self.namespace, image_ref).await
+    }
+
+    async fn pull(&mut self, image_ref: &str) -> Result<()> {
+        let mut cmd = tokio::process::Command::new("ctr");
+        cmd.arg("--address")
+            .arg(self.socket)
+            .args(["--namespace", self.namespace, "images", "pull", image_ref])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(IMAGE_PULL_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| anyhow!("ctr images pull {image_ref} exceeded {IMAGE_PULL_TIMEOUT:?}"))?
+            .context("spawning ctr")?;
+        if !out.status.success() {
+            bail!(
+                "ctr images pull {image_ref} exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// [`ensure_image_with`] over the real containerd at `socket`.
+pub async fn ensure_image(
+    channel: &Channel,
+    namespace: &str,
+    socket: &Path,
+    image_ref: &str,
+) -> Result<String> {
+    let mut store = CtrImageStore {
+        channel,
+        namespace,
+        socket,
+    };
+    ensure_image_with(&mut store, image_ref).await
 }
 
 /// Read a content-store blob fully into memory by digest.
@@ -1903,6 +2033,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -3021,5 +3153,57 @@ mod tests {
             check_bind_sources(&serde_json::json!({ "mounts": [] })),
             Ok(())
         );
+    }
+}
+
+/// R931-B9: the pull-if-missing decision, driven without a containerd socket.
+#[cfg(test)]
+mod ensure_image_tests {
+    use super::*;
+
+    struct FakeStore {
+        present: Option<String>,
+        /// What a pull installs; `None` means the pull itself fails.
+        pull_installs: Option<String>,
+        pulls: usize,
+    }
+
+    impl ImageStore for FakeStore {
+        async fn lookup(&mut self, _: &str) -> Result<Option<String>> {
+            Ok(self.present.clone())
+        }
+        async fn pull(&mut self, _: &str) -> Result<()> {
+            self.pulls += 1;
+            match &self.pull_installs {
+                Some(d) => {
+                    self.present = Some(d.clone());
+                    Ok(())
+                }
+                None => bail!("registry said 404"),
+            }
+        }
+    }
+
+    const REF: &str = "cr.yah.dev/x:t@sha256:aa";
+
+    #[tokio::test]
+    async fn a_present_image_is_not_pulled_again() {
+        let mut s = FakeStore { present: Some("sha256:m".into()), pull_installs: None, pulls: 0 };
+        assert_eq!(ensure_image_with(&mut s, REF).await.unwrap(), "sha256:m");
+        assert_eq!(s.pulls, 0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_image_is_pulled_then_resolved() {
+        let mut s = FakeStore { present: None, pull_installs: Some("sha256:m".into()), pulls: 0 };
+        assert_eq!(ensure_image_with(&mut s, REF).await.unwrap(), "sha256:m");
+        assert_eq!(s.pulls, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_pull_names_the_ref_and_the_cause() {
+        let mut s = FakeStore { present: None, pull_installs: None, pulls: 0 };
+        let msg = format!("{:#}", ensure_image_with(&mut s, REF).await.unwrap_err());
+        assert!(msg.contains(REF) && msg.contains("registry said 404"), "{msg}");
     }
 }

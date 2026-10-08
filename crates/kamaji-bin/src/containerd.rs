@@ -145,6 +145,9 @@ struct WorkloadTracking {
 #[derive(Clone, Debug)]
 pub struct ContainerdBackend {
     channel: Channel,
+    /// The socket `channel` dials. Kept because image pulls go through `ctr`,
+    /// which must address the same containerd (R931-B9).
+    socket: PathBuf,
     namespace: String,
     log_base: PathBuf,
     /// Sink for forwarded log lines (R406-T10). Defaults to a sink that
@@ -177,9 +180,11 @@ impl ContainerdBackend {
     /// Connect to an explicit socket path. Use for Colima on dev hosts
     /// (`~/.colima/default/containerd.sock`).
     pub async fn connect_at(socket: impl AsRef<std::path::Path>) -> Result<Self> {
-        let channel = kcc::connect(socket).await?;
+        let socket = socket.as_ref().to_path_buf();
+        let channel = kcc::connect(&socket).await?;
         Ok(Self {
             channel,
+            socket,
             namespace: YAH_NAMESPACE.to_string(),
             log_base: PathBuf::from(LOG_BASE),
             log_sink: Arc::new(NoopSink),
@@ -267,6 +272,15 @@ impl ContainerdBackend {
         kcc::image_ref(spec)
     }
 
+    /// R931-B9: make sure `spec`'s image is in containerd, pulling it when it is
+    /// not. Touches nothing that belongs to a running generation, so the
+    /// deploy path runs it before anything destructive (netns wiring, reap).
+    pub async fn ensure_image(&self, spec: &WorkloadSpec) -> Result<()> {
+        let image_ref = Self::image_ref(spec);
+        kcc::ensure_image(&self.channel, &self.namespace, &self.socket, &image_ref).await?;
+        Ok(())
+    }
+
     /// Deploy a workload. The `id` is what Kamaji's registry keys on and
     /// what surfaces in `KamajiToYubaba::WorkloadStarted` / lifecycle
     /// events. Returns the OS pid containerd reports for the new task.
@@ -334,15 +348,14 @@ impl ContainerdBackend {
         let container_id = id.as_str().to_string();
         let image_ref = Self::image_ref(spec);
 
-        // Verify the image is in containerd's image store and grab its target
-        // descriptor digest — we walk that (manifest → config → diff_ids) to
-        // prepare the rootfs snapshot below. Callers (yubaba admission,
-        // R040-F11's bootstrap) are expected to have pre-pulled the image via
-        // `ctr images pull` or the MachineProvider bootstrap path. Delegates
-        // to `kamaji-containerd-core` (R592-T1) — identical logic to the
-        // inlined `kamaji` crate's containerd backend.
+        // Grab the image's target descriptor digest — we walk that (manifest →
+        // config → diff_ids) to prepare the rootfs snapshot below. Pulled here
+        // if missing (R931-B9) so every generation path (graceful upgrade,
+        // custody) gets it; the server's deploy arm has already ensured it
+        // before wiring the netns, so there this is a lookup. Still ahead of
+        // the reap below, so a failed pull never costs the incumbent.
         let image_target_digest =
-            kcc::resolve_image_target_digest(&self.channel, &self.namespace, &image_ref)
+            kcc::ensure_image(&self.channel, &self.namespace, &self.socket, &image_ref)
                 .await
                 .map_err(BackendError::Containerd)?;
 
@@ -1767,6 +1780,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }

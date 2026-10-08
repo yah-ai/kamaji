@@ -83,7 +83,7 @@ fn why_not() -> Option<String> {
     // from a tarball into /usr/local/bin, which a non-login `ssh host cargo test`
     // does not always have on PATH — the same class of miss as the /usr/sbin one
     // `ensure_sbin_on_path` exists for.
-    if let Err(e) = kamaji::microvm::find_vmm() {
+    if let Err(e) = kamaji::microvm::find_vmm(&dir) {
         return Some(e.to_string());
     }
     if which("mkfs.ext4").is_none() || which("debugfs").is_none() {
@@ -179,6 +179,7 @@ fn artifact_spec(forge_id: &str, produced_dir: &Path) -> WorkloadSpec {
         },
         target: PathBuf::from("/yah/produced"),
         read_only: false,
+        from_secret_mount: false,
     }];
     spec
 }
@@ -186,9 +187,11 @@ fn artifact_spec(forge_id: &str, produced_dir: &Path) -> WorkloadSpec {
 fn node_config(state_dir: PathBuf) -> MicroVmConfig {
     let dir = microvm_dir();
     MicroVmConfig {
-        vmm_bin: kamaji::microvm::find_vmm().expect("checked by why_not"),
+        vmm_bin: kamaji::microvm::find_vmm(&dir).expect("checked by why_not"),
         kernel_image: dir.join("vmlinux"),
         rootfs_image: dir.join("rootfs.ext4"),
+        // Job-shaped guests only.
+        service_rootfs_image: None,
         // R605-F23: only if the node staged one. These tests assert the guest
         // contract, not the toolchain, so they must pass on a node that has no
         // toolchain.ext4 — but they must also exercise the three-drive shape
@@ -359,6 +362,7 @@ async fn a_real_cargo_build_runs_in_a_guest_and_its_binary_lands_on_the_host() {
         },
         target: PathBuf::from("/src"),
         read_only: false,
+        from_secret_mount: false,
     });
     spec.workdir = Some(PathBuf::from("/src"));
     spec.command = Some(vec![

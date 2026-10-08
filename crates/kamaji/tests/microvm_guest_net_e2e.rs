@@ -99,10 +99,12 @@ fn why_not() -> Option<String> {
     // resolution `kamaji-bin` uses, so this skips exactly when a node would fail
     // to attach the backend, and not on a node where the VMM is installed
     // somewhere a non-login shell's PATH does not reach.
-    if let Err(e) = kamaji::microvm::find_vmm() {
+    if let Err(e) = kamaji::microvm::find_vmm(&dir) {
         return Some(e.to_string());
     }
-    for bin in ["mkfs.ext4", "debugfs", "ip", "iptables"] {
+    // No `ip`: the TAP is made with ioctls since R605-F36, and a node without
+    // iproute2 (us-west-014) is exactly the one this test should run on.
+    for bin in ["mkfs.ext4", "debugfs", "iptables"] {
         if which(bin).is_none() {
             return Some(format!("{bin} is not on PATH"));
         }
@@ -211,9 +213,11 @@ fn test_network(uplink: String) -> GuestNetwork {
 fn node_config(state_dir: PathBuf, net: GuestNetwork) -> MicroVmConfig {
     let dir = microvm_dir();
     MicroVmConfig {
-        vmm_bin: kamaji::microvm::find_vmm().expect("checked by why_not"),
+        vmm_bin: kamaji::microvm::find_vmm(&dir).expect("checked by why_not"),
         kernel_image: dir.join("vmlinux"),
         rootfs_image: dir.join("rootfs.ext4"),
+        // Job-shaped guests only.
+        service_rootfs_image: None,
         // R605-F23: only if the node staged one. These tests assert the guest
         // contract, not the toolchain, so they must pass on a node that has no
         // toolchain.ext4 — but they must also exercise the three-drive shape
@@ -303,6 +307,7 @@ fn probe_spec(forge_id: &str, produced_dir: &Path, script: String) -> WorkloadSp
         },
         target: PathBuf::from("/yah/produced"),
         read_only: false,
+        from_secret_mount: false,
     }];
     spec
 }
@@ -499,6 +504,7 @@ async fn a_guest_fetches_a_crate_from_crates_io_over_tls() {
         },
         target: PathBuf::from("/src"),
         read_only: false,
+        from_secret_mount: false,
     });
     let ident = spec.expose.mesh.identity.clone();
     let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));

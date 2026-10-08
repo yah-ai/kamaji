@@ -202,6 +202,8 @@ fn full_container_spec() -> WorkloadSpec {
         },
         labels: HashMap::new(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: HashMap::new(),
         files: Vec::new(),
     }

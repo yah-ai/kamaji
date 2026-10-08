@@ -89,7 +89,6 @@
 //!
 //! @yah:relay(R895, "One workload data plane: merge kamaji's two netns vocabularies onto the W343 model")
 //! @yah:at(2026-09-11T22:25:56Z)
-//! @yah:status(handoff)
 //! @yah:assignee(agent:user-custom-char-gul2)
 //! @yah:next("Operator call (2026-09-11, chat session:d6fc1d54, from the yubaba/kamaji architecture review): kamaji carries two netns vocabularies — MeshAssignment.netns_name (yubaba-assigned WireGuard netns, consumed by socket_custody, jit, containerd, sibling) and container_net::netns_name(workload) (the W343 bridge/veth routed model, derived node-locally) — with two address schemes riding along (100.64/10 raft-pool mesh IPs vs 10.128.x/24 per-node routed subnets). A workload's address and namespace have two possible owners depending on path. Converge on W343's routed model as the one data plane; the pre-workload-spec compose generation is the same track's legacy tail.")
 //! @arch:see(.yah/docs/working/W343-per-workload-mesh-addressing.md)
@@ -121,6 +120,11 @@ pub mod docker;
 
 #[cfg(feature = "native-integration")]
 pub mod native;
+
+/// Interactive-session bridge for native-exec on a WSL host (R918-F8): how a
+/// native child reaches the logged-on user's desktop instead of session 0.
+#[cfg(feature = "native-integration")]
+pub mod win_interactive;
 
 /// KVM microVM backend (R605-F8 / W325 §5) — boots a workload in a Firecracker
 /// guest with its own kernel instead of sharing the host's.
@@ -203,6 +207,14 @@ pub mod sandbox;
 /// [`ports`] is — it is a property of every workload kamaji starts, not of a
 /// backend, and the whole point is that the answer cannot differ between them.
 pub mod observe;
+
+/// macOS TCC responsibility disclaim for spawned children (R940-B1). A child
+/// whose privacy access (Bluetooth, camera, …) is attributed to its own
+/// embedded Info.plist rather than to whichever app bundle sits at the top of
+/// its process tree. Unconditional because both supervisors (kamaji's native
+/// backend and yah desktop's agent spawns) need it, and a no-op off macOS.
+#[cfg(unix)]
+pub mod disclaim;
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -771,6 +783,11 @@ pub struct LogOpts {
     pub tail: Option<u64>,
     pub follow: bool,
     pub stream: Option<LogStreamKind>,
+    /// Resume point (R729-F2): an opaque cursor a previous [`LogEvent::cursor`]
+    /// carried; the stream starts with the record AFTER it. `None` starts from
+    /// the first retained record. A backend that cannot resume ignores it and
+    /// leaves every `LogEvent::cursor` `None`.
+    pub cursor: Option<String>,
 }
 
 /// Which stdio stream a log line came from.
@@ -789,6 +806,9 @@ pub struct LogEvent {
     pub stream: LogStreamKind,
     pub message: String,
     pub correlation_id: Option<String>,
+    /// Position just after this event (R729-F2), when the backend can resume;
+    /// see [`LogOpts::cursor`].
+    pub cursor: Option<String>,
 }
 
 impl LogEvent {
@@ -803,6 +823,7 @@ impl LogEvent {
             stream,
             message: message.into(),
             correlation_id: None,
+            cursor: None,
         }
     }
 }
@@ -829,13 +850,50 @@ pub struct RuntimeHealth {
 ///
 /// Build from a compile-time [`BuiltinService`] descriptor via
 /// `BuiltinService::contract()`, or construct directly for dynamic services.
+///
+/// @yah:ticket(R960-F10, "Vend listener: embeddable Hrana-over-turso_core crate a Shape-1 service links, bound to YAH_MESH_IP, verifying camp-tokens; refuses rw until R960 P4")
+/// @yah:status(review)
+/// @yah:at(2026-10-07T23:41:34Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:phase(P3)
+/// @yah:parent(R960)
+/// @yah:next("No Hrana server exists in the tree (W358 baseline grep). Build the minimum Hrana surface the workbench client speaks, over the service's OWN turso_core handle (W195 one-writer rule: no second process opens the file). Bind YAH_MESH_IP (kamaji native.rs:705), never 0.0.0.0.")
+/// @yah:next("Verify every request with cheers-verify: signature, kid, aud = <workload>/<db>, expiry. No token, expired, and wrong-aud fail IDENTICALLY. Refuse rw-scoped tokens outright until R960 P4 lifts it. Testable now with `yah cloud cheers token --aud ...` against a test workload.")
+/// @yah:next("Fill StatefulServiceContract.vend_endpoint (kamaji lib.rs:854), unproduced since W195.")
+/// @yah:gotcha("\"Crate home must be publishable: noisetable consumes cheers-* as registry deps (0.8.43-pre.1, web/services/account/Cargo.toml). Recommend oss/cheers beside cheers-turso (shares the turso pin + cheers-verify, no new mirror); a new oss/ subtree needs a mirror and an export-oss.sh entry. Record the choice and add the crate's path to this ticket's files.\"")
+/// @arch:see(.yah/docs/working/W358-data-connections-remote-dbs-through-the-vault.md)
+/// @yah:handoff("New publishable crate oss/cheers/crates/cheers-vend (workspace member, version 0.8.43-pre.1, deps cheers-core/cheers-verify/turso pin/axum 0.8). VendService::new(&turso::Database, VendConfig{verifier,kid,audience,reject_floor}) connects to the service's OWN Database (never opens the file) and sets PRAGMA query_only on that connection. VendListener::bind(ip,port,svc) refuses unspecified addrs; bind_mesh_from_env reads YAH_MESH_IP + PORT_SQL; endpoint() -> http://ip:port.")
+/// @yah:handoff("Hrana subset: GET /v2,/v3; POST /v2/pipeline,/v3/pipeline with execute/batch(with conditions)/get_autocommit/close; stateless (baton always null); sql_id/sequence/describe/store_sql unsupported (per-request error).")
+/// @yah:handoff("Gate: verify_mcp_at(token, now, kid) + aud == <workload>/<db> + scope sql:read. All refusals: 401, body 'unauthorized', WWW-Authenticate: Bearer, padded to reject_floor (default 50ms). Any sql:* scope other than sql:read -> 403 after verification (rw refused until R960 P4).")
+/// @yah:handoff("kamaji: removed BuiltinService.vend_endpoint (a &'static str for a runtime mesh URL, always None); added StatefulServiceContract::with_vend_endpoint(url) - the service passes VendListener::endpoint() into it. No other users of the field in app/crates/oss.")
+/// @yah:verify("cd oss/cheers && cargo test -p cheers-vend -> 5 passed, 0 failed, 0 warnings (2026-10-07; valid SELECT, no-token/expired/wrong-aud identical 401 above floor, rw 403, vended INSERT errors while owner conn writes, 0.0.0.0 bind refused). Daemon flagged unrelated peer edits (yubaba cloud, app cli) mid-run.")
+/// @yah:verify("cd oss/kamaji && cargo check -p kamaji --tests -> EXIT=0")
+/// @yah:gotcha("Not done here (W358 step 6 remainder): sql.hrana capability on GET /services, `sql` mesh port + verify-key mount in workload TOML and spec-loader refusal, noisetable-account link-in. Not wired into any service yet.")
+/// @yah:assumes("Scope vocabulary sql:read / sql:write is defined here as constants (cheers_vend::SQL_READ/SQL_WRITE); cheers_core::yah_scopes has no sql namespace yet. R960-F9's minter must use these strings, or move them into yah_scopes and repoint.")
+/// @yah:assumes("Used the `turso` wrapper (turso::Database, which wraps turso_core) rather than raw turso_core, matching cheers-turso and the services that will link this.")
+/// @yah:assumes("Identical timing shape implemented as a minimum-latency floor on 401s, not constant-time crypto.")
+/// @yah:files(oss/kamaji/crates/kamaji/src/lib.rs)
+/// @yah:files(oss/cheers/crates/cheers-vend/src/lib.rs)
+/// @yah:files(oss/cheers/crates/cheers-vend/src/hrana.rs)
+/// @yah:files(oss/cheers/crates/cheers-vend/tests/vend.rs)
+/// @yah:files(oss/cheers/crates/cheers-vend/Cargo.toml)
+/// @yah:handoff("Leader (Fable session:62240105) re-verified 2026-10-07: cargo test -p cheers-vend 5 passed / 0 failed; cargo check -p kamaji --tests exit 0. Courier Ashguard session:1aeebae6. The W358 step-6 remainder listed in the gotcha (services capability, workload TOML wiring, noisetable link-in) is R960-F8 / F11 / noisetable R804-F2 scope, not this ticket's.")
+/// @yah:verify("Leader re-run: cd oss/cheers && cargo test -p cheers-vend -> 5 passed, 0 failed; cd oss/kamaji && cargo check -p kamaji --tests -> EXIT=0.")
+/// @yah:handoff("cheers-vend SQL_READ/SQL_WRITE now alias cheers_core::yah_scopes (R960-F9 residual; pub use re-export, Scope type not &str, so the two comparisons in lib.rs use .as_wire()); cargo test -p cheers-vend 5 passed / 0 failed")
+/// @yah:gotcha("FOUND BY noisetable R804-F2 (Glimmerstone session:7596d334, 2026-10-08), dogfooding `yah sql` (libsql 0.9.30, the same client data-source/src/libsql_adapter.rs:71 runs) at the real noisetable-account binary: as shipped, this listener could NOT SERVE A SINGLE libsql READ, though the 'minimum surface the workbench's libsql client speaks' claim said otherwise. Three gaps: (1) libsql posts with no Content-Type, and axum's Json extractor answered 415; (2) libsql's prepare sends `describe` (libsql hrana/mod.rs:134), which was unsupported; (3) libsql's `query` reads rows only through POST /v3/cursor, which did not exist. All three were FIXED in oss/cheers/crates/cheers-vend (lib.rs pipeline + cursor handlers, hrana.rs describe/run_cursor/run_steps), and tests/libsql_client.rs now drives the real libsql client. R960-T12's live proof needs these bytes, and so does the cheers 0.8.43 publish.")
+/// @yah:handoff("Seams for noisetable R804-F2, landed by courier @Miravel:eclipse under an annotation `R960-T1` in oss/cheers/crates/cheers-vend/src/lib.rs that the yah board does NOT scan (`yah board show R960-T1` = not found), so they are recorded here: cheers-turso TursoConn::database(); cheers-verify kid_for (the CLI's copy deleted, now a re-export); cheers-vend VendConfig::from_public_key(&[u8;32], aud), which derives the kid. Plus the three libsql fixes in the gotcha above. Consumer: noisetable web/services/account/src/vend.rs.")
+/// @yah:verify("cd ~/ss/yah/oss/cheers && cargo test -p cheers-vend -> 10 passed / 0 failed (7 tests/vend.rs incl. new a_pipeline_without_a_content_type_is_served + 3 new tests/libsql_client.rs); cargo clippy -p cheers-vend --all-targets clean. Negative control: the same libsql client against the pre-fix listener failed first with 415, then with 'request type not supported'.")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatefulServiceContract {
     /// Human-readable service name, unique within a camp / pond.
     pub name: String,
     /// Relative paths of `.turso` files owned by this service.
     pub files: Vec<String>,
-    /// Optional SQL vending endpoint (Mode B per W195 §1).
+    /// Optional SQL vending endpoint (Mode B per W195 §1): the Hrana base URL
+    /// a `cheers-vend` listener reports once it has bound the mesh address
+    /// (`VendListener::endpoint`). A runtime value — set it with
+    /// [`with_vend_endpoint`](Self::with_vend_endpoint) after binding, never
+    /// from a compile-time descriptor.
     pub vend_endpoint: Option<String>,
     /// Opaque schema version used by kamaji for drift detection. Typically
     /// an ISO-8601 date string matching when the schema was last changed.
@@ -844,6 +902,15 @@ pub struct StatefulServiceContract {
     /// `"r2://yah-backups/{name}/{file}"`. `{file}` is replaced with the
     /// basename of each entry in `files`.
     pub backup_target: Option<String>,
+}
+
+impl StatefulServiceContract {
+    /// Record where this service vends its database (W358 `vend` source).
+    /// Called with the URL a bound vend listener reports.
+    pub fn with_vend_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.vend_endpoint = Some(endpoint.into());
+        self
+    }
 }
 
 /// Compile-time descriptor for a built-in (always-present) yah service.
@@ -857,7 +924,6 @@ pub struct BuiltinService {
     pub name: &'static str,
     /// Relative file paths (from camp_root / service root).
     pub files: &'static [&'static str],
-    pub vend_endpoint: Option<&'static str>,
     /// ISO-8601 date of last schema change.
     pub schema_version: &'static str,
     pub backup_target: Option<&'static str>,
@@ -872,7 +938,6 @@ impl BuiltinService {
         Self {
             name,
             files,
-            vend_endpoint: None,
             schema_version,
             backup_target: None,
         }
@@ -883,7 +948,7 @@ impl BuiltinService {
         StatefulServiceContract {
             name: self.name.to_string(),
             files: self.files.iter().map(|s| s.to_string()).collect(),
-            vend_endpoint: self.vend_endpoint.map(|s| s.to_string()),
+            vend_endpoint: None,
             schema_version: self.schema_version.to_string(),
             backup_target: self.backup_target.map(|s| s.to_string()),
         }

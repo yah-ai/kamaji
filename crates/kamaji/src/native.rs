@@ -108,7 +108,6 @@
 //!
 //! @yah:relay(R885, "Native workloads run unbounded: wire kamaji cgroup + sandbox boundary onto the live deploy path")
 //! @yah:at(2026-09-10T07:28:48Z)
-//! @yah:status(open)
 //! @arch:see(.yah/docs/working/W344-native-workloads-run-unbounded.md)
 //!
 //! @yah:ticket(R885-B1, "Wire CgroupV2 + spawn_native onto NativeRuntime, resolving the delegated cgroup root at runtime")
@@ -618,9 +617,9 @@ async fn materialize_files(spec: &WorkloadSpec) -> Result<()> {
 /// unbounded, exactly as every native workload did before R885-B1.
 ///
 /// @yah:ticket(R918-F8, "Interactive-session bridge for native-exec — run a Windows job inside session 1, not session 0")
-/// @yah:at(2026-09-18T01:34:45Z)
-/// @yah:status(open)
-/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:status(review)
+/// @yah:at(2026-10-04T20:12:45Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:parent(R918)
 /// @yah:next("Tier: Warrior — tricky implementation with a clear spec, crossing the systemd/Win32 session boundary.")
 /// @yah:next("The gap: kamaji's native-exec is systemd-parented, so every job it runs on a Windows host inherits session 0 and the non-interactive window station. A session-0 process cannot enumerate session-1 windows at all (EnumWindows is window-station scoped), so anything needing a real window (a GUI test, a DAW, a plugin editor) is structurally impossible today, and fails in a way that looks like the target is broken rather than the observer being blind.")
@@ -633,6 +632,12 @@ async fn materialize_files(spec: &WorkloadSpec) -> Result<()> {
 /// @yah:gotcha("There is currently no yah on the box's PATH, no ~/.yah, and nothing yah-side on the Windows half at all. The only thing that speaks to Windows today is full-path cmd.exe / powershell.exe interop calls from the Linux side. Always pipe </dev/null into cmd.exe -- it drains the parent's stdin and silently truncates otherwise.")
 /// @yah:gotcha("Two Win11 traps that produce convincing false negatives in any window/keystroke probe, both hit during the research: Start-Process notepad returns a stub process with no MainWindowHandle, and cmd.exe via Start-Process gets hwnd=0 because of the conhost / Windows Terminal handoff. Neither is a session-station problem -- pick a probe target that owns its own top-level window.")
 /// @yah:gotcha("Left on us-west-002 and reusable: C:\\Tools\\yah_t10_launch.bat and a scheduled task yah_t10_reaper.")
+/// @yah:handoff("LANDED (session:b199c49c, 2026-10-04), the task-scoped shape the ticket recommended, no resident agent. New oss/kamaji/crates/kamaji/src/win_interactive.sh is the POSIX-sh bridge. It hands ONE Windows command line to the Active user session as a one-shot schtasks /create /IT /ru <user> task, waits on a result file, relays stdout/stderr afterwards (not live), deletes task + staging, and exits with the job's own code. Typed exits: 64 usage, 69 no Active user session (EX_UNAVAILABLE), 70 bridge failure, 143 terminated (task ended + deleted first). New win_interactive.rs (feature native-integration): materialize() writes the bridge to <state_dir>/.win-interactive/win-interactive, idempotently and atomically, only when /proc/sys/fs/binfmt_misc/WSLInterop exists. native.rs spawn_child exports it as $YAH_WIN_INTERACTIVE; a failed write warns and skips. Opt-in only: a step calls \"$YAH_WIN_INTERACTIVE\" <cmdline>, nothing is wrapped implicitly.")
+/// @yah:handoff("DISCOVERED + DESIGNED AROUND: kamaji's ProtectSystem=strict makes /mnt/c READ-ONLY in its mount namespace (measured on us-west-002 via nsenter: mkdir /mnt/c/ProgramData/yah -> EROFS). So every C: write is made by a Windows process: the .bat is staged in kamaji's writable state dir, and cmd.exe copies it onto C:\\ProgramData\\yah\\interactive\\<tag> via the wslpath -w UNC path. Results are only READ back through /mnt/c. No unit change needed.")
+/// @yah:handoff("PROVEN LIVE on us-west-002, as root inside kamaji's own mount namespace (nsenter -t <kamaji MainPID> -m): via the bridge, powershell reports UserInteractive=True, SessionId=2 (the rdp-tcp#0 session). Direct interop from the same namespace reports False, 0. A job exiting 3 relayed its stderr and EXIT=3. After each run there were zero yah-interactive scheduled tasks, an empty jobs/ staging dir and an empty C:\\ProgramData\\yah\\interactive.")
+/// @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji --features native-integration --lib -- win_interactive native:: -> 40 passed / 0 failed. 6 are new: no-interop gets no bridge; executable + stale-copy replaced; parses as sh; usage 64; missing cmd.exe 70; no Active session 69 using us-west-002's real query-session rows. cargo clippy ... -p kamaji --features native-integration --tests EXIT=0, no new warnings. cargo check -p kamaji-bin EXIT=0.")
+/// @yah:verify("Live: on 002, `sudo nsenter -t $(systemctl show kamaji -p MainPID --value) -m -- /var/lib/yah/kamaji/native/.win-interactive/win-interactive powershell.exe -NoProfile -Command [Environment]::UserInteractive\\;(Get-Process -Id \\$PID).SessionId` prints True / 2.")
+/// @yah:cleanup("Fleet follow-through, gated on rolling a kamaji with this change onto us-west-002 (operator-run roll, not done here): then add `cap:win-interactive` to .yah/infra/machines/us-west-002.toml mesh_tags. Per that file's own rule the tag FOLLOWS the capability, so it is deliberately not added yet. A hand-placed copy of the bridge already sits at the path kamaji will materialize to; it is identical, and materialize() replaces any stale copy.")
 async fn spawn_child(
     state_dir: &Path,
     spec: &WorkloadSpec,
@@ -714,6 +719,25 @@ async fn spawn_child(
     for (k, v) in collector.env_for(spec, crate::observe::MountNs::Host) {
         cmd.env(k, v);
     }
+    // "How do I reach the Windows desktop?" — R918-F8. Only on a WSL host, and
+    // only as an offer: a step that never calls the bridge runs exactly as it
+    // did. A failed write costs the offer, not the workload.
+    match crate::win_interactive::materialize(
+        state_dir,
+        crate::win_interactive::interop_available(),
+    )
+    .await
+    {
+        Ok(Some(bridge)) => {
+            cmd.env(crate::win_interactive::ENV, bridge);
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            workload = %ident.0,
+            "could not materialize the interactive-session bridge; {} stays unset: {e:#}",
+            crate::win_interactive::ENV
+        ),
+    }
     // Spec env layers OVER the inherited environment, so a workload can override
     // a node default without the node having to know about the workload.
     for e in &spec.env {
@@ -790,6 +814,14 @@ async fn spawn_child(
             spec.name
         )
     })?;
+
+    // R940-B1 — on macOS the workload is its own TCC responsible process, so a
+    // BLE/camera binary is judged by its own embedded Info.plist instead of
+    // being SIGABRTed for whatever app launched the daemon. MUST stay the last
+    // pre_exec hook: it replaces the exec and never returns.
+    #[cfg(unix)]
+    crate::disclaim::disclaim_at_exec(cmd.as_std_mut())
+        .with_context(|| format!("preparing the disclaimed exec for workload {}", spec.name))?;
 
     let child = cmd
         .spawn()
@@ -1529,6 +1561,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: vec![],
         }
@@ -2153,6 +2187,7 @@ mod tests {
                     tail: None,
                     follow: false,
                     stream: None,
+                    cursor: None,
                 },
             )
             .await
@@ -2203,6 +2238,7 @@ mod tests {
                     tail: None,
                     follow: false,
                     stream: None,
+                    cursor: None,
                 },
             )
             .await
@@ -2283,6 +2319,7 @@ mod tests {
                     tail: None,
                     follow: false,
                     stream: None,
+                    cursor: None,
                 },
             )
             .await
@@ -2447,6 +2484,7 @@ mod tests {
                     tail: None,
                     follow: false,
                     stream: None,
+                    cursor: None,
                 },
             )
             .await
@@ -2546,6 +2584,7 @@ mod tests {
                     tail: None,
                     follow: false,
                     stream: None,
+                    cursor: None,
                 },
             )
             .await

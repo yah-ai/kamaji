@@ -4,25 +4,34 @@ The two artifacts a node needs before kamaji can run a workload in its own KVM
 guest, and the script that builds them reproducibly.
 
 ```
-build-guest-image.sh                 builds both, from the pins in its header
+build-guest-image.sh                 builds them, from the pins in its header
 kernel/base-x86_64-6.1.config        firecracker v1.16.1's own CI guest config, verbatim
-kernel/microvm.config                our delta over it (one symbol, and why)
+kernel/base-aarch64-6.1.config       the same, for aarch64 (R605-F32)
+kernel/microvm.config                our delta over either (one symbol, and why)
 rootfs/busybox.config                busybox deltas (static, minus the applets we must own)
-rootfs/etc/                          the image's /etc, checked in
-../crates/kamaji-guest-init/         /sbin/init: reads job.json, mounts, runs argv, halts
+rootfs/etc/                          the job image's /etc, checked in
+service-rootfs/                      files the service image adds (kamaji-job.service, ...)
+../crates/kamaji-guest-init/         /sbin/init of the job image: reads job.json, mounts,
+                                     runs argv, halts; `--unit` in the service image
 ```
 
-Output (git-ignored, ~75 MB):
+Output (git-ignored):
 
 ```
-out/vmlinux         uncompressed ELF kernel   ← Firecracker boots this, never a bzImage
-out/rootfs.ext4     read-only root filesystem
+out/vmlinux               the kernel Firecracker boots: the ELF vmlinux on x86_64
+                          (never a bzImage), the arm64 boot Image on aarch64
+                          (never Image.gz) — named vmlinux on both
+out/rootfs.ext4           the JOB image: busybox + kamaji-guest-init as PID 1, ~30 MB
+out/service-rootfs.ext4   the SERVICE image: Debian + systemd, ~2.5 GB sparse
+                          (only with --only service-rootfs)
 ```
 
 ## Build
 
-x86_64 Linux only — it compiles an x86_64 kernel. The camp Mac cannot run it;
-`.yah/infra/machines/us-west-003.toml` is a node that can (KVM, non-voter, LAN).
+On Linux, for the **host's** arch (x86_64 or aarch64). There is no cross-build
+flag: the kernel, busybox and the musl init would each need a cross toolchain.
+`.yah/infra/machines/us-west-003.toml` is an x86_64 node that can build and boot
+the x86 guest (KVM, non-voter, LAN):
 
 ```
 sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev \
@@ -30,6 +39,30 @@ sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev \
 rustup target add x86_64-unknown-linux-musl
 ./build-guest-image.sh --jobs "$(nproc)"        # ~4 min on 16 threads
 ```
+
+The **aarch64** guest (the Raspberry Pis, R605-F32) is built natively on the
+camp Mac in an arm64 Linux container — ~3 min for the kernel, and nothing gets
+installed on the Pis, which are the live dev raft. `--privileged` is only for
+the service image (mmdebstrap mounts /proc in its chroot). The two cargo
+overrides undo the repo's `.cargo/config.toml`, which forces sccache and names
+the Mac's *cross* musl linker:
+
+```
+docker run -d --privileged --name guest-builder --platform linux/arm64 \
+    -v "$PWD/../../..":/yah -v guest-build:/build debian:trixie sleep infinity
+docker exec guest-builder bash -c 'apt-get update && apt-get install -y \
+    build-essential bc bison flex libelf-dev libssl-dev xz-utils bzip2 \
+    e2fsprogs curl ca-certificates git mmdebstrap &&
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
+        -t aarch64-unknown-linux-musl'
+docker exec guest-builder bash -c '. ~/.cargo/env && cd /yah/oss/kamaji/guest &&
+    RUSTC_WRAPPER= CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=gcc \
+    CARGO_TARGET_DIR=/build/target ./build-guest-image.sh --out /build/out'
+```
+
+The service image is opt-in (`--only init,service-rootfs --authorized-keys
+<yah.pub>`): its `yah` user is how a member guest is provisioned, and the key is
+a deployment input rather than something to commit.
 
 Every download is sha256-pinned, so an upstream that changes bytes under a
 version fails the build rather than silently changing the guest.
@@ -39,12 +72,16 @@ version fails the build rather than silently changing the guest.
 ```
 install -D -m 0644 out/vmlinux     /var/lib/yah/kamaji/microvm/vmlinux
 install -D -m 0644 out/rootfs.ext4 /var/lib/yah/kamaji/microvm/rootfs.ext4
+# only on a node that runs service-shaped (server/appliance) guests:
+install -D -m 0644 out/service-rootfs.ext4 /var/lib/yah/kamaji/microvm/service-rootfs.ext4
 ```
 
 then give `kamaji` `--microvm-dir /var/lib/yah/kamaji/microvm`. **The filenames
-are not negotiable**: `MicroVmRuntime::new` looks for exactly those two, and a
+are not negotiable**: `MicroVmRuntime::new` looks for exactly those, and a
 node with a typo advertises *no* microVM backend rather than failing a build —
 so the symptom is "my microvm workload was refused", nowhere near the cause.
+A node without `service-rootfs.ext4` runs job-shaped guests only and refuses a
+service-shaped deploy by name; it never seeds a service from the job image.
 
 The node also needs `firecracker` on `PATH`, `e2fsprogs` (`mkfs.ext4` +
 `debugfs`, in `/usr/sbin`), and a `/dev/kvm` the kamaji user can open read-write.

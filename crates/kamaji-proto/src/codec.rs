@@ -676,6 +676,8 @@ mod tests {
                 m
             },
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: {
                 let mut m = HashMap::new();
                 m.insert("yah.created-by".into(), "agent:claude".into());

@@ -1,6 +1,5 @@
 //! @yah:relay(R597, "Finish constable->kamaji / warden->yubaba rename tail (env-var + raft symbols)")
 //! @yah:at(2026-07-06T07:45:13Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:next("Spawned from R592-T4 (the wire-surface rename, now in review). T4 renamed the pub types/client/field (WardenToConstable->YubabaToKamaji, ConstableToWarden->KamajiToYubaba, ConstableClient->KamajiClient, constable_version->kamaji_version) across oss/kamaji + root/hub + oss/yubaba and verified all 3 green. This relay finishes the two residual slices T4 deliberately deferred: R597-T1 (KAMAJI_SOCK env var rename, drags in oss/qed) and R597-T2 (yubaba-internal raft Warden* symbols). Both are independent, mechanical, and can run in either order once their lanes are quiet.")
 //!
@@ -584,6 +583,14 @@ fn run() -> Result<()> {
             let n = ctx.resume_native_workloads().await;
             tracing::info!(resumed = n, "recorded native deploys replayed (R936-B11)");
         }
+        // R605-F16: and every service-shaped microVM that asked to outlive
+        // kamaji (a dev-cluster member VM). Its Firecracker process lives in
+        // this unit's cgroup, so the restart that got us here killed it.
+        #[cfg(feature = "microvm")]
+        {
+            let n = ctx.resume_microvm_workloads().await;
+            tracing::info!(resumed = n, "recorded microVM deploys replayed (R605-F16)");
+        }
         // R932: and re-arm the durability tail of every container workload that
         // is still running here. The bundle resume above brings workloads BACK;
         // this one reattaches to workloads that never left — a container
@@ -765,7 +772,8 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
             ctx.with_native_exec(Arc::new(
                 kamaji::native::NativeRuntime::new(dir).with_collector(collector.clone()),
             ))
-            .with_native_deploy_records(kamaji_bin::deploy_records::NativeDeployRecords::under(
+            .with_native_deploy_records(kamaji_bin::deploy_records::ResumeRecords::under(
+                kamaji_bin::deploy_records::ResumeBackend::Native,
                 dir,
             ))
         } else {
@@ -905,9 +913,15 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 // /usr/local/bin, so the constant was wrong on the only node
                 // that has guest artifacts staged. `MicroVmRuntime::new`
                 // refuses an absent vmm_bin, so kamaji would not have started.
-                vmm_bin: kamaji::microvm::find_vmm()?,
+                vmm_bin: kamaji::microvm::find_vmm(dir)?,
                 kernel_image: dir.join("vmlinux"),
                 rootfs_image: dir.join("rootfs.ext4"),
+                // R605-F32: same rule as the toolchain — present iff staged. A
+                // node without one runs job-shaped guests only and refuses a
+                // service-shaped deploy by name, rather than booting a member
+                // in the minimal job image.
+                service_rootfs_image: Some(dir.join(kamaji::microvm::SERVICE_ROOTFS_IMAGE_FILE))
+                    .filter(|p| p.exists()),
                 // R605-F23: present iff the operator staged one, with no second
                 // flag to forget. A node without it boots guests that can run
                 // programs but not compile them, which is exactly what the
@@ -944,7 +958,14 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 "microVM backend attached; Container workloads marked yah.exec=microvm \
                  will be booted in their own KVM guest"
             );
-            ctx.with_microvm(Arc::new(runtime))
+            // R605-F16: `<microvm-dir>/.deploys`, beside `vms/` — dot-prefixed,
+            // so it can never be a guest's ident.
+            ctx.with_microvm(Arc::new(runtime)).with_microvm_deploy_records(
+                kamaji_bin::deploy_records::ResumeRecords::under(
+                    kamaji_bin::deploy_records::ResumeBackend::MicroVm,
+                    dir,
+                ),
+            )
         } else {
             tracing::debug!("no --microvm-dir; microVM-marked Container deploys will be refused");
             ctx

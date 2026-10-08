@@ -60,7 +60,6 @@
 //!
 //! @yah:relay(R612, "kamaji-bin test hygiene: deflake drain SIGTERM-escalation timing tests")
 //! @yah:at(2026-07-20T03:52:37Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //!
 //! @yah:ticket(R612-B1, "Deflake sigterm_ignoring_workload_is_force_killed — SIGTERM-vs-budget race under host load")

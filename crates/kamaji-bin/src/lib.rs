@@ -11,10 +11,16 @@
 //!
 //! @yah:relay(R426, "JWT contract + verifier core (kamaji)")
 //! @yah:at(2026-06-03T22:42:02Z)
-//! @yah:status(open)
 //! @yah:phase(P1)
 //! @yah:parent(Q425)
 //! @arch:see(.yah/docs/working/W159-camp-trust-boundaries-and-mcp-auth.md)
+//! @yah:gotcha("R731-F7: ownership granted_by is any kind (svc CHECK dropped, migration 0008_ownership_any_granter), on_behalf_of is attribution only, revoke follows holder (OwnershipStore::revoke_by_principal replaces revoke_by_on_behalf_of); bound_to not needed (no caller wrote a row that must die with a non-holder). app/yah/cli/src/cloud_cheers.rs:471 still asserts the old service-only rule and needs updating yah-side.")
+//! @yah:gotcha("R731-B1: JWK gains principal + role (issuer|assertion|self-signer); kamaji accepts only role=issuer for access tokens; kamaji JWKS cache format changed")
+//! @yah:gotcha("R731-F2: cheers Scope is now a validated namespace:verb newtype checked against a ScopeRegistry; yah's 17 live in cheers_core::yah_scopes (Audiences::Any); Scope::ALL / is_service_only removed; wire strings unchanged")
+//! @yah:gotcha("R731-F6: kamaji's W159 JWKS cache moved into cheers-verify (feature jwks-http); kamaji verifies through cheers-verify KeySetVerifier with role enforcement; McpClaims gains optional ceiling (self-signer)")
+//! @yah:gotcha("R731-F3: yah scope audiences are bound per deployment at ScopeRegistry build (bind_audiences(namespace, auds)); an unbound namespace is a startup error; Audiences::Any removed")
+//! @yah:gotcha("R731-F5: POST /token is live in cheers. For services: grant_type=client_credentials + client_assertion_type=urn:cheers:client-assertion-type:paseto-v4-public (iss=sub=svc:<id>, aud=<issuer>/token, jti, exp<=5min) + audience. For user+camp, RFC 8693 token-exchange: subject_token = the user session (urn:ietf:params:oauth:token-type:access_token), actor_token = the camp bootstrap credential (urn:cheers:token-type:camp-bootstrap), plus audience and scope. The issued token has sub = user, act = camp, camp_id = camp. yubaba cheers_client.rs should move off self-signing onto this")
+//! @yah:gotcha("R731-F8: ownership:write scope deleted; the ownership router authorizes by relationship (may_grant) and accepts a session or MCP bearer; on_behalf_of only from a verified act claim; yubaba cheers_client.rs and cloud_cheers.rs were compile-fixed only, and their real move to /token + a relationship is yah-side work")
 //!
 //! @yah:ticket(R426-F2, "Kamaji JWKS cache + signature verification (first-start, rotation, kid-miss refresh)")
 //! @yah:assignee(agent:claude)
@@ -48,12 +54,13 @@ pub mod auth;
 pub use kamaji::cgroup;
 #[cfg(feature = "containerd-integration")]
 pub mod containerd;
-/// R755-B5 / R936-B11: deploy records that let a workload outlive kamaji.
+/// R755-B5 / R936-B11 / R605-F16: deploy records that let a workload outlive kamaji.
 pub mod deploy_records;
 pub mod drain;
 /// R850-F1: run the declared restore before a stateful workload starts.
 pub mod hydrate;
 pub mod journal;
+pub mod logs;
 pub mod pidfd;
 pub mod probe;
 pub mod server;
@@ -66,8 +73,8 @@ pub use audit::{
     Outcome as AuditOutcome, SamplerConfig, WriterConfig,
 };
 pub use auth::{
-    ActorClaim, AuthConfig, AuthError, AuthStrength, AuthVerifier, JwksCache, JwksDoc, McpClaims,
-    OwnsClaim, VerifyError,
+    ActorClaim, AuthConfig, AuthStrength, AuthVerifier, JwksError, McpClaims, OwnsClaim,
+    VerifyError,
 };
 
 pub use kamaji::cgroup::{CgroupError, CgroupHandle, CgroupV2, DEFAULT_SLICE_ROOT};

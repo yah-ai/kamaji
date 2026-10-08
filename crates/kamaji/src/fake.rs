@@ -33,10 +33,7 @@
 //! `restart_workload`, `graceful_upgrade_workload`, `list_workloads`,
 //! `get_workload`, `stream_logs`, `health`.
 //!
-//! @yah:ticket(R091-F2, "runtime::fake: in-memory ContainerRuntime for yubaba orchestration unit tests")
-//! @yah:status(review)
-//! @yah:at(2026-05-12T18:24:04Z)
-//! @yah:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
+//! archived: R091 — history: `yah board history oss/kamaji/crates/kamaji/src/fake.rs`
 
 #![cfg(feature = "testing")]
 
@@ -558,6 +555,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -649,6 +648,7 @@ mod tests {
             tail: None,
             follow: false,
             stream: None,
+            cursor: None,
         };
         let mut stream = rt
             .stream_logs(&spec.expose.mesh.identity, opts)
@@ -666,6 +666,7 @@ mod tests {
             tail: None,
             follow: false,
             stream: None,
+            cursor: None,
         };
         let mut stream2 = rt
             .stream_logs(&spec.expose.mesh.identity, opts2)
@@ -688,6 +689,7 @@ mod tests {
             tail: Some(3),
             follow: false,
             stream: None,
+            cursor: None,
         };
         let stream = rt
             .stream_logs(&spec.expose.mesh.identity, opts)
@@ -712,6 +714,7 @@ mod tests {
             tail: None,
             follow: false,
             stream: Some(LogStreamKind::Stderr),
+            cursor: None,
         };
         let stream = rt
             .stream_logs(&spec.expose.mesh.identity, opts)

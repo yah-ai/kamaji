@@ -628,6 +628,109 @@ async fn read_frame(
     }
 }
 
+/// One item off a [`LogFollow`] (R729-F2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogFollowItem {
+    /// Zero or more lines; empty is Kamaji's keepalive. `cursor` is the last
+    /// position so far.
+    Batch {
+        records: Vec<kamaji_proto::LogRecord>,
+        cursor: Option<String>,
+    },
+    /// The workload is terminal and its output drained — the only clean close.
+    End { cursor: Option<String> },
+}
+
+/// A `Logs` follow on its own **dedicated** UDS connection (R729-F2, W257).
+///
+/// Never multiplexed onto [`KamajiClient`]'s control connection: that one
+/// correlates each request to exactly one reply, and a follow stream there
+/// would starve the `List` every `GET /state` poll sends. The caller should
+/// gate on [`NodeCapabilities::log_stream`] first — an older Kamaji does not
+/// know the request and drops the connection.
+pub struct LogFollow {
+    rd: OwnedReadHalf,
+    // Kept so the connection stays open for the life of the follow.
+    _wr: OwnedWriteHalf,
+    buf: Vec<u8>,
+    request_id: RequestId,
+    done: bool,
+}
+
+impl LogFollow {
+    /// Connect, handshake, and send `Logs { id, cursor }`.
+    pub async fn open(
+        socket: &Path,
+        id: WorkloadId,
+        cursor: Option<String>,
+    ) -> Result<Self, ClientError> {
+        let stream = UnixStream::connect(socket).await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let mut buf = Vec::with_capacity(4096);
+        write_frame(
+            &mut wr,
+            &YubabaToKamaji::Hello {
+                version: ProtocolVersion::CURRENT,
+            },
+        )
+        .await?;
+        match read_frame(&mut rd, &mut buf).await? {
+            KamajiToYubaba::Welcome { .. } => {}
+            KamajiToYubaba::Error { code, message, .. } => {
+                return Err(ClientError::Remote { code, message })
+            }
+            other => return Err(ClientError::Unexpected(format!("{other:?}"))),
+        }
+        let request_id = RequestId(1);
+        write_frame(
+            &mut wr,
+            &YubabaToKamaji::Logs {
+                request_id,
+                id,
+                cursor,
+            },
+        )
+        .await?;
+        Ok(Self {
+            rd,
+            _wr: wr,
+            buf,
+            request_id,
+            done: false,
+        })
+    }
+
+    /// The next item; `Ok(None)` after `End`. A connection that closes before
+    /// `End` is `Err(PeerClosed)` — a drop to resume from the last cursor,
+    /// never a finish.
+    pub async fn next(&mut self) -> Result<Option<LogFollowItem>, ClientError> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            match read_frame(&mut self.rd, &mut self.buf).await? {
+                KamajiToYubaba::LogBatch {
+                    request_id,
+                    records,
+                    cursor,
+                } if request_id == self.request_id => {
+                    return Ok(Some(LogFollowItem::Batch { records, cursor }))
+                }
+                KamajiToYubaba::LogEnd { request_id, cursor } if request_id == self.request_id => {
+                    self.done = true;
+                    return Ok(Some(LogFollowItem::End { cursor }));
+                }
+                KamajiToYubaba::Error { code, message, .. } => {
+                    return Err(ClientError::Remote { code, message })
+                }
+                // Lifecycle pushes may interleave; they are not ours.
+                KamajiToYubaba::WorkloadStarted { .. } | KamajiToYubaba::WorkloadExited { .. } => {}
+                other => return Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+    }
+}
+
 // ── Kamaji trait impl ──────────────────────────────────────────────────────
 //
 // Bridges the `Kamaji` trait (W199 caller contract) to the sibling-shape
@@ -809,14 +912,50 @@ impl crate::Kamaji for KamajiClient {
         Ok(all.into_iter().find(|s| s.ident == *ident))
     }
 
+    /// R729-F2: a [`LogFollow`] on a dedicated connection. The wire always
+    /// follows to `End`; `follow: false` and `tail` are not expressible on it,
+    /// so `tail` is refused rather than silently ignored, and `stream` filters
+    /// client-side. A drop before `End` ends the stream early — callers that
+    /// need resume use [`LogFollow`] directly with the last cursor.
     async fn stream_logs(
         &self,
-        _ident: &crate::MeshIdent,
-        _opts: crate::LogOpts,
+        ident: &crate::MeshIdent,
+        opts: crate::LogOpts,
     ) -> anyhow::Result<crate::LogStream> {
-        Err(anyhow::anyhow!(
-            "stream_logs not yet in the sibling-Kamaji wire protocol"
-        ))
+        if opts.tail.is_some() {
+            anyhow::bail!("stream_logs over the sibling wire does not support `tail`");
+        }
+        let mut follow = LogFollow::open(&self.socket, WorkloadId::new(&ident.0), opts.cursor)
+            .await
+            .map_err(|e| anyhow::anyhow!("kamaji stream_logs: {e}"))?;
+        let ident = ident.clone();
+        let want = opts.stream;
+        let (tx, rx) = mpsc::channel::<crate::LogEvent>(256);
+        tokio::spawn(async move {
+            while let Ok(Some(LogFollowItem::Batch { records, .. })) = follow.next().await {
+                for r in records {
+                    let stream = match r.stream {
+                        kamaji_proto::LogStreamTag::Stdout => crate::LogStreamKind::Stdout,
+                        kamaji_proto::LogStreamTag::Stderr => crate::LogStreamKind::Stderr,
+                    };
+                    if want.is_some_and(|w| w != stream) {
+                        continue;
+                    }
+                    let event = crate::LogEvent {
+                        timestamp_ms: r.ts_ms,
+                        ident: ident.clone(),
+                        stream,
+                        message: r.line,
+                        correlation_id: None,
+                        cursor: Some(r.cursor),
+                    };
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     async fn restart_workload(&self, ident: &crate::MeshIdent) -> anyhow::Result<()> {
@@ -1749,21 +1888,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn constable_stream_logs_returns_not_supported_err() {
-        let (_tmp, sock) = one_shot_server(|_| KamajiToYubaba::WorkloadList {
-            request_id: RequestId(1),
-            entries: vec![],
+    async fn log_follow_reads_batches_until_end_on_a_dedicated_connection() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let req = conn.recv().await;
+            let YubabaToKamaji::Logs {
+                request_id,
+                id,
+                cursor,
+            } = req
+            else {
+                panic!("expected Logs, got {req:?}")
+            };
+            assert_eq!((id.as_str(), cursor.as_deref()), ("forge.a", Some("3:0")));
+            let rec = kamaji_proto::LogRecord {
+                stream: kamaji_proto::LogStreamTag::Stdout,
+                cursor: "7:0".into(),
+                ts_ms: 1,
+                line: "hey".into(),
+            };
+            conn.send(&KamajiToYubaba::LogBatch {
+                request_id,
+                records: vec![rec],
+                cursor: Some("7:0".into()),
+            })
+            .await;
+            conn.send(&KamajiToYubaba::LogEnd {
+                request_id,
+                cursor: Some("7:0".into()),
+            })
+            .await;
         })
         .await;
-        let client = KamajiClient::connect(sock).await.unwrap();
-        let result = client
-            .stream_logs(&crate::MeshIdent("any".into()), crate::LogOpts::default())
-            .await;
-        // LogStream doesn't impl Debug, so match manually.
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("expected stream_logs to return Err"),
-        };
-        assert!(err.to_string().contains("not yet in the sibling"));
+        let mut f = LogFollow::open(&sock, WorkloadId::new("forge.a"), Some("3:0".into()))
+            .await
+            .unwrap();
+        match f.next().await.unwrap() {
+            Some(LogFollowItem::Batch { records, cursor }) => {
+                assert_eq!(records[0].line, "hey");
+                assert_eq!(cursor.as_deref(), Some("7:0"));
+            }
+            other => panic!("expected a batch, got {other:?}"),
+        }
+        assert_eq!(
+            f.next().await.unwrap(),
+            Some(LogFollowItem::End {
+                cursor: Some("7:0".into())
+            })
+        );
+        assert_eq!(f.next().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn log_follow_close_before_end_is_a_drop_not_a_finish() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let _ = conn.recv().await;
+            // Drop the connection without LogEnd.
+        })
+        .await;
+        let mut f = LogFollow::open(&sock, WorkloadId::new("w"), None)
+            .await
+            .unwrap();
+        assert!(matches!(f.next().await, Err(ClientError::PeerClosed)));
     }
 }

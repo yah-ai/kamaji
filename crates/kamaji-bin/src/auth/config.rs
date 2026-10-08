@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::error::AuthError;
+use super::error::JwksError;
 
 /// Required + default-tunable knobs for the verifier.
 #[derive(Debug, Clone)]
@@ -69,10 +69,10 @@ impl AuthConfig {
     /// tokens kamaji will accept. `https://…` is always allowed; `http://…` is
     /// allowed ONLY when the host is loopback (`127.0.0.1`, `[::1]`,
     /// `localhost`) so local dev against the in-process mock issuer keeps
-    /// working. Anything else returns [`AuthError::InsecureIssuer`].
+    /// working. Anything else returns [`JwksError::InsecureIssuer`].
     ///
     /// Enforced by [`super::AuthVerifier::boot`] before any network fetch.
-    pub fn validate_issuer(&self) -> Result<(), AuthError> {
+    pub fn validate_issuer(&self) -> Result<(), JwksError> {
         if let Some(rest) = self.cheers_issuer.strip_prefix("https://") {
             // Require a non-empty authority so a bare `https://` can't slip by.
             if !authority_host(rest).is_empty() {
@@ -83,7 +83,7 @@ impl AuthConfig {
                 return Ok(());
             }
         }
-        Err(AuthError::InsecureIssuer {
+        Err(JwksError::InsecureIssuer {
             issuer: self.cheers_issuer.clone(),
         })
     }
@@ -201,7 +201,7 @@ mod tests {
         ] {
             let c = AuthConfig::new(issuer, "https://kamaji.example");
             assert!(
-                matches!(c.validate_issuer(), Err(AuthError::InsecureIssuer { .. })),
+                matches!(c.validate_issuer(), Err(JwksError::InsecureIssuer { .. })),
                 "should reject {issuer}"
             );
         }
@@ -212,7 +212,7 @@ mod tests {
         for issuer in ["cheers.example", "ftp://cheers.example", "https://"] {
             let c = AuthConfig::new(issuer, "https://kamaji.example");
             assert!(
-                matches!(c.validate_issuer(), Err(AuthError::InsecureIssuer { .. })),
+                matches!(c.validate_issuer(), Err(JwksError::InsecureIssuer { .. })),
                 "should reject {issuer}"
             );
         }

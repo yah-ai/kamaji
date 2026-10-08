@@ -1,6 +1,6 @@
 //! @yah:ticket(R880-B1, "hotship's proto-skew guard compares the tree against the last RELEASE, not against what the node runs — so it passes on a hotshipped node and breaks the kamaji/yubaba pair")
-//! @yah:at(2026-09-18T16:34:26Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-10-07T16:30:28Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R880)
 //! @yah:severity(high)
@@ -8,7 +8,10 @@
 //! @yah:gotcha("Hit for real 2026-09-18. `scripts/hotship.sh --nodes us-west-002,us-west-003 --binaries yubaba` passed the guard and broke the kamaji UDS on both nodes: kamaji logged `decode failed: postcard error: Serde Deserialization Error` once per retry, and yubaba fell back to its in-process containerd runtime with a single WARN. The only external symptom is that GET /health then OMITS kamaji_version entirely — easy to read as transient. This is the exact failure the guard's own R881-B7 comment predicts; the guard simply could not see it.")
 //! @arch:see(scripts/hotship.sh)
 //! @yah:verify("Point a tree whose kamaji_proto has moved past a node's hotshipped half at that node with --binaries yubaba; today the guard is silent. After the fix it must refuse and name the node.")
-//! @yah:assumes("Recovery used here was to ship the other half (--binaries kamaji) and then restart yubaba by hand on each node. yubaba's KamajiClient connects ONCE at boot with a 30s budget and falls back permanently, so shipping kamaji alone does not re-pair. Whether `hotship --binaries kamaji` should also restart yubaba is undecided.")
+//! @yah:handoff("Guard now compares against each NODE. yubaba GET /health gains `kamaji_protocol: u32` (ProtocolVersion::CURRENT.number(), new const fn in oss/kamaji/crates/kamaji-proto/src/version.rs). scripts/hotship.sh `node_pair_proto` probes every --nodes target (mesh then LAN): kamaji_protocol + kamaji_version present = pair proven on V<n>; else UNPROVEN (old yubaba without the field, unreachable, or no kamaji handshaken — the 2026-09-18 symptom). Any mismatch or unproven node refuses a single-half restart ship and names the node; --no-restart warns; --allow-proto-skew overrides. Release-commit comparison removed. --allow-proto-skew help text updated.")
+//! @yah:verify("cd oss/kamaji && cargo test -p kamaji-proto --lib number_tests (1/1); cd oss/yubaba && cargo test -p yubaba --lib health (52/52); node_pair_proto exercised against stubbed /health bodies: proven→13, no kamaji_version→unproven, pre-field yubaba→unproven; bash -n clean. Not run against a live node.")
+//! @yah:gotcha("Rollout: no live node carries kamaji_protocol yet, so EVERY single-half hotship (--binaries yubaba or kamaji alone) refuses as unproven until a yubaba with this change is on that node — ship both halves once (--binaries kamaji,yubaba) per node, or --allow-proto-skew deliberately. Intended: unproven is never a match.")
+//! @yah:handoff("Operator call A (2026-10-07): a kamaji restart-ship without yubaba in --binaries now also restarts the node's existing yubaba unit, so KamajiClient re-handshakes (scripts/hotship.sh unit:* activation arm). Uses the per-node raft floor already checked before the node; no sovereign-flag retire since yubaba bytes are unchanged. bash -n clean; not run against a live node.")
 
 use serde::{Deserialize, Serialize};
 
@@ -265,4 +268,22 @@ impl Default for ProtocolVersion {
 impl ProtocolVersion {
     /// The version this build of `kamaji-proto` produces by default.
     pub const CURRENT: Self = Self::V13;
+
+    /// The `n` of `Vn`. Surfaced on yubaba's `GET /health` as
+    /// `kamaji_protocol` so `scripts/hotship.sh` can compare a tree against the
+    /// wire a NODE actually speaks, not against the last release (R880-B1).
+    pub const fn number(self) -> u32 {
+        self as u32 + 1
+    }
+}
+
+#[cfg(test)]
+mod number_tests {
+    use super::ProtocolVersion;
+
+    #[test]
+    fn number_matches_the_variant_name() {
+        assert_eq!(ProtocolVersion::V1.number(), 1);
+        assert_eq!(ProtocolVersion::V13.number(), 13);
+    }
 }

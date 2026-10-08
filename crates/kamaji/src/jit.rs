@@ -82,7 +82,6 @@
 //!
 //! @yah:relay(R852, "Custom-domain onboarding, the halves outside passway/yubaba: declare a per-tenant passway workload, and render the tenant-facing enrollment page")
 //! @yah:at(2026-09-03T06:26:19Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:next("Split out of R779 (free-tier ingress at 10k domains) at its P8 close-out, because both halves are outside R779's blast radius rather than unfinished inside it. R779 shipped and proved the whole passway/yubaba side: SNI demux on one shared :443 that terminates no TLS, per-tenant passway fd-3 adoption + idle self-reap behind kamaji JIT (oss/passway/crates/passway/tests/jit_cold_start.rs proves fork/serve/reap/re-fork end to end), the R2-backed cert store off raft, the enrollment set as the structural allowlist, the per-domain ACME issuer, and DNS-01 _acme-challenge CNAME delegation now proven against a real CA (oss/passway/crates/acme-engine/tests/pebble_dns01_delegation.rs). What is left is a way to DECLARE a per-tenant passway, and a place for a tenant to READ their two DNS records. Design canon: .yah/docs/working/W267-sovereign-public-ingress.md.")
 //!
@@ -873,6 +872,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: vec![],
         }
