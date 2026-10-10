@@ -1068,7 +1068,13 @@ mod tests {
     fn the_local_tier_treats_a_pin_as_a_preference_not_an_error() {
         // A dev mirror's `port = 4321` is a browser handle, not a published
         // address — honoured when free, floated when taken, never fatal.
-        let free = pick_free_port(LOOPBACK).unwrap();
+        // Scanned from BELOW both OSes' ephemeral ranges (macOS 49152+, Linux
+        // 32768+): a pin out of `pick_free_port` is an ephemeral number, and any
+        // parallel test that binds :0 or connects out can take it before
+        // `resolve_one` runs.
+        let free = (20000..30000u16)
+            .find(|&p| is_free(LOOPBACK, p))
+            .expect("a free port below the ephemeral range");
         assert_eq!(
             EphemeralPorts
                 .resolve_one(

@@ -829,6 +829,8 @@ async fn spawn_child(
     let pid = child
         .id()
         .ok_or_else(|| anyhow!("workload {}: child exited before pid read", spec.name))?;
+    // R967-B1: the identity a later runtime on this state dir reaps us by.
+    crate::orphan::record(state_dir, &ident.0, pid);
 
     Ok(SpawnedChild {
         child,
@@ -1187,6 +1189,24 @@ impl Kamaji for NativeRuntime {
         // Idempotent: clear any prior workload with the same identity.
         self.teardown_workload(&ident).await?;
 
+        // R967-B1: a child of a PREVIOUS runtime on this state dir is not in
+        // our map, so the teardown above never saw it — but `LedgerPorts`
+        // hands its remembered port straight back to us. Replace it (the pid
+        // file is its identity), then insist every declared port is bindable:
+        // whatever still holds one is not ours to kill.
+        crate::orphan::reap(&self.state_dir, &ident.0, TERM_GRACE).await;
+        for (name, number) in crate::declared_port_names(&spec.expose.mesh) {
+            if crate::orphan::is_held_settled(mesh.mesh_ip, number).await {
+                return Err(anyhow!(
+                    "workload {}: port {number} ({}) is held by {}, which is not a child \
+                     this runtime started; free the port or stop that process",
+                    spec.name,
+                    crate::ports::port_env_var(&name),
+                    crate::orphan::describe_holder(number),
+                ));
+            }
+        }
+
         // R885-B1: mint the cgroup leaf BEFORE the fork. A failure here fails
         // the deploy rather than degrading to an unbounded fork — this runtime
         // already decided at startup whether the host can confine anything
@@ -1384,9 +1404,12 @@ impl Kamaji for NativeRuntime {
         // handle through `Ctrl::Adopt` is what that needs, and neither defect
         // B4 exists for requires it: the race is a redeploy's teardown against
         // its own re-create, and a handoff `rmdir`s nothing.
-        let cgroup = {
+        let (cgroup, old_pid) = {
             let map = self.workloads.lock().await;
-            map.get(&ident.0).and_then(|h| h.cgroup.clone())
+            (
+                map.get(&ident.0).and_then(|h| h.cgroup.clone()),
+                map.get(&ident.0).map_or(0, |h| h.pid.load(Ordering::SeqCst)),
+            )
         };
 
         // 1. Start the replacement in upgrade mode. It connects to the shared
@@ -1412,6 +1435,13 @@ impl Kamaji for NativeRuntime {
         tokio::time::sleep(UPGRADE_SETTLE).await;
         if let Ok(Some(status)) = replacement.child.try_wait() {
             stop_child(&mut replacement.child, new_pid).await;
+            // R967-B1: spawn_child recorded the replacement; the old process is
+            // the one still serving, so the pid file goes back to naming it.
+            if old_pid != 0 {
+                crate::orphan::record(&self.state_dir, &ident.0, old_pid);
+            } else {
+                crate::orphan::clear(&self.state_dir, &ident.0);
+            }
             return Err(anyhow!(
                 "workload {}: graceful-upgrade replacement exited during handoff ({status}); \
                  old instance left running",
@@ -1454,6 +1484,7 @@ impl Kamaji for NativeRuntime {
         if handle.ctrl.send(Ctrl::Teardown(ack_tx)).await.is_ok() {
             let _ = ack_rx.await;
         }
+        crate::orphan::clear(&self.state_dir, &ident.0);
         // The supervisor has stopped and reaped the child it owns. Anything the
         // workload double-forked away is NOT reaped by that — it was reparented
         // to init and is still sitting in the generation leaf. R885-B4's
@@ -2822,6 +2853,39 @@ mod tests {
             .unwrap();
     }
 
+    /// R967-B1: a replacement that dies during the handoff leaves the OLD
+    /// process serving, so the pid file must go back to naming it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_graceful_upgrade_leaves_the_pid_file_naming_the_survivor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let spec = native_spec("native-upgrade-fail", vec!["/bin/sleep".into(), "30".into()]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let old_pid = runtime.deploy_workload(&spec, &mesh).await.unwrap().task_pid;
+
+        // Same identity, but the replacement exits at once.
+        let dying = native_spec(
+            "native-upgrade-fail",
+            vec!["/bin/sh".into(), "-c".into(), "exit 1".into()],
+        );
+        let err = runtime
+            .graceful_upgrade_workload(&dying, &mesh)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("old instance left running"), "{err}");
+
+        let recorded = std::fs::read_to_string(crate::orphan::pid_path(
+            tmp.path(),
+            "native-upgrade-fail",
+        ))
+        .unwrap();
+        let start = crate::orphan::start_time(old_pid).expect("old process still alive");
+        assert_eq!(recorded.trim(), format!("{old_pid} {start}"));
+
+        runtime.teardown_workload(&spec.expose.mesh.identity).await.unwrap();
+    }
+
     #[tokio::test]
     async fn graceful_upgrade_with_no_running_instance_is_a_deploy() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2871,6 +2935,147 @@ mod tests {
             "{:?}",
             state.status
         );
+    }
+
+    // ── R967-B1: orphans of a previous runtime on the same state dir.
+
+    /// A long-lived process that listens on a port the kernel gave IT (bound to
+    /// `:0`, port read back off its stdout), standing in for a driver that
+    /// outlived its camp. Never pick-then-release a number for it: a parallel
+    /// test's ledger can be handed the same released number and then see this
+    /// holder as a squatter. Reaped by a task so a kill leaves no zombie.
+    async fn spawn_port_holder() -> (u32, u16) {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut child = tokio::process::Command::new("python3")
+            .args([
+                "-c",
+                "import socket,time\ns=socket.socket()\n\
+                 s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n\
+                 s.bind(('0.0.0.0',0))\ns.listen()\n\
+                 print(s.getsockname()[1],flush=True)\ntime.sleep(300)",
+            ])
+            .stdout(Stdio::piped())
+            .kill_on_drop(false)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let port: u16 = lines.next_line().await.unwrap().unwrap().trim().parse().unwrap();
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        (pid, port)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recorded_orphan_is_reaped_and_its_port_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (orphan, port) = spawn_port_holder().await;
+        std::fs::create_dir_all(tmp.path().join("native-orphan")).unwrap();
+        crate::orphan::record(tmp.path(), "native-orphan", orphan);
+
+        // A fresh runtime on the same state dir: it has no memory of the orphan.
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-orphan",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        spec.expose.mesh.ports = MeshExpose::anonymous_ports([port]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+
+        assert!(
+            crate::orphan::is_held(Ipv4Addr::LOCALHOST, port) || unsafe { libc::kill(orphan as i32, 0) } != 0,
+            "the orphan must be gone"
+        );
+        assert_ne!(
+            crate::orphan::start_time(orphan),
+            crate::orphan::start_time(std::process::id()),
+        );
+        assert!(
+            unsafe { libc::kill(orphan as i32, 0) } != 0,
+            "orphan pid {orphan} is still alive"
+        );
+        runtime.teardown_workload(&spec.expose.mesh.identity).await.unwrap();
+        assert!(!crate::orphan::pid_path(tmp.path(), "native-orphan").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pid_file_with_a_mismatched_start_time_is_ignored_not_killed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bystander = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = bystander.id().unwrap();
+        std::fs::create_dir_all(tmp.path().join("native-reuse")).unwrap();
+        std::fs::write(
+            crate::orphan::pid_path(tmp.path(), "native-reuse"),
+            format!("{pid} not-its-start-time\n"),
+        )
+        .unwrap();
+
+        let runtime = NativeRuntime::new(tmp.path());
+        let spec = native_spec(
+            "native-reuse",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+
+        assert!(
+            bystander.try_wait().unwrap().is_none(),
+            "a recycled pid must not be killed"
+        );
+        runtime.teardown_workload(&spec.expose.mesh.identity).await.unwrap();
+        let _ = bystander.start_kill();
+    }
+
+    /// A listener on one loopback address must not block a workload that binds
+    /// a different one (two native workloads on different mesh IPs may share a
+    /// port). Needs a second loopback IP: Linux has all of 127/8, macOS does not
+    /// without an alias, so there the test returns early rather than fail.
+    #[tokio::test]
+    async fn a_listener_on_another_address_does_not_block_the_deploy() {
+        let other = Ipv4Addr::new(127, 0, 0, 2);
+        let Ok(holder) = std::net::TcpListener::bind((other, 0)) else {
+            return; // no 127.0.0.2 on this host (macOS without an lo0 alias)
+        };
+        let port = holder.local_addr().unwrap().port();
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-neighbour",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        spec.expose.mesh.ports = MeshExpose::anonymous_ports([port]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        runtime.teardown_workload(&spec.expose.mesh.identity).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_foreign_listener_on_a_declared_port_fails_the_deploy_naming_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign =
+            std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = foreign.local_addr().unwrap().port();
+
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec(
+            "native-foreign",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        );
+        spec.expose.mesh.ports = MeshExpose::anonymous_ports([port]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let err = runtime.deploy_workload(&spec, &mesh).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&port.to_string()), "{msg}");
+        assert!(msg.contains("native-foreign"), "{msg}");
+        assert!(msg.contains("pid"), "{msg}");
     }
 
     #[tokio::test]

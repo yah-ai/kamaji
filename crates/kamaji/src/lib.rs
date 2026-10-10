@@ -126,6 +126,9 @@ pub mod native;
 #[cfg(feature = "native-integration")]
 pub mod win_interactive;
 
+#[cfg(feature = "native-integration")]
+pub(crate) mod orphan;
+
 /// KVM microVM backend (R605-F8 / W325 §5) — boots a workload in a Firecracker
 /// guest with its own kernel instead of sharing the host's.
 #[cfg(feature = "microvm-integration")]
