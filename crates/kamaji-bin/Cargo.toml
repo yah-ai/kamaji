@@ -96,18 +96,18 @@ bundle-serving = [
 tenant-passway = ["kamaji/native-integration"]
 
 [dependencies]
-kamaji-proto = { path = "../kamaji-proto", version = "0.8.43" }
+kamaji-proto = { path = "../kamaji-proto", version = "0.8.45" }
 # R555-F4 (W235 §(c)): `admission-verify` brings in the Ed25519 half of
 # `workload_spec::admission`. Not optional — deciding what is allowed to run
 # is kamaji's job description, and a build that could silently omit the
 # admission gate is a build an operator cannot tell apart from one that has it.
-workload-spec = { package = "yah-workload-spec", version = "0.8.43", features = ["admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.45", features = ["admission-verify"] }
 # R715-F3 / W315 — the process-control channel. `client` is the consumer half
 # the probe runner dials; `kamaji` gives it the ProcState -> WorkloadState
 # conversion as an exhaustive match, which is what keeps "believed verbatim"
 # true. Pure std + serde + tokio (already linked), so no RSS cost worth
 # weighing against W154's memory budget.
-kamaji-procctl = { path = "../procctl", version = "0.8.43", features = ["client", "kamaji"] }
+kamaji-procctl = { path = "../procctl", version = "0.8.45", features = ["client", "kamaji"] }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -123,10 +123,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # R731-B1 — the JWK `role` enum (issuer | assertion | self-signer) lives in
 # cheers-core so this verifier and cheers's JWKS publisher share one type.
-cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.43" }
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.45" }
 # R731-F6 — the W159 JWKS cache + KeySetVerifier (key-role enforcement, §D5)
 # moved here from this crate's auth/jwks.rs; `jwks-http` is the reqwest source.
-cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.43", features = ["jwks-http"] }
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.45", features = ["jwks-http"] }
 
 # Containerd gRPC client (optional — only with containerd-integration feature).
 # Mirrors yubaba's optional dep so both processes can share crates.io artifacts.
@@ -134,7 +134,7 @@ containerd-client = { version = "0.9", optional = true }
 prost-types = { version = "0.14", optional = true }
 # Shared containerd backend core (R592-T1) — OCI-spec building, image/rootfs
 # resolution, task-status querying. One home for both kamaji and kamaji-bin.
-kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.43", default-features = false }
+kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, version = "0.8.45", default-features = false }
 # The kamaji library crate. NOT optional as of R885-B1: the cgroup v2 driver
 # moved into it (`kamaji::cgroup`) so the live `kamaji::native::NativeRuntime`
 # could reach it, and this crate re-exports it unconditionally. With
@@ -142,14 +142,14 @@ kamaji-containerd-core = { path = "../kamaji-containerd-core", optional = true, 
 # link — the backend-bearing features below each turn on the one they need
 # (socket-custody for the passway fd handoff, native-integration for fork+exec,
 # and so on).
-kamaji = { path = "../kamaji", default-features = false, version = "0.8.43" }
+kamaji = { path = "../kamaji", default-features = false, version = "0.8.45" }
 
 # R599-F10 node bundle backend (only linked with the `bundle-serving` feature).
 # yah-object-store is the R2/in-memory blob store; yah-mesofact-bundle (store
 # feature) materializes a W272 bundle from it into the node cache. Both live in
 # oss/yah-base, redirected to path by the root [patch.crates-io] block.
-yah-object-store = { version = "0.8.43", optional = true }
-yah-mesofact-bundle = { version = "0.8.43", optional = true }
+yah-object-store = { version = "0.8.45", optional = true }
+yah-mesofact-bundle = { version = "0.8.45", optional = true }
 
 # Linux-only syscall surface used by the native driver (R406-T5).
 # All permissive (MIT / Apache-2.0). The `landlock` crate is a thin wrapper over

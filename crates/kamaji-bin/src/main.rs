@@ -66,6 +66,36 @@
 //! @yah:verify("NOT VERIFIED, stated rather than glossed: I did not compile anything. Per the ticket's own constraint I did not build and did not ship, so there is no proof from THIS pass that kamaji-bin compiles for x86_64-unknown-linux-musl or aarch64-unknown-linux-musl with the feature on. What is on record from elsewhere: R605-F8's verify line reports `cargo test --workspace --all-features` green in oss/kamaji, and R605-F14 ran the microVM guest e2e on us-west-003 — so the feature has compiled before, on a host target, on an older tree. It has never been cross-compiled for musl by anyone. A compile-check now would also be ambiguous, since oss/kamaji currently carries several hundred uncommitted lines from R605-F22 and a red would not be attributable to this change. First real proof is the build in step 3 of the sequence.")
 //! @yah:gotcha("ONE STALE REFERENCE DELIBERATELY LEFT ALONE. .yah/docs/working/W282-qed-manual-steps.md:37 tells whoever cuts a release by hand to build kamaji with containerd-integration,native-exec,bundle-serving — now wrong by one feature. It is another ticket's @yah:next annotation, not prose, so hand-editing it would be authoring on someone else's ticket; the authoritative source is the script, which is fixed. Whoever owns W282 should refresh that line. Two other hits on the old string are historical records that are correct as history and should NOT be edited: .yah/infra/machines/us-west-015.toml:12 (a darwin-leg analysis) and the R605-T15 handoff recorded on W325.")
 //! @yah:handoff("SCOPE HELD AND NOTHING WAS SHIPPED. No cargo build, no hotship, no node access, no restart — us-west-003 was not touched and was still not answering ssh or HTTP at the end of this pass. Five files changed, all repo-only: scripts/publish-yubaba-release.sh (build call + its header comment), scripts/hotship.sh (app_spec row), .github/workflows/release.yml (the third build site), app/yah/cli/resources/kamaji.service (header comment: the Environment= drop-in spelling for microVM and its three fatal-at-startup preconditions), .yah/infra/machines/us-west-003.toml (findings 2 and 3 corrected, drop-in warning added). No source file was edited — in particular nothing in oss/kamaji, which is R605-F22's live working set.")
+//!
+//! @yah:relay(R964, "Self-heal gaps a node reboot exposed: noisetable staging outage 2026-10-09")
+//! @yah:at(2026-10-09T17:20:32Z)
+//! @yah:next("Incident: us-west-011 lost its LAN uplink (bad cable) ~2026-10-08T16:28Z and was power-cycled 2026-10-09T03:40Z. On reconnect the passway doors self-healed within one 5-min sweep (good), but api-staging stayed 503 because kamaji never resumed the noisetable-account-staging container after the reboot; it sat Pending (pid null) for 13h while /workloads reported health=ready. A static-compute 'yah cloud apply' then could not fix it and blamed a restart that never happened; 'yah cloud workload deploy noisetable-account-staging' did. Children carry the three gaps. Goal: a node reboot with no operator action ends with every admitted workload Running.")
+//!
+//! @yah:ticket(R964-B1, "kamaji does not resume containerd workloads after a restart or reboot — every node reboot silently undeploys them")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:at(2026-10-09T18:26:56Z)
+//! @yah:parent(R964)
+//! @yah:severity(high)
+//! @yah:next("Startup (main.rs ~575-591) calls resume_bundle_workloads / resume_native_workloads / resume_microvm_workloads; there is no containerd equivalent. Generalize R755-B5's persisted-deploy-record pattern (BundleDeployRecord + record_deploy/forget_deploy) to the containerd backend and replay it at startup through the same post-Ack path a fresh Deploy uses.")
+//! @yah:verify("Measured on us-west-011 2026-10-09: after the 03:40Z reboot kamaji logged 'recorded microVM deploys replayed resumed=3' and nothing for noisetable-account-staging; GET /workloads showed it state=Pending pid=null ports=[] for 13h until 'yah cloud workload deploy noisetable-account-staging' brought it Running. Acceptance: systemctl restart kamaji (or a reboot) on a node running an image workload ends with it Running and no apply/deploy in between.")
+//! @yah:handoff("Generalized the R755-B5/R936-B11/R605-F16 record pattern: ResumeBackend::Containerd in oss/kamaji/crates/kamaji-bin/src/deploy_records.rs. Records are NOT opt-in for containerd (no yah.resume annotation needed, so the us-west-011 case is covered); native/microVM-marked specs and Job archetypes are excluded (no re-running jobs).")
+//! @yah:handoff("server.rs: ServerCtx.containerd_records + with_containerd_deploy_records; record_resumable_deploy writes the record on DeployAck (same site as native/microvm); stop_workload forgets it after containerd teardown; new resume_containerd_workloads replays through deploy_container_backend (the arm a fresh Deploy reaches post-admission/hydrate, no parallel path) and set_deployed_spec on Ack. Idempotence: records whose container containerd lists as Running (kamaji-only restart) are adopted, not redeployed. Failed replay keeps the record for the next restart.")
+//! @yah:handoff("main.rs: resume called after microVM resume and before tail::resume (so durability tails re-arm for replayed workloads); records dir `<state-dir>/.deploys`, new flag --containerd-state-dir / env KAMAJI_CONTAINERD_STATE_DIR, default /var/lib/kamaji/containerd.")
+//! @yah:handoff("Hydrate-on-place is deliberately NOT re-run on replay (same call as the native arm: volumes survive on disk).")
+//! @yah:verify("cargo check -p kamaji-bin --all-features (oss/kamaji): EXIT=0")
+//! @yah:verify("cargo test -p kamaji-bin --all-features: all suites ok (326 lib tests, 0 failed), including new service_shaped_image_workloads_are_recorded_without_opting_in and containerd_records_round_trip_and_forget. No pre-change baseline run taken.")
+//! @yah:verify("NOT verified: no live containerd/Linux node — resume_containerd_workloads itself (list-adopt + replay) has no unit test since it needs a containerd socket; acceptance (systemctl restart kamaji / reboot on a node with an image workload) still needs a live node. Needs /var/lib/kamaji writable under the kamaji unit sandbox (inferred from ports.json using it, not checked).")
+//! @yah:gotcha("Hot-ship/deploy: the first kamaji run after upgrade has no records, so already-running image workloads only become resumable after their next Deploy; existing containers are unaffected. Commit command (git policy defer, not run): git add oss/kamaji/crates/kamaji-bin/src/{deploy_records,server,main}.rs && git commit -m 'kamaji: record and replay containerd deploys across restart (R964-B1)'  -- main.rs/server.rs carry peer hunks too; stage with git add -p.")
+//! @yah:handoff("CORRECTION to the earlier handoff: the default records dir is now /var/lib/yah/kamaji/containerd (records in <dir>/.deploys), NOT /var/lib/kamaji/containerd, which kamaji.service's ProtectSystem=strict leaves read-only (EROFS) — the earlier default would have made the fix inert on every node. It is the new constant kamaji::DEFAULT_CONTAINERD_STATE_DIR (oss/kamaji/crates/kamaji/src/lib.rs), used by main.rs, its --help text and its comment, and sits under the unit's StateDirectory=yah/kamaji / ReadWritePaths=/var/lib/yah/kamaji grants.")
+//! @yah:handoff("Failed record writes are loud: record_resumable_deploy warn!s with workload id, records dir and the io error (dir added this pass); the deploy itself still Acks since the workload is running.")
+//! @yah:handoff("Pinned: app/yah/cli/src/supervisor_unit.rs kamaji_unit_grants_every_host_path_kamaji_writes now asserts kamaji::DEFAULT_CONTAINERD_STATE_DIR is writable under kamaji.service.")
+//! @yah:verify("cargo test -p kamaji-bin --all-features (oss/kamaji): EXIT=0, 326 lib tests passed, 0 failed.")
+//! @yah:verify("cargo test -p yah --lib supervisor_unit: 16 passed, 0 failed, including kamaji_unit_grants_every_host_path_kamaji_writes. I did not mutation-check that the new row goes red.")
+//! @yah:verify("LIVE ACCEPTANCE STILL OPEN: needs a kamaji roll to a node running an image workload, then `systemctl restart kamaji` (or reboot) and the workload ends Running with no apply/deploy. resume_containerd_workloads is untested against a real containerd. Workloads deployed before the roll have no record until their next Deploy.")
+//! @yah:verify("LIVE ACCEPTANCE PASSED on us-west-011 2026-10-09 (operator-authorised, only that node). Baseline: kamaji 0.8.43-h6 (hot ship, symlink /usr/local/bin/kamaji -> /data/yah-bin/0.8.43-h6/kamaji), 7 drop-ins incl 10-microvm.conf, 3 firecracker VMs Running (vm-us-west-111/112/113), noisetable-account-staging Running pid 606579, noisetable-staging + passway-inner-noisetable-marketing Running, compiler/coordinator/seed Pending, no turso-backup tail processes (no durability tail to kill), /var/lib/yah/kamaji had no containerd dir. Ship: scripts/hotship.sh --nodes us-west-011 --binaries kamaji (dry-run first; features include microvm) -> 0.8.45-h2 sha256 a51d3932..c053a4; boot journal: 3 microVM replayed, bundle 1, native 1, 'recorded containerd deploys replayed (R964-B1) resumed=0' (pre-record, expected). Then yah cloud workload deploy noisetable-account-staging -> record /var/lib/yah/kamaji/containerd/.deploys/noisetable-account-staging.json (4327B), 0 EROFS/read-only/failed-to-write lines. Then systemctl restart kamaji, no deploy: journal 'recorded containerd deploy already running; adopted (R964-B1) id=noisetable-account-staging' resumed=1; GET /workloads showed account-staging Running pid 607718 (same pid, container survived = ADOPTED, not redeployed); all 3 microVMs, noisetable-staging, passway-inner back Running; NRestarts=0. api-staging.noisetable.com/health = 200 (root 404 = app route; a 502 seen ~40s after restart was transient). Not exercised: the redeploy-if-container-gone branch (container was alive both times).")
+//! @yah:gotcha("us-west-011 left running hot-shipped kamaji 0.8.45-h2 (NOT on CDN; /usr/local/bin/kamaji -> /data/yah-bin/0.8.45-h2/kamaji; rollback = kamaji.prehotship -> /data/yah-bin/0.8.43-h6/kamaji). hotship.sh also restarted yubaba on that node (re-handshake; yubaba still 0.8.43-h6). New state on node: /var/lib/yah/kamaji/containerd/.deploys/noisetable-account-staging.json (root 0700). passway.* tenant domains read Pending in kamaji after each restart until yubaba's sweep re-arms them (pre-existing R852-B4 behaviour; still Pending ~8min after the last restart, I did not investigate). No drop-ins added.")
+//! @yah:verify("FOLLOW-UP (read-only, us-west-011, after the roll): passway.* tenant domains are NOT a regression. (b) Pre-ship baseline GET /workloads already had both passway.api-staging.noisetable.com (:8447) and passway.staging.noisetable.com (:8448) Pending, pid null. (a) Now: passway.api-staging.noisetable.com Running pid 607958, passway.staging.noisetable.com Pending. Yubaba journal: 'tenant passway: arming one cold passway per enrolled custom domain' (sweep_secs=300, idle_ttl_secs=60), sweeps applied armed=2 failed=0 at 20:01Z and 20:06Z. Reading (inference): these are cold passways forked on first request and idled after 60s, so Pending is their idle state; api-staging Running reflects traffic. api-staging.noisetable.com/health = 200. No kamaji journal lines named either id in the last 60 min.")
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -110,6 +140,9 @@ struct Args {
     /// attaches the backend; `None` leaves microVM-marked deploys refused.
     #[cfg_attr(not(feature = "microvm"), allow(dead_code))]
     microvm_dir: Option<PathBuf>,
+    /// R964-B1: where containerd deploy records live (`<dir>/.deploys`);
+    /// `None` = [`kamaji::DEFAULT_CONTAINERD_STATE_DIR`].
+    containerd_state_dir: Option<PathBuf>,
     /// State dir for the per-tenant passway JIT tier (R852-F1), holding each
     /// cold passway's stdout/stderr capture across forks. `Some(dir)` attaches
     /// the tier; `None` leaves tenant-passway deploys refused.
@@ -191,6 +224,8 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
 
     // R605-F8: microVM backend opt-in, same discipline again.
     let mut microvm_dir: Option<PathBuf> = std::env::var_os("KAMAJI_MICROVM_DIR").map(PathBuf::from);
+    let mut containerd_state_dir: Option<PathBuf> =
+        std::env::var_os("KAMAJI_CONTAINERD_STATE_DIR").map(PathBuf::from);
 
     // R852-F1: per-tenant passway tier opt-in. Same discipline once more — a
     // node that is not a public front door must not start binding tenant
@@ -268,6 +303,13 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
                         .ok_or(ParseError::MissingValue("--native-exec-dir"))?,
                 );
             }
+            "--containerd-state-dir" => {
+                containerd_state_dir = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or(ParseError::MissingValue("--containerd-state-dir"))?,
+                );
+            }
             "--microvm-dir" => {
                 microvm_dir = Some(
                     iter.next()
@@ -337,6 +379,7 @@ fn parse_args() -> std::result::Result<Args, ParseError> {
         docker_host,
         native_exec_dir,
         microvm_dir,
+        containerd_state_dir,
         tenant_passway_dir,
         hydrate_helper,
         tail_helper,
@@ -382,6 +425,8 @@ fn print_help() {
     println!("                                Darwin build-workers: no container can run");
     println!("                                cargo-tauri/codesign/notarytool (default:");
     println!("                                $KAMAJI_NATIVE_EXEC_DIR, else such deploys are refused)");
+    println!("      --containerd-state-dir PATH  where containerd deploys are recorded for replay");
+    println!("                                after a restart (default /var/lib/yah/kamaji/containerd)");
     println!("      --microvm-dir PATH        supervise Container workloads marked");
     println!("                                `yah.exec = microvm` by booting each one in its own");
     println!("                                KVM guest. PATH holds the guest kernel (vmlinux),");
@@ -591,6 +636,14 @@ fn run() -> Result<()> {
             let n = ctx.resume_microvm_workloads().await;
             tracing::info!(resumed = n, "recorded microVM deploys replayed (R605-F16)");
         }
+        // R964-B1: and every image workload containerd was running. A reboot
+        // kills their tasks and nothing else remembered them (us-west-011,
+        // 2026-10-09: noisetable-account-staging sat Pending for 13h).
+        #[cfg(feature = "containerd-integration")]
+        {
+            let n = ctx.resume_containerd_workloads().await;
+            tracing::info!(resumed = n, "recorded containerd deploys replayed (R964-B1)");
+        }
         // R932: and re-arm the durability tail of every container workload that
         // is still running here. The bundle resume above brings workloads BACK;
         // this one reattaches to workloads that never left — a container
@@ -660,7 +713,21 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 socket = %sock.display(),
                 "containerd backend attached"
             );
-            ctx.with_containerd(std::sync::Arc::new(backend))
+            // R964-B1: `<state-dir>/.deploys`, so a reboot or restart can replay
+            // what was running. The default sits beside `--native-exec-dir`
+            // under `/var/lib/yah/kamaji`, the tree kamaji.service's
+            // ProtectSystem=strict sandbox grants (ReadWritePaths= and
+            // StateDirectory=); a path outside it is EROFS on a real node.
+            let records_dir = args
+                .containerd_state_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(kamaji::DEFAULT_CONTAINERD_STATE_DIR));
+            ctx.with_containerd(std::sync::Arc::new(backend)).with_containerd_deploy_records(
+                kamaji_bin::deploy_records::ResumeRecords::under(
+                    kamaji_bin::deploy_records::ResumeBackend::Containerd,
+                    &records_dir,
+                ),
+            )
         } else {
             tracing::warn!(
                 "no --containerd-socket; Deploy {{ Container }} will refuse with BackendRefused. \

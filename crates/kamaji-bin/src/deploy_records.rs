@@ -1,6 +1,6 @@
 //! Deploy records: the admission input kamaji persists so a workload survives
 //! kamaji itself (R755-B5 for serve bundles, R936-B11 for native-exec, R605-F16
-//! for service-shaped microVM guests).
+//! for service-shaped microVM guests, R964-B1 for containerd image workloads).
 //!
 //! Every native workload, every served bundle and every microVM's Firecracker
 //! process lives in `kamaji.service`'s cgroup, so a kamaji restart (a reboot, a
@@ -9,7 +9,8 @@
 //! memory there is, and startup replays it through the same deploy path the
 //! original request took.
 //!
-//! **Native and microVM records are opt-in per workload** —
+//! **Containerd records are not opt-in** (an image workload that was running
+//! should be running after a reboot). **Native and microVM records are opt-in per workload** —
 //! [`workload_spec::RESUME_AFTER_RESTART_ANNOTATION`]. A workload whose
 //! placement yubaba decides (the headscale appliance follows the raft ingress
 //! owner) must never come back on a node just because it last ran there; after
@@ -126,6 +127,10 @@ pub enum ResumeBackend {
     Native,
     /// R605-F16: `yah.exec = microvm`, service-shaped guests only.
     MicroVm,
+    /// R964-B1: the containerd (image workload) backend — everything that is
+    /// neither native-exec nor microVM. Unlike the other two it is NOT opt-in:
+    /// a rebooted node otherwise silently undeploys every image workload on it.
+    Containerd,
 }
 
 impl ResumeBackend {
@@ -133,6 +138,7 @@ impl ResumeBackend {
         match self {
             Self::Native => "native deploy",
             Self::MicroVm => "microVM deploy",
+            Self::Containerd => "containerd deploy",
         }
     }
 }
@@ -165,17 +171,21 @@ impl ResumeRecord {
         mesh: Option<&kamaji_proto::MeshAssignment>,
     ) -> Option<Self> {
         let spec = workload.container_spec()?;
+        let service_shaped = !matches!(
+            spec.effective_archetype(),
+            workload_spec::LifecycleArchetype::Job
+        );
         let ours = match backend {
             ResumeBackend::Native => spec.wants_native_exec(),
-            ResumeBackend::MicroVm => {
-                spec.wants_microvm()
-                    && !matches!(
-                        spec.effective_archetype(),
-                        workload_spec::LifecycleArchetype::Job
-                    )
+            ResumeBackend::MicroVm => spec.wants_microvm() && service_shaped,
+            // R964-B1: a job's record would outlive its exit and re-run it on
+            // every restart, same as a microVM job guest.
+            ResumeBackend::Containerd => {
+                !spec.wants_native_exec() && !spec.wants_microvm() && service_shaped
             }
         };
-        (ours && spec.wants_resume_after_restart()).then(|| Self {
+        let opted_in = backend == ResumeBackend::Containerd || spec.wants_resume_after_restart();
+        (ours && opted_in).then(|| Self {
             id: id.0.clone(),
             workload: workload.clone(),
             mesh: mesh.cloned(),
@@ -336,6 +346,40 @@ mod tests {
         assert!(native_rec(&workload(&[native])).is_none());
         assert!(native_rec(&workload(&[resume])).is_none());
         assert!(native_rec(&workload(&[native, (RESUME_AFTER_RESTART_ANNOTATION, "yes")])).is_none());
+    }
+
+    /// R964-B1: an image workload is recorded with NO opt-in (a reboot must not
+    /// silently undeploy it), but a job, a native workload and a microVM are
+    /// not — each has its own store or no resume at all.
+    #[test]
+    fn service_shaped_image_workloads_are_recorded_without_opting_in() {
+        let id = WorkloadId::new("noisetable-account-staging");
+        let rec = |w: &workload_spec::Workload| {
+            ResumeRecord::for_deploy(ResumeBackend::Containerd, &id, w, None)
+        };
+        let server = Some(LifecycleArchetype::Server);
+        assert!(rec(&workload_shaped(&[], server)).is_some());
+        assert!(rec(&workload_shaped(&[], Some(LifecycleArchetype::Job))).is_none());
+        assert!(rec(&workload_shaped(&[(NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE)], server)).is_none());
+        assert!(rec(&workload_shaped(&[(NATIVE_EXEC_ANNOTATION, MICROVM_EXEC_VALUE)], server)).is_none());
+    }
+
+    /// R964-B1: record -> replay -> forget through the containerd store, the
+    /// on-disk half of "a rebooted node brings its image workloads back".
+    #[test]
+    fn containerd_records_round_trip_and_forget() {
+        let root = scratch("containerd");
+        let records = ResumeRecords::under(ResumeBackend::Containerd, &root);
+        let id = WorkloadId::new("noisetable-account-staging");
+        let w = workload_shaped(&[], Some(LifecycleArchetype::Server));
+        let rec = records.for_deploy(&id, &w, None).expect("service-shaped image is recorded");
+        records.record(&rec).unwrap();
+        let back = records.recorded();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].id, "noisetable-account-staging");
+        records.forget(&id).unwrap();
+        assert!(records.recorded().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// R605-F16: a microVM is recorded only when it opted in AND is

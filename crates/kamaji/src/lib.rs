@@ -712,6 +712,14 @@ pub fn reject_unresolved_ports(
     )
 }
 
+/// R964-B1: where kamaji records containerd deploys for replay after a restart
+/// (`<this>/.deploys`) unless `--containerd-state-dir` says otherwise. It must
+/// sit under a path `kamaji.service` makes writable (`ProtectSystem=strict`):
+/// a sibling of `--native-exec-dir /var/lib/yah/kamaji/native`, covered by the
+/// unit's `StateDirectory=yah/kamaji`. The yah CLI's
+/// `kamaji_unit_grants_every_host_path_kamaji_writes` pins this constant live.
+pub const DEFAULT_CONTAINERD_STATE_DIR: &str = "/var/lib/yah/kamaji/containerd";
+
 /// The name a workload's sole port gets when nothing named it, and the name a
 /// front door publishes when a workload has several.
 ///

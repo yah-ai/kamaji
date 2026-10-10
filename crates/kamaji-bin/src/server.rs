@@ -524,6 +524,11 @@ pub struct ServerCtx {
     /// `None` = nothing is recorded (tests, a node without `--microvm-dir`).
     #[cfg(feature = "microvm")]
     pub microvm_records: Option<crate::deploy_records::ResumeRecords>,
+    /// R964-B1: the containerd twin — every service-shaped image workload,
+    /// replayed by [`ServerCtx::resume_containerd_workloads`]. `None` = nothing
+    /// is recorded (tests, a node without a containerd backend).
+    #[cfg(feature = "containerd-integration")]
+    pub containerd_records: Option<crate::deploy_records::ResumeRecords>,
     /// Optional Firecracker microVM backend (R605-F8 / W325 §5). `None`
     /// outside the `microvm` feature build, or when kamaji is started without
     /// `--microvm-dir`.
@@ -946,6 +951,8 @@ impl ServerCtx {
             native_records: None,
             #[cfg(feature = "microvm")]
             microvm_records: None,
+            #[cfg(feature = "containerd-integration")]
+            containerd_records: None,
             #[cfg(feature = "microvm")]
             microvm: None,
         }
@@ -977,6 +984,8 @@ impl ServerCtx {
             native_records: None,
             #[cfg(feature = "microvm")]
             microvm_records: None,
+            #[cfg(feature = "containerd-integration")]
+            containerd_records: None,
             #[cfg(feature = "microvm")]
             microvm: None,
         }
@@ -1111,6 +1120,18 @@ impl ServerCtx {
         records: crate::deploy_records::ResumeRecords,
     ) -> Self {
         self.microvm_records = Some(records);
+        self
+    }
+
+    /// Record service-shaped containerd deploys under `records` (R964-B1). The
+    /// binary calls this beside [`Self::with_containerd`]; a context without it
+    /// records nothing and resumes nothing.
+    #[cfg(feature = "containerd-integration")]
+    pub fn with_containerd_deploy_records(
+        mut self,
+        records: crate::deploy_records::ResumeRecords,
+    ) -> Self {
+        self.containerd_records = Some(records);
         self
     }
 
@@ -1990,7 +2011,7 @@ fn record_resumable_deploy(
     workload: &workload_spec::Workload,
     mesh: Option<&kamaji_proto::MeshAssignment>,
 ) {
-    let stores: [Option<&crate::deploy_records::ResumeRecords>; 2] = [
+    let stores: [Option<&crate::deploy_records::ResumeRecords>; 3] = [
         #[cfg(feature = "native-exec")]
         ctx.native_records.as_ref(),
         #[cfg(not(feature = "native-exec"))]
@@ -1999,14 +2020,19 @@ fn record_resumable_deploy(
         ctx.microvm_records.as_ref(),
         #[cfg(not(feature = "microvm"))]
         None,
+        #[cfg(feature = "containerd-integration")]
+        ctx.containerd_records.as_ref(),
+        #[cfg(not(feature = "containerd-integration"))]
+        None,
     ];
     for records in stores.into_iter().flatten() {
         if let Some(rec) = records.for_deploy(id, workload, mesh) {
             if let Err(e) = records.record(&rec) {
                 warn!(
-                    id = %id.0, error = %e,
+                    id = %id.0, dir = %records.dir().display(), error = %e,
                     "workload is running but its deploy record could not be written; \
-                     it will NOT be resumed after the next kamaji restart (R936-B11/R605-F16)"
+                     it will NOT be resumed after the next kamaji restart \
+                     (R936-B11/R605-F16/R964-B1)"
                 );
             }
         }
@@ -3413,6 +3439,78 @@ impl ServerCtx {
     }
 }
 
+#[cfg(feature = "containerd-integration")]
+impl ServerCtx {
+    /// R964-B1: replay every recorded containerd deploy, the image-workload twin
+    /// of `resume_microvm_workloads`. Call once at startup, before the UDS
+    /// answers. A reboot kills every container's task; a kamaji-only restart
+    /// leaves them running, so a record whose container containerd reports
+    /// Running is adopted (its spec re-registered) and NOT redeployed.
+    ///
+    /// Replays through `deploy_container_backend` — the arm a fresh Deploy
+    /// reaches after admission and hydrate. Hydrate is deliberately not re-run
+    /// over volumes that survived on this node's disk; the durability tail is
+    /// re-armed afterwards by `tail::resume`. Returns how many are up.
+    pub async fn resume_containerd_workloads(self: &Arc<Self>) -> usize {
+        let (Some(records), Some(backend)) = (&self.containerd_records, self.containerd.clone())
+        else {
+            return 0;
+        };
+        let running: std::collections::HashSet<String> = match backend.list().await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.state == WorkloadState::Running)
+                .map(|e| e.id.0)
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "cannot list containerd workloads; replaying every record");
+                Default::default()
+            }
+        };
+        let mut resumed = 0;
+        for record in records.recorded() {
+            let id = WorkloadId::new(&record.id);
+            let Some(spec) = record.workload.container_spec() else {
+                warn!(id = %record.id, "containerd deploy record holds no container spec; skipped");
+                continue;
+            };
+            if running.contains(&record.id) {
+                info!(id = %record.id, "recorded containerd deploy already running; adopted (R964-B1)");
+                self.registry
+                    .lock()
+                    .await
+                    .set_deployed_spec(id, record.workload.clone());
+                resumed += 1;
+                continue;
+            }
+            info!(id = %record.id, "resuming recorded containerd deploy after restart (R964-B1)");
+            match deploy_container_backend(
+                self,
+                kamaji_proto::RequestId(0),
+                &id,
+                spec,
+                record.mesh.as_ref(),
+            )
+            .await
+            {
+                KamajiToYubaba::DeployAck { .. } => {
+                    self.registry
+                        .lock()
+                        .await
+                        .set_deployed_spec(id, record.workload.clone());
+                    resumed += 1;
+                }
+                other => warn!(
+                    id = %record.id, reply = ?other,
+                    "recorded containerd deploy failed to resume; its record is kept so the \
+                     next restart retries it"
+                ),
+            }
+        }
+        resumed
+    }
+}
+
 /// Materialize the W272 bundle tree from the node store (R599-F1) and resolve
 /// the serve binary path (W272 §2/§3), shared by the keep-alive and on-demand
 /// deploy paths. Returns `(bundle_dir, serve_bin)` or, as `Err`, the reason.
@@ -4642,6 +4740,19 @@ pub(crate) async fn stop_workload(
                 code: ErrorCode::BackendRefused,
                 message: format!("containerd teardown: {e}"),
             };
+        }
+        // R964-B1: a stopped workload must not come back on the next restart.
+        if let Some(records) = &ctx.containerd_records {
+            if let Err(e) = records.forget(&id) {
+                return KamajiToYubaba::Error {
+                    request_id: Some(request_id),
+                    code: ErrorCode::BackendRefused,
+                    message: format!(
+                        "containerd workload stopped but its deploy record could not be \
+                         removed (it would be resumed after the next kamaji restart): {e}"
+                    ),
+                };
+            }
         }
         // R881-T3: the namespace outlives the container unless something
         // deletes it, and with it the veth pair and the address. Deliberately
