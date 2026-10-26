@@ -5,6 +5,7 @@
 //! workload to grow a tokio runtime to answer one JSON line would make the
 //! channel cost more than the log-grepping it replaces.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,14 @@ use crate::{abstract_name, clear_stale_socket, control_sock_path, ProcStatus, ST
 /// thread. Bounded so a stuck peer costs one request's latency, not the
 /// channel.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the helper knows about its own process for certain, stamped onto any
+/// document whose producer left the field unanswered.
+struct Stamp {
+    pid: u32,
+    started: Instant,
+    env_fingerprint: BTreeMap<String, String>,
+}
 
 /// The request line. Only `cmd` is defined; unknown fields are ignored so the
 /// verb set can grow without breaking older producers.
@@ -93,12 +102,31 @@ pub fn serve_at<F>(path: impl Into<PathBuf>, status_fn: F) -> std::io::Result<Co
 where
     F: Fn() -> ProcStatus + Send + 'static,
 {
+    // Once, at bind: a process's environment is fixed from exec, so the
+    // fingerprints of what it runs with cannot change under it (R866).
+    serve_at_with(path, status_fn, crate::env_fingerprint_from_env())
+}
+
+/// [`serve_at`] with the environment fingerprints supplied rather than read
+/// from this process — the seam that keeps tests off `std::env::set_var`.
+fn serve_at_with<F>(
+    path: impl Into<PathBuf>,
+    status_fn: F,
+    env_fingerprint: BTreeMap<String, String>,
+) -> std::io::Result<ControlServer>
+where
+    F: Fn() -> ProcStatus + Send + 'static,
+{
     let path = path.into();
     let listener = bind(&path)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
-    let pid = std::process::id();
+    let stamp = Stamp {
+        pid: std::process::id(),
+        started,
+        env_fingerprint,
+    };
 
     let thread = {
         let shutdown = shutdown.clone();
@@ -110,7 +138,7 @@ where
                         return;
                     }
                     let Ok(stream) = stream else { continue };
-                    serve_connection(stream, &status_fn, pid, started);
+                    serve_connection(stream, &status_fn, &stamp);
                 }
             })?
     };
@@ -168,7 +196,7 @@ fn connect(path: &Path) -> std::io::Result<UnixStream> {
 /// Multiple requests per connection are supported even though the reference
 /// client opens a fresh connection per poll — reading to EOF is the same three
 /// lines either way, and it makes an interactive `nc` session work.
-fn serve_connection<F>(stream: UnixStream, status_fn: &F, pid: u32, started: Instant)
+fn serve_connection<F>(stream: UnixStream, status_fn: &F, stamp: &Stamp)
 where
     F: Fn() -> ProcStatus,
 {
@@ -187,10 +215,13 @@ where
                 let mut status = status_fn();
                 // Stamp what the helper knows for certain, when the producer
                 // did not answer it itself.
-                status.pid.get_or_insert(pid);
+                status.pid.get_or_insert(stamp.pid);
                 status
                     .uptime_secs
-                    .get_or_insert_with(|| started.elapsed().as_secs());
+                    .get_or_insert_with(|| stamp.started.elapsed().as_secs());
+                if status.env_fingerprint.is_empty() {
+                    status.env_fingerprint = stamp.env_fingerprint.clone();
+                }
                 serde_json::to_string(&status)
                     .unwrap_or_else(|e| error_line(&format!("status not serializable: {e}")))
             }
@@ -288,6 +319,31 @@ mod tests {
         let got = ask_status(server.path());
         assert_eq!(got.pid, Some(std::process::id()));
         assert!(got.uptime_secs.is_some());
+    }
+
+    /// R866: a producer that never heard of fingerprints still reports them,
+    /// because the helper computed them from its environment at bind.
+    #[test]
+    fn env_fingerprints_are_stamped_when_the_producer_omits_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("control.sock");
+        let fp: BTreeMap<String, String> =
+            [("R2_SECRET".to_string(), crate::env_fingerprint("k", "v"))].into();
+        let server =
+            serve_at_with(&sock, || ProcStatus::new(ProcState::Running), fp.clone()).unwrap();
+        assert_eq!(ask_status(server.path()).env_fingerprint, fp);
+    }
+
+    /// No fingerprints asked for → none reported, and the field stays off the
+    /// wire entirely.
+    #[test]
+    fn an_unconfigured_process_emits_no_env_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("control.sock");
+        let server =
+            serve_at_with(&sock, || ProcStatus::new(ProcState::Running), BTreeMap::new())
+                .unwrap();
+        assert!(!ask(server.path(), r#"{"cmd":"status"}"#).contains("env_fingerprint"));
     }
 
     #[test]

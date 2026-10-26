@@ -149,6 +149,8 @@ fn node_capabilities_required_fields_are_a_deliberate_set() {
             detail: Some("permission denied".into()),
         },
         log_stream: true,
+        exec: true,
+        arm_tail: true,
     };
     // A capability nobody reported must not read as one somebody did — see
     // NodeCapabilities' doc. These two stay loud.

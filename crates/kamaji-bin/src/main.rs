@@ -643,6 +643,8 @@ fn run() -> Result<()> {
         {
             let n = ctx.resume_containerd_workloads().await;
             tracing::info!(resumed = n, "recorded containerd deploys replayed (R964-B1)");
+            // R971-B11: and keep them up per their restart_policy.
+            kamaji_bin::restart::spawn(ctx.clone());
         }
         // R932: and re-arm the durability tail of every container workload that
         // is still running here. The bundle resume above brings workloads BACK;

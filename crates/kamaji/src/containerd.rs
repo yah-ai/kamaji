@@ -922,6 +922,9 @@ impl Kamaji for ContainerdRuntime {
                 ..Default::default()
             },
         );
+        // R971-B10: named-volume dirs are kamaji's own; create before checking.
+        kcc::ensure_named_volume_dirs(spec)
+            .with_context(|| format!("workload {}", spec.expose.mesh.identity.0))?;
         if let Err(message) = kcc::check_bind_sources(&preflight) {
             anyhow::bail!("workload {}: {message}", spec.expose.mesh.identity.0);
         }

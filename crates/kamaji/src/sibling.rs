@@ -406,6 +406,27 @@ impl KamajiClient {
         }
     }
 
+    /// `YubabaToKamaji::ArmTail` (R977-B15) — arm the durability tail kamaji
+    /// held on restart for a floater, once yubaba's leader has confirmed this
+    /// node still owns it. Send only to a kamaji whose
+    /// [`NodeCapabilities::arm_tail`] is set.
+    pub async fn arm_tail(&self, id: &WorkloadId) -> Result<(), ClientError> {
+        let request_id = self.next_request_id();
+        let reply = self
+            .request(
+                YubabaToKamaji::ArmTail {
+                    request_id,
+                    id: id.clone(),
+                },
+                request_id,
+            )
+            .await?;
+        match reply {
+            KamajiToYubaba::Ack { .. } => Ok(()),
+            other => Err(ClientError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
     /// `YubabaToKamaji::Drain` — structured drain with a deadline budget.
     /// Returns `(accepted, reason)` from Kamaji's synchronous `DrainAck`.
     pub async fn drain(
@@ -731,6 +752,107 @@ impl LogFollow {
     }
 }
 
+/// An `Exec` run on its own **dedicated** UDS connection (R969-F7) — the
+/// [`LogFollow`] shape, for the same reason. Gate on
+/// [`NodeCapabilities::exec`] first.
+pub struct ExecRun {
+    rd: OwnedReadHalf,
+    _wr: OwnedWriteHalf,
+    buf: Vec<u8>,
+    request_id: RequestId,
+    done: bool,
+}
+
+impl ExecRun {
+    /// Connect, handshake, and send `Exec { id, argv, env }`.
+    pub async fn open(
+        socket: &Path,
+        id: WorkloadId,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> Result<Self, ClientError> {
+        let stream = UnixStream::connect(socket).await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let mut buf = Vec::with_capacity(4096);
+        write_frame(
+            &mut wr,
+            &YubabaToKamaji::Hello {
+                version: ProtocolVersion::CURRENT,
+            },
+        )
+        .await?;
+        match read_frame(&mut rd, &mut buf).await? {
+            KamajiToYubaba::Welcome { .. } => {}
+            KamajiToYubaba::Error { code, message, .. } => {
+                return Err(ClientError::Remote { code, message })
+            }
+            other => return Err(ClientError::Unexpected(format!("{other:?}"))),
+        }
+        let request_id = RequestId(1);
+        write_frame(
+            &mut wr,
+            &YubabaToKamaji::Exec {
+                request_id,
+                id,
+                argv,
+                env,
+            },
+        )
+        .await?;
+        Ok(Self {
+            rd,
+            _wr: wr,
+            buf,
+            request_id,
+            done: false,
+        })
+    }
+
+    /// The next event; `Ok(None)` after `Exit`. A connection that closes
+    /// before `Exit` is `Err(PeerClosed)` — a dropped run, never a finish.
+    pub async fn next(&mut self) -> Result<Option<crate::ExecEvent>, ClientError> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            match read_frame(&mut self.rd, &mut self.buf).await? {
+                KamajiToYubaba::ExecOutput {
+                    request_id,
+                    stream,
+                    data,
+                } if request_id == self.request_id => {
+                    let stream = match stream {
+                        kamaji_proto::LogStreamTag::Stdout => crate::LogStreamKind::Stdout,
+                        kamaji_proto::LogStreamTag::Stderr => crate::LogStreamKind::Stderr,
+                    };
+                    return Ok(Some(crate::ExecEvent::Output { stream, data }));
+                }
+                KamajiToYubaba::ExecExit { request_id, code } if request_id == self.request_id => {
+                    self.done = true;
+                    return Ok(Some(crate::ExecEvent::Exit { code }));
+                }
+                KamajiToYubaba::Error { code, message, .. } => {
+                    return Err(ClientError::Remote { code, message })
+                }
+                KamajiToYubaba::WorkloadStarted { .. } | KamajiToYubaba::WorkloadExited { .. } => {}
+                other => return Err(ClientError::Unexpected(format!("{other:?}"))),
+            }
+        }
+    }
+}
+
+/// `UnknownWorkload` from Kamaji is the typed [`crate::ExecError::NotRunning`];
+/// anything else stays a plain error.
+fn exec_client_error(ident: &crate::MeshIdent, e: ClientError) -> anyhow::Error {
+    match e {
+        ClientError::Remote {
+            code: ErrorCode::UnknownWorkload,
+            ..
+        } => crate::ExecError::NotRunning(ident.0.clone()).into(),
+        other => anyhow::anyhow!("kamaji exec_in_workload: {other}"),
+    }
+}
+
 // ── Kamaji trait impl ──────────────────────────────────────────────────────
 //
 // Bridges the `Kamaji` trait (W199 caller contract) to the sibling-shape
@@ -1022,6 +1144,54 @@ impl crate::Kamaji for KamajiClient {
         self.stop(&id)
             .await
             .map_err(|e| anyhow::anyhow!("kamaji teardown_workload: {e}"))
+    }
+
+    /// R969-F7: an [`ExecRun`] on a dedicated connection, gated on the
+    /// daemon's `exec` capability so an older Kamaji is refused as
+    /// [`crate::ExecError::Unsupported`] instead of dropping the connection.
+    async fn exec_in_workload(
+        &self,
+        ident: &crate::MeshIdent,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> anyhow::Result<crate::ExecStream> {
+        let caps = self
+            .capabilities()
+            .await
+            .map_err(|e| anyhow::anyhow!("kamaji exec_in_workload: capabilities: {e}"))?;
+        if !caps.exec {
+            return Err(crate::ExecError::Unsupported(self.backend()).into());
+        }
+        let mut run = ExecRun::open(&self.socket, WorkloadId::new(&ident.0), argv, env)
+            .await
+            .map_err(|e| exec_client_error(ident, e))?;
+        // The first frame decides between "refused" and "running": a refusal
+        // surfaces as this call's error (so `/exec` can answer 409), not as a
+        // stream that ends on its first item.
+        let first = run.next().await.map_err(|e| exec_client_error(ident, e))?;
+        let ident = ident.clone();
+        let (tx, rx) = mpsc::channel::<anyhow::Result<crate::ExecEvent>>(64);
+        tokio::spawn(async move {
+            let mut item = first;
+            loop {
+                match item {
+                    Some(ev) => {
+                        if tx.send(Ok(ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => return,
+                }
+                item = match run.next().await {
+                    Ok(next) => next,
+                    Err(e) => {
+                        let _ = tx.send(Err(exec_client_error(&ident, e))).await;
+                        return;
+                    }
+                };
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     async fn health(&self) -> anyhow::Result<crate::RuntimeHealth> {
@@ -1949,5 +2119,77 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(f.next().await, Err(ClientError::PeerClosed)));
+    }
+
+    /// R969-F7: `Exec` streams output frames then one exit frame.
+    #[tokio::test]
+    async fn exec_run_streams_output_then_exit() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let req = conn.recv().await;
+            let YubabaToKamaji::Exec {
+                request_id,
+                id,
+                argv,
+                env,
+            } = req
+            else {
+                panic!("expected Exec, got {req:?}")
+            };
+            assert_eq!(id.as_str(), "forge.a");
+            assert_eq!(argv, vec!["ls".to_string()]);
+            assert_eq!(env, vec![("A".to_string(), "1".to_string())]);
+            conn.send(&KamajiToYubaba::ExecOutput {
+                request_id,
+                stream: kamaji_proto::LogStreamTag::Stderr,
+                data: b"oops\n".to_vec(),
+            })
+            .await;
+            conn.send(&KamajiToYubaba::ExecExit {
+                request_id,
+                code: 2,
+            })
+            .await;
+        })
+        .await;
+        let mut run = ExecRun::open(
+            &sock,
+            WorkloadId::new("forge.a"),
+            vec!["ls".into()],
+            vec![("A".into(), "1".into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run.next().await.unwrap(),
+            Some(crate::ExecEvent::Output {
+                stream: crate::LogStreamKind::Stderr,
+                data: b"oops\n".to_vec()
+            })
+        );
+        assert_eq!(run.next().await.unwrap(), Some(crate::ExecEvent::Exit { code: 2 }));
+        assert_eq!(run.next().await.unwrap(), None);
+    }
+
+    /// R969-F7: Kamaji's `UnknownWorkload` refusal is the typed NotRunning.
+    #[tokio::test]
+    async fn exec_unknown_workload_maps_to_not_running() {
+        let (_tmp, sock) = scripted_server(|mut conn| async move {
+            let _ = conn.recv().await;
+            conn.send(&KamajiToYubaba::Error {
+                request_id: Some(RequestId(1)),
+                code: ErrorCode::UnknownWorkload,
+                message: "gone".into(),
+            })
+            .await;
+        })
+        .await;
+        let mut run = ExecRun::open(&sock, WorkloadId::new("w"), vec!["true".into()], vec![])
+            .await
+            .unwrap();
+        let err = exec_client_error(&crate::MeshIdent("w".into()), run.next().await.unwrap_err());
+        assert!(matches!(
+            err.downcast_ref::<crate::ExecError>(),
+            Some(crate::ExecError::NotRunning(_))
+        ));
     }
 }

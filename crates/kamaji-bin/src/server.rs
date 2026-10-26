@@ -147,7 +147,7 @@
 //! @yah:verify("VERIFY #1 (sharing is the whole point) is pinned by two_vanilla_bundles_at_one_version_fetch_the_runtime_once: two distinct vanilla digests deployed to one node cache, counting GETs of the runtime blob specifically. Asserts exactly 1.")
 //! @yah:verify("VERIFY #2 (fail loudly, no fallback) is pinned by an_unfetchable_runtime_version_fails_naming_version_and_location: the failed DeployStatus detail must contain the version, the triple, and the key it looked for; plus versions_do_not_alias proves a cached 0.8.19 never stands in for an unpublished 0.8.20.")
 //! @yah:verify("Content-addressed check before exec is pinned by tampered_bytes_are_refused_and_never_written (swap the blobs bytes under its address -> HashMismatch, and the resolved path does not exist afterwards) and a_misfiled_asset_manifest_is_refused.")
-//! @yah:verify("cargo xtask install: /Users/leif/.local/bin/yah, build id yah 0.8.22+cf7a7291-dirty. yah cloud bundle publish-runtime --help renders. NOTE the install printed a W298 SUSPECT RESULT (two peer edits landed mid-build, in files unrelated to this ticket) - the binary installed and the verb works, but the build ran against a tree that moved.")
+//! @yah:verify("cargo xtask install: ~/.local/bin/yah, build id yah 0.8.22+cf7a7291-dirty. yah cloud bundle publish-runtime --help renders. NOTE the install printed a W298 SUSPECT RESULT (two peer edits landed mid-build, in files unrelated to this ticket) - the binary installed and the verb works, but the build ran against a tree that moved.")
 //! @yah:gotcha("The published runtime asset must be the WHOLE mesofact binary, not a serve-only build. kamaji forks it as BIN serve --bundle DIR --listen ADDR (W174 made mesofact subcommand-driven), so a binary taking --bundle as argv[1] exits on an unknown argument before it ever binds and kamaji logs nothing useful. The publish-runtime help says so; the file is named serve because that is the slot, not the subcommand.")
 //!
 //! @yah:ticket(R755-B5, "kamaji does not resume keep-alive bundle workloads after a restart — every control-plane roll takes the node's sites down until an apply")
@@ -191,7 +191,7 @@
 //! @yah:handoff("LEADER DECISION, so the ticket's three-way \"which identity to match on\" question is settled: option (c) + (a) — an explicit required scope on the arm that REFUSES to activate without one, resolved to the per-service bundle digest for the match. Option (b) (ask kamaji by pid) was rejected as adding a runtime round-trip to a bash script for something already present in the serve argv. The install half was deliberately left shared and unchanged: one runtime asset backs every tenant naming that version, and that is correct for a runtime tier — the bug was only that ACTIVATION converted a shared-bytes change into a shared-outage change.")
 //! @yah:verify("LIVE MEASUREMENT, four real ships against us-east-001 (0.8.36-h12/h13/h14/h15), asserted on pid rather than on a log line as the ticket demanded. yah-marketing re-forked 611260,611273 -> 617664,617671 -> 617987,617998 -> 618240,618253 -> 619423,619436 while noisetable's pid 614524 stayed UNCHANGED throughout, confirmed by both pid and `ps -o lstart`. noisetable's probe: zero non-200s across 200 samples. yah.dev cost exactly 1x502 per activation — its own restart, which is in-scope and expected. Before the fix the same ship re-forked all three processes.")
 //! @yah:gotcha("THE FIRST LIVE SHIP EXPOSED TWO REPORTING BUGS IN THE NEW ARM AND BOTH WERE FIXED IN THE SAME PASS, which is worth knowing because both would have made a correct ship look wrong: a `kill -0` EPERM false alarm, and a fixed `sleep 3` that read pid state inside the 5s stop grace and so saw a partial set. The \"service not deployed on this node\" case was also changed from aborting a multi-node roll to a loud skip, matching the `unit:` arm's stated convention. Deploy-state reads were routed through sudo so that R876-B9's permission fix will not silently disarm this arm — that coupling is deliberate and B9 must not undo it.")
-//! @yah:gotcha("NOISETABLE R131-T19 IS BLOCKED ON ONE YAH-SIDE ACTION AND CANNOT PROCEED WITHOUT IT. The account-scoped R2 admin pair was rotated on 2026-09-10 (option A: mint the replacement, write both vault slots, leave the old token alive so nothing goes down). The vault is correct and unchanged — `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives f293d33294250d04 and cloudflare-r2-secret-key gives 8d0ad8c9470d48df. But /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 still carries the OLD value inline as MESOFACT_S3_ACCESS_KEY_ID — re-measured 2026-09-11T06:02Z, it hashes to 38da59ad427a7e1f. THE ASK: re-apply the yah-marketing mirror from a host whose vault holds the new pair, so that field stops hashing to 38da59ad427a7e1f and starts matching f293d33294250d04. It is materialized by `yah cloud apply` out of those same slots (app/yah/cli/src/cloud.rs, revalidate-receiver block) and nothing in the noisetable repo can do it. UNTIL THEN THE DISCLOSURE STAYS OPEN: the outgoing Cloudflare token 92414fa46ea2b8a5f06df51bae1a3512, name `yah-dev-1a3512`, issued 2026-05-26, is account-wide and deliberately still ALIVE. Deleting it before the re-apply breaks yah-marketing revalidate. AND ONE THING ONLY THE YAH CAMP KNOWS: that token is account-wide and the noisetable camp never enumerated its yah-side users — before it is deleted, someone on your side needs to confirm it was only ever the R2 admin pair. FILING NOTE from the courier that wrote this: R131-T19's next-step cites THIS ticket as \"already owns the exposure record\", which looks like a mis-citation — R876-B9 is the ticket carrying the credential-exposure/rotation record (its own gotcha names MESOFACT_S3_ACCESS_KEY_ID in this exact deploy file and says the secrets stay disclosed until rotated), while R876-B5 is the hotship activation-scoping bug. Mirror this onto R876-B9 if that is where the yah camp actually tracks it.")
+//! @yah:gotcha("NOISETABLE R131-T19 IS BLOCKED ON ONE YAH-SIDE ACTION AND CANNOT PROCEED WITHOUT IT. The account-scoped R2 admin pair was rotated on 2026-09-10 (option A: mint the replacement, write both vault slots, leave the old token alive so nothing goes down). The vault is correct and unchanged — `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives <fingerprint> and cloudflare-r2-secret-key gives <fingerprint>. But /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 still carries the OLD value inline as MESOFACT_S3_ACCESS_KEY_ID — re-measured 2026-09-11T06:02Z, it hashes to <fingerprint>. THE ASK: re-apply the yah-marketing mirror from a host whose vault holds the new pair, so that field stops hashing to <fingerprint> and starts matching <fingerprint>. It is materialized by `yah cloud apply` out of those same slots (app/yah/cli/src/cloud.rs, revalidate-receiver block) and nothing in the noisetable repo can do it. UNTIL THEN THE DISCLOSURE STAYS OPEN: the outgoing Cloudflare token <cf-token-id>, name `yah-dev-1a3512`, issued 2026-05-26, is account-wide and deliberately still ALIVE. Deleting it before the re-apply breaks yah-marketing revalidate. AND ONE THING ONLY THE YAH CAMP KNOWS: that token is account-wide and the noisetable camp never enumerated its yah-side users — before it is deleted, someone on your side needs to confirm it was only ever the R2 admin pair. FILING NOTE from the courier that wrote this: R131-T19's next-step cites THIS ticket as \"already owns the exposure record\", which looks like a mis-citation — R876-B9 is the ticket carrying the credential-exposure/rotation record (its own gotcha names MESOFACT_S3_ACCESS_KEY_ID in this exact deploy file and says the secrets stay disclosed until rotated), while R876-B5 is the hotship activation-scoping bug. Mirror this onto R876-B9 if that is where the yah camp actually tracks it.")
 //!
 //! @yah:ticket(R605-T27, "No remote surface reports whether a node attached the microVM backend — the kvm probe is in-process only")
 //! @yah:status(review)
@@ -218,25 +218,25 @@
 //! @yah:at(2026-09-11T19:15:50Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R876)
-//! @yah:next("THE ASK, and it is the whole ticket: ENUMERATE THE YAH-SIDE CONSUMERS of Cloudflare API token id 92414fa46ea2b8a5f06df51bae1a3512, name `yah-dev-1a3512`, issued 2026-05-26 — then either (a) confirm it is safe to delete, or (b) name the consumers that still read it so they can be moved to the new pair first. The deletion itself is noisetable R131-T19 step 4 and is that camp's to perform once this answer exists; this ticket owes the ANSWER, not the deletion. DO NOT DELETE ANYTHING under this ticket.")
-//! @yah:gotcha("WHY THE NOISETABLE CAMP CANNOT ANSWER THIS ITSELF. That token is ACCOUNT-WIDE (Cloudflare account 3948dc292e724e71b0deefde0ea95999, three account-scoped groups: Workers R2 Storage Write bf7481a1826f439697cb59a20b22293e, R2 Data Catalog Write d229766a2f7f4d299f20eaa8c9b1fde9, R2 SQL Read f45430d92e2b4a6cb9f94f2594c141b8). Noisetable R131-T19 only ever proved it was the pair behind NOISETABLE's r2 vault slots; it never enumerated yah-side users, and nothing in the noisetable repo can see them. Deleting it blind breaks an unrelated yah service with NO WAY BACK: the S3 secret is SHA-256 of a token value that Cloudflare shows once and stores nowhere, so a deleted token cannot be reconstructed from anything either camp holds.")
-//! @yah:gotcha("STATE OF THE ROTATION, so the enumerator knows what is already safe. noisetable R131-T19 rotated the Cloudflare R2 admin pair; its steps 1-3 are DONE and independently verified. THE REPLACEMENT PAIR IS ALREADY LIVE IN THE VAULT: `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives f293d33294250d04 and cloudflare-r2-secret-key gives 8d0ad8c9470d48df — every slot-name consumer is already on the new pair, and the yah-marketing deploy record on us-east-001 was re-applied to match. THE OLD PAIR IS PARKED at vault slots `cloudflare-r2-access-key-id-pre-r131t19` / `cloudflare-r2-secret-key-pre-r131t19` (fingerprints 38da59ad427a7e1f / 9198605d52642726) and those parked slots are THE ONLY WAY BACK if a consumer turns out to still need the old value — they exist for exactly that reason and must not be deleted before this enumeration is answered. So the enumeration is looking for consumers that read the token VALUE by some route other than the vault slot names: anything with an inline/baked copy, a separate secret store, a CI or workflow secret, or a machine-local env file.")
+//! @yah:next("THE ASK, and it is the whole ticket: ENUMERATE THE YAH-SIDE CONSUMERS of Cloudflare API token id <cf-token-id>, name `yah-dev-1a3512`, issued 2026-05-26 — then either (a) confirm it is safe to delete, or (b) name the consumers that still read it so they can be moved to the new pair first. The deletion itself is noisetable R131-T19 step 4 and is that camp's to perform once this answer exists; this ticket owes the ANSWER, not the deletion. DO NOT DELETE ANYTHING under this ticket.")
+//! @yah:gotcha("WHY THE NOISETABLE CAMP CANNOT ANSWER THIS ITSELF. That token is ACCOUNT-WIDE (Cloudflare account 0123456789abcdef0123456789abcdef, three account-scoped groups: Workers R2 Storage Write bf7481a1826f439697cb59a20b22293e, R2 Data Catalog Write d229766a2f7f4d299f20eaa8c9b1fde9, R2 SQL Read f45430d92e2b4a6cb9f94f2594c141b8). Noisetable R131-T19 only ever proved it was the pair behind NOISETABLE's r2 vault slots; it never enumerated yah-side users, and nothing in the noisetable repo can see them. Deleting it blind breaks an unrelated yah service with NO WAY BACK: the S3 secret is SHA-256 of a token value that Cloudflare shows once and stores nowhere, so a deleted token cannot be reconstructed from anything either camp holds.")
+//! @yah:gotcha("STATE OF THE ROTATION, so the enumerator knows what is already safe. noisetable R131-T19 rotated the Cloudflare R2 admin pair; its steps 1-3 are DONE and independently verified. THE REPLACEMENT PAIR IS ALREADY LIVE IN THE VAULT: `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives <fingerprint> and cloudflare-r2-secret-key gives <fingerprint> — every slot-name consumer is already on the new pair, and the yah-marketing deploy record on us-east-001 was re-applied to match. THE OLD PAIR IS PARKED at vault slots `cloudflare-r2-access-key-id-pre-r131t19` / `cloudflare-r2-secret-key-pre-r131t19` (fingerprints <fingerprint> / <fingerprint>) and those parked slots are THE ONLY WAY BACK if a consumer turns out to still need the old value — they exist for exactly that reason and must not be deleted before this enumeration is answered. So the enumeration is looking for consumers that read the token VALUE by some route other than the vault slot names: anything with an inline/baked copy, a separate secret store, a CI or workflow secret, or a machine-local env file.")
 //! @yah:gotcha("WHY THIS IS ITS OWN TICKET RATHER THAN THE NOTE IT WAS. This ask previously sat only as a gotcha appended to R876-B9 (and mirrored on R876-B5). R876-B9 is at status `review` — a dead-letter box, where an appended gotcha reaches nobody but a signing reviewer and is stripped from source when the ticket archives. The ask has been MOVED here so it is claimable and has an owner; R876-B9's copy stays as provenance, not as the live home. Tier: Cleric — a bounded read-only audit (vault slots, infra TOML, cloud-init, CI/QED secrets, Cloudflare's own token audit log) ending in a yes/no with named consumers; careful and cross-cutting, but no design work and no code change.")
-//! @yah:verify("DONE = a written verdict on this ticket naming either \"no yah-side consumer of 92414fa46ea2b8a5f06df51bae1a3512 remains, safe to delete\" or the specific consumers that still read it, with how each was checked (vault slot fingerprints, grep over .yah/infra and cloud-init, QED/CI secret stores, and Cloudflare's own token last-used / audit record for that id). Fingerprint form that prints no secret: `yah keys get <slot> | shasum -a 256 | cut -c1-16` — the old pair is 38da59ad427a7e1f / 9198605d52642726, the new pair f293d33294250d04 / 8d0ad8c9470d48df. NO SECRET VALUE SHOULD BE PRINTED OR READ INTO CONTEXT at any point; hash on the remote host, compare hashes only. Nothing is deleted by this ticket.")
-//! @yah:handoff("VERDICT (audit 2026-09-11, read-only, nothing deleted/revoked/rotated): NOT SAFE TO DELETE. Cloudflare API token 92414fa46ea2b8a5f06df51bae1a3512 (`yah-dev-1a3512`) still has FOUR live yah-side consumers that read its derived R2 pair by a route OTHER than the vault slot names, on three fleet nodes plus this workstation. Cloudflare's own record confirms the token is still real and armed: GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/92414fa46ea2b8a5f06df51bae1a3512 (authenticated with the `cloudflare-legacy-yah` vault slot; `cloudflare-api-token` returns 9109 Unauthorized for this endpoint) returns status=active, name=yah-dev-1a3512, issued_on=2026-05-26T03:52:19Z, expires_on=null, last_used_on=NULL. CAUTION ON THAT NULL: do NOT read `last_used_on: null` as \"nobody uses it\". That field tracks api.cloudflare.com bearer-auth calls; the consumers found below authenticate to R2 over the S3 protocol with the derived access-key/secret pair, which is a different code path (this last clause is INFERENCE from the field's meaning, not from Cloudflare docs I read - but the consumers themselves are directly measured and are decisive on their own).")
-//! @yah:handoff("CONSUMER 1 - us-east-001 (debian@51.81.85.145), yah-scryer.service, ACTIVE+ENABLED, ExecMainStartTimestamp Fri 2026-09-11 06:57:22 UTC. `systemctl show yah-scryer.service -p EnvironmentFiles` returns `/etc/yah/scryer-r2.env (ignore_errors=no)`. That file (root:root 0600, mtime Sep 10 07:46) holds CF_R2_ACCESS_KEY_ID and CF_R2_SECRET_KEY; hashed ON THE HOST they are 38da59ad427a7e1f / 9198605d52642726 = THE OLD PAIR. TRAP FOR THE NEXT READER: the main unit /etc/systemd/system/yah-scryer.service contains NO EnvironmentFile= directive - only a comment mentioning one - so reading the unit file alone says \"not wired\" and is WRONG. The directive lives in the drop-in /etc/systemd/system/yah-scryer.service.d/10-snapshot-producer.conf, which also sets --long-tier-bucket yah-analytics --r2-account 3948dc292e724e71b0deefde0ea95999 --snapshot-interval-secs 300. So this node is authenticating to R2 with the old pair every 5 minutes right now; deleting the token stops the yah-analytics long-tier snapshot producer. Two stale copies of the unit sit beside it (yah-scryer.service.rollback-20260911, .rollback-20260908); neither carries an EnvironmentFile= line.")
-//! @yah:handoff("CONSUMERS 2-4 - us-west-011, us-west-013, us-west-014 all carry /etc/yah-cloud/litestream.env (root:root 0600, mtime Sep 8 20:02 on 011) holding LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY; hashed ON EACH HOST they are 38da59ad427a7e1f / 9198605d52642726 = THE OLD PAIR on all three. Two units reference it on each node: /etc/systemd/system/yubaba.service.d/50-r858t5.conf (a drop-in whose own header calls itself TEMPORARY, an R858-T5 dev-cluster exercise of the litestream restore-before-serve leg) and /etc/systemd/system/litestream-headscale.service. Measured states: us-west-011 yubaba.service ACTIVE+ENABLED since 2026-09-10 08:45:57 BST, litestream-headscale INACTIVE; us-west-013 yubaba.service ACTIVE since 2026-09-10 08:46:07 BST AND litestream-headscale.service ACTIVE - this is the hottest one, a replicator actually running against R2 on the old pair; us-west-014 yubaba.service ACTIVE since 2026-09-10 08:45:45 BST, litestream-headscale INACTIVE. `systemctl show yubaba.service -p EnvironmentFiles` on all three lists /etc/yah-cloud/litestream.env, so the old pair is in the live process environment on every one.")
-//! @yah:handoff("CONSUMER 5 (workstation, not a service but the most complete copy anywhere) - /Users/leif/ss/yah/.env, untracked and gitignored (.gitignore:22), mtime Aug 9 15:31, is the ONLY file in the whole tree carrying this credential. Line 6 R2_ACCESS_KEY fingerprints to 38da59ad427a7e1f, line 7 R2_SECRET_KEY to 9198605d52642726 - the old pair - and line 8 R2_TOKEN is the RAW CLOUDFLARE TOKEN VALUE ITSELF (53 chars, `cfat_` prefix). PROVEN BY DERIVATION, not assumed: sha256(R2_TOKEN) hashes to 9198605d52642726, i.e. it is exactly the preimage of the R2 secret access key, which is how Cloudflare derives an R2 secret from a token value. ALSO PROVEN: sha256(\"92414fa46ea2b8a5f06df51bae1a3512\") = 38da59ad427a7e1f, so the R2 access-key-id IS the token id and any host carrying that literal is carrying this credential - that identity is what made the fleet grep decisive. TWO CONSEQUENCES. (a) This file is a SECOND way back, independent of the parked `-pre-r131t19` vault slots, and unlike them it holds the one-time-shown token VALUE that Cloudflare stores nowhere - worth knowing before anyone treats the parked slots as the single point of recovery. (b) It is sourced wholesale into the camp environment by app/yah/desktop/camp-env.sh:47-49 and app/yah/desktop/install-mac.sh:152-153 (`set -a; . \"$root/.env\"; set +a`), so R2_ACCESS_KEY / R2_SECRET_KEY / R2_TOKEN are exported into every process those launch.")
-//! @yah:handoff("SURFACES CHECKED AND CLEAN. (1) VAULT - `yah keys list` gives 50 slots; all 17 Cloudflare/R2-suggestive ones fingerprinted. cloudflare-r2-access-key-id = f293d33294250d04 and cloudflare-r2-secret-key = 8d0ad8c9470d48df (both NEW, correct); the two -pre-r131t19 slots = 38da59ad427a7e1f / 9198605d52642726 (OLD, parked as designed); NO OTHER SLOT matches the old pair. I also ran a derivation test on every slot - sha256(slot value) then fingerprint, compared against 9198605d52642726 - to catch any slot secretly holding the raw token value: zero matches, so `cloudflare-api-token` (fp eff3bd48b192aba7) is a DIFFERENT token, as are the account-backup / cert-store / fleet-read pairs. (2) REPO LITERALS - swept for the token id, `yah-dev-1a3512`, the account id, `cfat_`/`cfut_` token shapes and every R2/CF env var name across the tree including oss/ and dotfile dirs; the ONLY file carrying this credential is ./.env (session transcripts under .yah/sessions and .yah/forms excluded as agent scrollback, not consumers). (3) .yah/infra - machines/*.toml, state/bundles, providers/cloudflare.toml: no baked credential, account id only. (4) .yah/qed - every reference goes through vault slots or the CF_R2_* env fallback (yah-release.toml:32-33, yah-cli-release.toml:112, yah-desktop-release.toml:388); no inline value. (5) us-east-001's yah-marketing deploy record - I RE-VERIFIED the R876-B9 re-apply landed: /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json now has MESOFACT_S3_ACCESS_KEY_ID = f293d33294250d04 and MESOFACT_S3_SECRET_ACCESS_KEY = 8d0ad8c9470d48df (NEW pair). Its CLOUDFLARE_API_TOKEN field fingerprints to eff3bd48b192aba7 = the `cloudflare-api-token` slot, a different token, NOT this one. The older gotcha on oss/kamaji/crates/kamaji-bin/src/server.rs:195 saying that field still hashes to 38da59ad427a7e1f is now STALE. (6) us-south-001, us-west-001, us-west-002, us-west-003, us-west-015 - no /etc/yah/scryer-r2.env, no /etc/yah-cloud/litestream.env, no occurrence of the old access-key-id or any cfat_ literal under /etc, /var/lib/yah, /opt, /root, /home. (7) Workstation outside the repo - ~/.config, ~/.aws, ~/.local/share, ~/Library/Application Support/yah: clean.")
-//! @yah:handoff("GAPS I COULD NOT CLOSE, stated plainly rather than guessed. (A) GITHUB REPO SECRETS on yah-ai/yah - `gh secret list -R yah-ai/yah` shows CF_R2_ACCESS_KEY_ID, CF_R2_SECRET_KEY, CF_R2_ACCOUNT_ID, CLOUDFLARE_TOKEN and R2_ACCESS_KEY, EVERY ONE last updated 2026-06-19T22:40Z - i.e. after this token was issued (2026-05-26) and nearly three months BEFORE the 2026-09-10 rotation. GitHub Actions secrets are write-only by design, so I could not fingerprint them and CANNOT prove which pair they hold; the dates are strong circumstantial evidence they still hold the OLD one. They are consumed by .github/workflows/fleet-index.yml:153-156 (as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY against the R2 endpoint) and .github/workflows/smoke.yml:86,129. Per CLAUDE.md no workflow in this repo has an `on: push` trigger any more, so these are dormant-but-dispatchable: deleting the token would not break a push, it would break the next manual `workflow_dispatch`. Settling this needs someone who can re-set those secrets, not someone who can read them. `gh secret list --org yah-ai` returned HTTP 403 (not an org admin), so ORG-LEVEL secrets are entirely unchecked. (B) LATENT, NOT LIVE - app/yah/web/dashboard/mesofact.config.toml:21-23 names access_key_id_env = \"R2_ACCESS_KEY\" / secret_access_key_env = \"R2_SECRET_KEY\" / api_token_env = \"CLOUDFLARE_KEY\", which are EXACTLY the names ./.env exports with the old pair, so a publish from this workstation would sign with the old credential. It is dormant only because the same file still carries the unsubstituted `endpoint = \"https://ACCOUNT_ID.r2.cloudflarestorage.com\"` / `zone_id = \"ZONE_ID\"` placeholders - the identical R330-T35 landmine already defused in marketing's and analytics' configs but NOT in dashboard's. Note this corrects a claim in the crates/yah/hub/src/in_process.rs:103 handoff that \"nothing in the tree sets any of the three\": ./.env sets two of them and camp-env.sh exports them. (C) SIDE FINDING, different credential, out of scope for the deletion but should not go unreported - .yah/forms/01KSJH81803BHCCTVXWSBXEJJ3.json (and several sibling form records) contain a literal `cfut_` bearer token in plaintext in the recorded command. It fingerprints to 3e9091fc44f7060b, which equals both the `cloudflare-legacy-yah` vault slot and ./.env's CLOUDFLARE_KEY. It is NOT 92414fa46ea2b8a5f06df51bae1a3512, so it does not change this verdict, but it is a live Cloudflare credential sitting unencrypted in approval-form scrollback and deserves its own ticket.")
-//! @yah:handoff("WHAT NOISETABLE R131-T19 STEP 4 NEEDS BEFORE IT CAN PROCEED, in dependency order. (1) Rewrite /etc/yah/scryer-r2.env on us-east-001 with the new pair and restart yah-scryer.service. (2) Rewrite /etc/yah-cloud/litestream.env on us-west-011, us-west-013 and us-west-014 with the new pair and restart yubaba.service on all three plus litestream-headscale.service on us-west-013 - OR, since the 50-r858t5.conf drop-in describes itself as a temporary R858-T5 exercise, remove the drop-in on any node where that exercise is finished, which retires the consumer instead of rotating it. (3) Re-set the five GitHub repo secrets on yah-ai/yah to the new pair (they cannot be read, so re-setting is the only way to make them safe) and check org-level secrets with an admin account. (4) Decide what to do with ./.env on the workstation - it is the only copy of the raw token value anywhere, so it is a recovery asset as well as an exposure; do not shred it before the deletion is committed to. (5) Fix the dashboard mesofact.config.toml placeholders and repoint its three env names at the MESOFACT_S3_* defaults, matching what was already done for marketing and analytics. ONLY THEN is the token free. Note that NONE of these is deletion and none was performed under this ticket: this audit changed nothing on any host, in the vault, in the repo, or at Cloudflare. Every fingerprint quoted was computed on the machine holding the value (`... | sha256sum | cut -c1-16` on Linux hosts, `shasum -a 256` locally); no secret value was printed or read into an agent context at any point.")
-//! @yah:handoff("VERDICT: **NOT SAFE TO DELETE.** Cloudflare API token 92414fa46ea2b8a5f06df51bae1a3512 (`yah-dev-1a3512`, account 3948dc292e724e71b0deefde0ea95999) still has live yah-side consumers reading the OLD pair by a NON-VAULT route. The enumeration this ticket owed is complete and the answer is (b): named consumers remain. noisetable R131-T19 step 4 must NOT proceed yet. The four fleet consumers, all measured on-host: (1) us-east-001 `yah-scryer.service`, ACTIVE, restarted 2026-09-11 06:57:22 UTC, EnvironmentFile=/etc/yah/scryer-r2.env on the old pair, producing snapshots every 300s; (2,3,4) us-west-011 / -013 / -014, /etc/yah-cloud/litestream.env on the old pair, loaded by an ACTIVE yubaba.service on each plus an ACTIVE litestream-headscale.service on -013. Plus a fifth, in-tree: repo-root .env holds the RAW TOKEN VALUE (not merely the derived pair) and app/yah/desktop/camp-env.sh:47-49 sources it with `set -a` into every camp session.")
-//! @yah:handoff("THE MIGRATION WORK THIS ENUMERATION EXPOSED IS FILED AS **R891** — \"Retire the old Cloudflare R2 pair: migrate the non-vault consumers R876-T10 found, then unblock noisetable R131-T19 step 4\". Five children: R891-T2 (the four live fleet units), R891-B3 (repo-root .env: raw token to the vault, exports to the new pair), R891-T4 (GitHub repo secrets pre-rotation + org secrets unchecked, blocked_on operator), R891-B5 (a plaintext cfut_ bearer in 3 .yah/forms/*.json — a DIFFERENT credential, fingerprint 3e9091fc44f7060b = cloudflare-legacy-yah), R891-B6 (the R330-T35 publish landmine still armed in the dashboard's mesofact.config.toml). R891's own acceptance is the handoff to the noisetable camp once T2, B3 and T4 close — which is when this ticket's answer flips to \"safe to delete\".")
+//! @yah:verify("DONE = a written verdict on this ticket naming either \"no yah-side consumer of <cf-token-id> remains, safe to delete\" or the specific consumers that still read it, with how each was checked (vault slot fingerprints, grep over .yah/infra and cloud-init, QED/CI secret stores, and Cloudflare's own token last-used / audit record for that id). Fingerprint form that prints no secret: `yah keys get <slot> | shasum -a 256 | cut -c1-16` — the old pair is <fingerprint> / <fingerprint>, the new pair <fingerprint> / <fingerprint>. NO SECRET VALUE SHOULD BE PRINTED OR READ INTO CONTEXT at any point; hash on the remote host, compare hashes only. Nothing is deleted by this ticket.")
+//! @yah:handoff("VERDICT (audit 2026-09-11, read-only, nothing deleted/revoked/rotated): NOT SAFE TO DELETE. Cloudflare API token <cf-token-id> (`yah-dev-1a3512`) still has FOUR live yah-side consumers that read its derived R2 pair by a route OTHER than the vault slot names, on three fleet nodes plus this workstation. Cloudflare's own record confirms the token is still real and armed: GET /accounts/0123456789abcdef0123456789abcdef/tokens/<cf-token-id> (authenticated with the `cloudflare-legacy-yah` vault slot; `cloudflare-api-token` returns 9109 Unauthorized for this endpoint) returns status=active, name=yah-dev-1a3512, issued_on=2026-05-26T03:52:19Z, expires_on=null, last_used_on=NULL. CAUTION ON THAT NULL: do NOT read `last_used_on: null` as \"nobody uses it\". That field tracks api.cloudflare.com bearer-auth calls; the consumers found below authenticate to R2 over the S3 protocol with the derived access-key/secret pair, which is a different code path (this last clause is INFERENCE from the field's meaning, not from Cloudflare docs I read - but the consumers themselves are directly measured and are decisive on their own).")
+//! @yah:handoff("CONSUMER 1 - us-east-001 (debian@203.0.113.13), yah-scryer.service, ACTIVE+ENABLED, ExecMainStartTimestamp Fri 2026-09-11 06:57:22 UTC. `systemctl show yah-scryer.service -p EnvironmentFiles` returns `/etc/yah/<scryer-env> (ignore_errors=no)`. That file (root:root 0600, mtime Sep 10 07:46) holds CF_R2_ACCESS_KEY_ID and CF_R2_SECRET_KEY; hashed ON THE HOST they are <fingerprint> / <fingerprint> = THE OLD PAIR. TRAP FOR THE NEXT READER: the main unit /etc/systemd/system/yah-scryer.service contains NO EnvironmentFile= directive - only a comment mentioning one - so reading the unit file alone says \"not wired\" and is WRONG. The directive lives in the drop-in /etc/systemd/system/yah-scryer.service.d/10-snapshot-producer.conf, which also sets --long-tier-bucket yah-analytics --r2-account 0123456789abcdef0123456789abcdef --snapshot-interval-secs 300. So this node is authenticating to R2 with the old pair every 5 minutes right now; deleting the token stops the yah-analytics long-tier snapshot producer. Two stale copies of the unit sit beside it (yah-scryer.service.rollback-20260911, .rollback-20260908); neither carries an EnvironmentFile= line.")
+//! @yah:handoff("CONSUMERS 2-4 - us-west-011, us-west-013, us-west-014 all carry <cloud-conf-dir>/<litestream-env> (root:root 0600, mtime Sep 8 20:02 on 011) holding LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY; hashed ON EACH HOST they are <fingerprint> / <fingerprint> = THE OLD PAIR on all three. Two units reference it on each node: /etc/systemd/system/yubaba.service.d/50-r858t5.conf (a drop-in whose own header calls itself TEMPORARY, an R858-T5 dev-cluster exercise of the litestream restore-before-serve leg) and /etc/systemd/system/litestream-headscale.service. Measured states: us-west-011 yubaba.service ACTIVE+ENABLED since 2026-09-10 08:45:57 BST, litestream-headscale INACTIVE; us-west-013 yubaba.service ACTIVE since 2026-09-10 08:46:07 BST AND litestream-headscale.service ACTIVE - this is the hottest one, a replicator actually running against R2 on the old pair; us-west-014 yubaba.service ACTIVE since 2026-09-10 08:45:45 BST, litestream-headscale INACTIVE. `systemctl show yubaba.service -p EnvironmentFiles` on all three lists <cloud-conf-dir>/<litestream-env>, so the old pair is in the live process environment on every one.")
+//! @yah:handoff("CONSUMER 5 (workstation, not a service but the most complete copy anywhere) - .env, untracked and gitignored (.gitignore:22), mtime Aug 9 15:31, is the ONLY file in the whole tree carrying this credential. Line 6 R2_ACCESS_KEY fingerprints to <fingerprint>, line 7 R2_SECRET_KEY to <fingerprint> - the old pair - and line 8 R2_TOKEN is the RAW CLOUDFLARE TOKEN VALUE ITSELF (53 chars, `cfat_` prefix). PROVEN BY DERIVATION, not assumed: sha256(R2_TOKEN) hashes to <fingerprint>, i.e. it is exactly the preimage of the R2 secret access key, which is how Cloudflare derives an R2 secret from a token value. ALSO PROVEN: sha256(\"<cf-token-id>\") = <fingerprint>, so the R2 access-key-id IS the token id and any host carrying that literal is carrying this credential - that identity is what made the fleet grep decisive. TWO CONSEQUENCES. (a) This file is a SECOND way back, independent of the parked `-pre-r131t19` vault slots, and unlike them it holds the one-time-shown token VALUE that Cloudflare stores nowhere - worth knowing before anyone treats the parked slots as the single point of recovery. (b) It is sourced wholesale into the camp environment by app/yah/desktop/camp-env.sh:47-49 and app/yah/desktop/install-mac.sh:152-153 (`set -a; . \"$root/.env\"; set +a`), so R2_ACCESS_KEY / R2_SECRET_KEY / R2_TOKEN are exported into every process those launch.")
+//! @yah:handoff("SURFACES CHECKED AND CLEAN. (1) VAULT - `yah keys list` gives 50 slots; all 17 Cloudflare/R2-suggestive ones fingerprinted. cloudflare-r2-access-key-id = <fingerprint> and cloudflare-r2-secret-key = <fingerprint> (both NEW, correct); the two -pre-r131t19 slots = <fingerprint> / <fingerprint> (OLD, parked as designed); NO OTHER SLOT matches the old pair. I also ran a derivation test on every slot - sha256(slot value) then fingerprint, compared against <fingerprint> - to catch any slot secretly holding the raw token value: zero matches, so `cloudflare-api-token` (fp <fingerprint>) is a DIFFERENT token, as are the account-backup / cert-store / fleet-read pairs. (2) REPO LITERALS - swept for the token id, `yah-dev-1a3512`, the account id, `cfat_`/`cfut_` token shapes and every R2/CF env var name across the tree including oss/ and dotfile dirs; the ONLY file carrying this credential is ./.env (session transcripts under .yah/sessions and .yah/forms excluded as agent scrollback, not consumers). (3) .yah/infra - machines/*.toml, state/bundles, providers/cloudflare.toml: no baked credential, account id only. (4) .yah/qed - every reference goes through vault slots or the CF_R2_* env fallback (yah-release.toml:32-33, yah-cli-release.toml:112, yah-desktop-release.toml:388); no inline value. (5) us-east-001's yah-marketing deploy record - I RE-VERIFIED the R876-B9 re-apply landed: /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json now has MESOFACT_S3_ACCESS_KEY_ID = <fingerprint> and MESOFACT_S3_SECRET_ACCESS_KEY = <fingerprint> (NEW pair). Its CLOUDFLARE_API_TOKEN field fingerprints to <fingerprint> = the `cloudflare-api-token` slot, a different token, NOT this one. The older gotcha on oss/kamaji/crates/kamaji-bin/src/server.rs:195 saying that field still hashes to <fingerprint> is now STALE. (6) us-south-001, us-west-001, us-west-002, us-west-003, us-west-015 - no /etc/yah/<scryer-env>, no <cloud-conf-dir>/<litestream-env>, no occurrence of the old access-key-id or any cfat_ literal under /etc, /var/lib/yah, /opt, /root, /home. (7) Workstation outside the repo - ~/.config, ~/.aws, ~/.local/share, ~/Library/Application Support/yah: clean.")
+//! @yah:handoff("GAPS I COULD NOT CLOSE, stated plainly rather than guessed. (A) GITHUB REPO SECRETS on yah-ai/yah - `gh secret list -R yah-ai/yah` shows CF_R2_ACCESS_KEY_ID, CF_R2_SECRET_KEY, CF_R2_ACCOUNT_ID, CLOUDFLARE_TOKEN and R2_ACCESS_KEY, EVERY ONE last updated 2026-06-19T22:40Z - i.e. after this token was issued (2026-05-26) and nearly three months BEFORE the 2026-09-10 rotation. GitHub Actions secrets are write-only by design, so I could not fingerprint them and CANNOT prove which pair they hold; the dates are strong circumstantial evidence they still hold the OLD one. They are consumed by .github/workflows/fleet-index.yml:153-156 (as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY against the R2 endpoint) and .github/workflows/smoke.yml:86,129. Per CLAUDE.md no workflow in this repo has an `on: push` trigger any more, so these are dormant-but-dispatchable: deleting the token would not break a push, it would break the next manual `workflow_dispatch`. Settling this needs someone who can re-set those secrets, not someone who can read them. `gh secret list --org yah-ai` returned HTTP 403 (not an org admin), so ORG-LEVEL secrets are entirely unchecked. (B) LATENT, NOT LIVE - app/yah/web/dashboard/mesofact.config.toml:21-23 names access_key_id_env = \"R2_ACCESS_KEY\" / secret_access_key_env = \"R2_SECRET_KEY\" / api_token_env = \"CLOUDFLARE_KEY\", which are EXACTLY the names ./.env exports with the old pair, so a publish from this workstation would sign with the old credential. It is dormant only because the same file still carries the unsubstituted `endpoint = \"https://ACCOUNT_ID.r2.cloudflarestorage.com\"` / `zone_id = \"ZONE_ID\"` placeholders - the identical R330-T35 landmine already defused in marketing's and analytics' configs but NOT in dashboard's. Note this corrects a claim in the crates/yah/hub/src/in_process.rs:103 handoff that \"nothing in the tree sets any of the three\": ./.env sets two of them and camp-env.sh exports them. (C) SIDE FINDING, different credential, out of scope for the deletion but should not go unreported - .yah/forms/01KSJH81803BHCCTVXWSBXEJJ3.json (and several sibling form records) contain a literal `cfut_` bearer token in plaintext in the recorded command. It fingerprints to <fingerprint>, which equals both the `cloudflare-legacy-yah` vault slot and ./.env's CLOUDFLARE_KEY. It is NOT <cf-token-id>, so it does not change this verdict, but it is a live Cloudflare credential sitting unencrypted in approval-form scrollback and deserves its own ticket.")
+//! @yah:handoff("WHAT NOISETABLE R131-T19 STEP 4 NEEDS BEFORE IT CAN PROCEED, in dependency order. (1) Rewrite /etc/yah/<scryer-env> on us-east-001 with the new pair and restart yah-scryer.service. (2) Rewrite <cloud-conf-dir>/<litestream-env> on us-west-011, us-west-013 and us-west-014 with the new pair and restart yubaba.service on all three plus litestream-headscale.service on us-west-013 - OR, since the 50-r858t5.conf drop-in describes itself as a temporary R858-T5 exercise, remove the drop-in on any node where that exercise is finished, which retires the consumer instead of rotating it. (3) Re-set the five GitHub repo secrets on yah-ai/yah to the new pair (they cannot be read, so re-setting is the only way to make them safe) and check org-level secrets with an admin account. (4) Decide what to do with ./.env on the workstation - it is the only copy of the raw token value anywhere, so it is a recovery asset as well as an exposure; do not shred it before the deletion is committed to. (5) Fix the dashboard mesofact.config.toml placeholders and repoint its three env names at the MESOFACT_S3_* defaults, matching what was already done for marketing and analytics. ONLY THEN is the token free. Note that NONE of these is deletion and none was performed under this ticket: this audit changed nothing on any host, in the vault, in the repo, or at Cloudflare. Every fingerprint quoted was computed on the machine holding the value (`... | sha256sum | cut -c1-16` on Linux hosts, `shasum -a 256` locally); no secret value was printed or read into an agent context at any point.")
+//! @yah:handoff("VERDICT: **NOT SAFE TO DELETE.** Cloudflare API token <cf-token-id> (`yah-dev-1a3512`, account 0123456789abcdef0123456789abcdef) still has live yah-side consumers reading the OLD pair by a NON-VAULT route. The enumeration this ticket owed is complete and the answer is (b): named consumers remain. noisetable R131-T19 step 4 must NOT proceed yet. The four fleet consumers, all measured on-host: (1) us-east-001 `yah-scryer.service`, ACTIVE, restarted 2026-09-11 06:57:22 UTC, EnvironmentFile=/etc/yah/<scryer-env> on the old pair, producing snapshots every 300s; (2,3,4) us-west-011 / -013 / -014, <cloud-conf-dir>/<litestream-env> on the old pair, loaded by an ACTIVE yubaba.service on each plus an ACTIVE litestream-headscale.service on -013. Plus a fifth, in-tree: repo-root .env holds the RAW TOKEN VALUE (not merely the derived pair) and app/yah/desktop/camp-env.sh:47-49 sources it with `set -a` into every camp session.")
+//! @yah:handoff("THE MIGRATION WORK THIS ENUMERATION EXPOSED IS FILED AS **R891** — \"Retire the old Cloudflare R2 pair: migrate the non-vault consumers R876-T10 found, then unblock noisetable R131-T19 step 4\". Five children: R891-T2 (the four live fleet units), R891-B3 (repo-root .env: raw token to the vault, exports to the new pair), R891-T4 (GitHub repo secrets pre-rotation + org secrets unchecked, blocked_on operator), R891-B5 (a plaintext cfut_ bearer in 3 .yah/forms/*.json — a DIFFERENT credential, fingerprint <fingerprint> = cloudflare-legacy-yah), R891-B6 (the R330-T35 publish landmine still armed in the dashboard's mesofact.config.toml). R891's own acceptance is the handoff to the noisetable camp once T2, B3 and T4 close — which is when this ticket's answer flips to \"safe to delete\".")
 //! @yah:verify("HOW EACH SURFACE WAS CHECKED (courier @Glimmerstone:polaris, session:c3eaf0c9). CLEAN: all 17 CF/R2 vault slots fingerprinted, including a derivation test for any slot holding the raw token value — zero hits; repo literal sweep for the token id, token name, account id and the R2/CF env-var names; .yah/infra; .yah/qed; ~/.config; ~/.aws. Every fingerprint was computed on the host holding the value via `shasum -a 256 | cut -c1-16` and compared as 16 hex chars — NO SECRET VALUE WAS PRINTED OR READ INTO CONTEXT at any point, and nothing was deleted, revoked, rotated or written on any host. Cloudflare's own record: status=active, last_used_on=NULL, fetched via the cloudflare-legacy-yah slot (the cloudflare-api-token slot returns error 9109 on that endpoint).")
-//! @yah:verify("LEADER RE-VERIFICATION (@Ashguard:coffee), independent of the courier and the decisive claim re-derived from scratch: chained `shasum -a 256` over repo-root .env's R2_TOKEN yields 9198605d52642726 — byte-identical to the recorded old-secret fingerprint — which proves .env holds the one-time-shown token value itself, since the R2 secret IS sha256(token). Also confirmed directly: app/yah/desktop/camp-env.sh sources .env under `set -a` (exports every variable to every camp session), and `grep -rlo cfut_ .yah/forms/` returns 3 files. GAPS, stated rather than papered over: 5 of 9 fleet nodes were reached, so 4 were not; GitHub repo secrets are write-only and cannot be fingerprinted (dates say pre-rotation); `gh secret list --org yah-ai` returned HTTP 403 so ORG-level secrets are wholly unchecked. R891-T4 owns those gaps.")
+//! @yah:verify("LEADER RE-VERIFICATION (@Ashguard:coffee), independent of the courier and the decisive claim re-derived from scratch: chained `shasum -a 256` over repo-root .env's R2_TOKEN yields <fingerprint> — byte-identical to the recorded old-secret fingerprint — which proves .env holds the one-time-shown token value itself, since the R2 secret IS sha256(token). Also confirmed directly: app/yah/desktop/camp-env.sh sources .env under `set -a` (exports every variable to every camp session), and `grep -rlo cfut_ .yah/forms/` returns 3 files. GAPS, stated rather than papered over: 5 of 9 fleet nodes were reached, so 4 were not; GitHub repo secrets are write-only and cannot be fingerprinted (dates say pre-rotation); `gh secret list --org yah-ai` returned HTTP 403 so ORG-level secrets are wholly unchecked. R891-T4 owns those gaps.")
 //! @yah:gotcha("CORRECTION TO A STALE GOTCHA ON THIS RELAY: the note at oss/kamaji/crates/kamaji-bin/src/server.rs:195 saying us-east-001's yah-marketing deploy record is still on the OLD pair is NO LONGER TRUE. This audit independently re-verified that the R876-B9 re-apply landed — us-east-001's yah-marketing.json is on the NEW pair. Do not act on that gotcha.")
-//! @yah:handoff("THE ANSWER FLIPS: **SAFE TO DELETE**, as of 2026-09-16 (R891 closed by @Ashguard:vortex, session:c8036b0c). Every consumer this audit named is migrated, and each was verified by measurement rather than by assuming the edit took. CONSUMER 1, us-east-001 yah-scryer.service: /etc/yah/scryer-r2.env rewritten to the new pair (38da59ad427a7e1f/9198605d52642726 -> f293d33294250d04/8d0ad8c9470d48df, hashed on the host), unit restarted and ACTIVE, and it published analytics snapshot b8eefe2550da5d3f7acf68856550de5894ad11d2ac0bcec59896e27354acf031 four seconds later — confirmed present in the yah-analytics bucket. CONSUMERS 2-4, us-west-011/-013/-014: /etc/yah-cloud/litestream.env rewritten to the new pair on all three, yubaba.service restarted one node at a time with followers first and the leader (013) last, litestream-headscale.service restarted on 013, and each node separately proved it can WRITE to R2 with the rotated file via a throwaway `litestream replicate -config` that logged both 'snapshot written' and 'wal segment written'. Dev raft never dipped: leader 13, term 66, all three peers live before, between and after. Rotation rather than drop-in removal, because `systemctl cat yubaba.service` shows the SHIPPED unit reads litestream.env independently of the R858-T5 drop-in — deleting the drop-in would have removed nothing. CONSUMER 5, repo-root .env: the raw token moved to the vault slot `cloudflare-r2-token-pre-r131t19` (derivation test passes — sha256 of that slot's value fingerprints to 9198605d52642726), R2_ACCESS_KEY/R2_SECRET_KEY rotated to the new pair, R2_TOKEN retired, file tightened 0644 -> 0600. GAP (A) IS CLOSED BY DELETION, NOT ROTATION: the operator's call was that GitHub repo secrets are not needed (R915 — `gh` is a non-goal), so all NINE were deleted via direct REST, verified total_count 0. Gap (A)'s org-level half is ACCEPTED-UNCHECKED by operator decision. GAP (B) fixed (R891-B6). GAP (C) fixed at the mechanism (R891-B5); its rotation was declined by the operator on the record.")
-//! @yah:verify("THE SWEEP THIS AUDIT COULD NOT FINISH IS NOW FINISHED, AND IT IS CLEAN. This ticket reached 5 of 9 fleet nodes and said so. All NINE have now been swept for the old pair, by piping both old-pair VALUES from the parked vault slots onto `ssh <node> 'sudo -n grep -rlFI -f - /etc /root /home /var/lib/yah /var/lib/yah-cloud /opt'` — patterns on stdin, only filenames returned, no value printed in either direction. Zero hits on us-east-001, us-south-001, us-west-001, -002, -003, -011, -013, -014, with `sudo -n id -u` = 0 confirmed separately on each so that an empty result is a real read rather than a permission failure reading as clean. ONE BOUNDED EXCEPTION: us-west-015 has no passwordless sudo and refuses root SSH, so its grep ran unprivileged; it is also not a systemd box (`systemctl` not found) and has no /etc/yah or /etc/yah-cloud, so the consumer class this audit is about cannot exist there. The same sweep over the workstation — whole repo tree minus target/.git/node_modules, plus ~/.config, ~/.aws, ~/.zshrc, ~/.zshenv, ~/.profile — found zero copies of the old SECRET and zero of the RAW TOKEN. Three files matched the old ACCESS KEY ID and all three are board annotation prose, which is expected and harmless: this audit's own proof that sha256('92414fa46ea2b8a5f06df51bae1a3512') = 38da59ad427a7e1f means the access-key-id half IS the public token id and was never secret material.")
+//! @yah:handoff("THE ANSWER FLIPS: **SAFE TO DELETE**, as of 2026-09-16 (R891 closed by @Ashguard:vortex, session:c8036b0c). Every consumer this audit named is migrated, and each was verified by measurement rather than by assuming the edit took. CONSUMER 1, us-east-001 yah-scryer.service: /etc/yah/<scryer-env> rewritten to the new pair (<fingerprint>/<fingerprint> -> <fingerprint>/<fingerprint>, hashed on the host), unit restarted and ACTIVE, and it published analytics snapshot b8eefe2550da5d3f7acf68856550de5894ad11d2ac0bcec59896e27354acf031 four seconds later — confirmed present in the yah-analytics bucket. CONSUMERS 2-4, us-west-011/-013/-014: <cloud-conf-dir>/<litestream-env> rewritten to the new pair on all three, yubaba.service restarted one node at a time with followers first and the leader (013) last, litestream-headscale.service restarted on 013, and each node separately proved it can WRITE to R2 with the rotated file via a throwaway `litestream replicate -config` that logged both 'snapshot written' and 'wal segment written'. Dev raft never dipped: leader 13, term 66, all three peers live before, between and after. Rotation rather than drop-in removal, because `systemctl cat yubaba.service` shows the SHIPPED unit reads <litestream-env> independently of the R858-T5 drop-in — deleting the drop-in would have removed nothing. CONSUMER 5, repo-root .env: the raw token moved to the vault slot `cloudflare-r2-token-pre-r131t19` (derivation test passes — sha256 of that slot's value fingerprints to <fingerprint>), R2_ACCESS_KEY/R2_SECRET_KEY rotated to the new pair, R2_TOKEN retired, file tightened 0644 -> 0600. GAP (A) IS CLOSED BY DELETION, NOT ROTATION: the operator's call was that GitHub repo secrets are not needed (R915 — `gh` is a non-goal), so all NINE were deleted via direct REST, verified total_count 0. Gap (A)'s org-level half is ACCEPTED-UNCHECKED by operator decision. GAP (B) fixed (R891-B6). GAP (C) fixed at the mechanism (R891-B5); its rotation was declined by the operator on the record.")
+//! @yah:verify("THE SWEEP THIS AUDIT COULD NOT FINISH IS NOW FINISHED, AND IT IS CLEAN. This ticket reached 5 of 9 fleet nodes and said so. All NINE have now been swept for the old pair, by piping both old-pair VALUES from the parked vault slots onto `ssh <node> 'sudo -n grep -rlFI -f - /etc /root /home /var/lib/yah /var/lib/yah-cloud /opt'` — patterns on stdin, only filenames returned, no value printed in either direction. Zero hits on us-east-001, us-south-001, us-west-001, -002, -003, -011, -013, -014, with `sudo -n id -u` = 0 confirmed separately on each so that an empty result is a real read rather than a permission failure reading as clean. ONE BOUNDED EXCEPTION: us-west-015 has no passwordless sudo and refuses root SSH, so its grep ran unprivileged; it is also not a systemd box (`systemctl` not found) and has no /etc/yah or /etc/yah-cloud, so the consumer class this audit is about cannot exist there. The same sweep over the workstation — whole repo tree minus target/.git/node_modules, plus ~/.config, ~/.aws, ~/.zshrc, ~/.zshenv, ~/.profile — found zero copies of the old SECRET and zero of the RAW TOKEN. Three files matched the old ACCESS KEY ID and all three are board annotation prose, which is expected and harmless: this audit's own proof that sha256('<cf-token-id>') = <fingerprint> means the access-key-id half IS the public token id and was never secret material.")
 //!
 //! @yah:ticket(R932-B1, "Plain `deploy` on an existing container workload tears the incumbent down before the OCI create, and /workloads/validate passes a spec whose bind-mount source is missing on the host — R892's gate did not cover it")
 //! @yah:status(review)
@@ -273,7 +273,7 @@
 //! @yah:handoff("DISCOVERED AND FIXED: the deploy could not be re-run while the door was live. deploy_inner_door (app/yah/cli/src/cloud.rs, front-door loop) plain-deployed the door, which is an Appliance archetype. So once it was live on one node, the next run got yubaba's R572-F4 409 'appliance already live' and aborted the loop before later front doors, and a half-finished rollout could never be completed. New helpers is_live_appliance_conflict + replace_live_inner_door (beside deploy_inner_door) turn exactly that 409 into validate -> destroy -> deploy. Validation runs first, as in `workload rolling` (R892-B1), and a node with no /workloads/validate is refused rather than having its door destroyed blind. There is no skip-if-unchanged, because GET /workloads/{ident}/spec redacts the inline-file body, which is the only part that changes. Installed via `cargo xtask install` and exercised on prod: it replaced the doors on east and south.")
 //! @yah:verify("New test cloud::inner_door_apply_tests::only_the_live_appliance_409_is_read_as_replace_the_inner_door plus the 3 existing inner_door tests: `cargo test -p yah --lib inner_door` = 4 passed / 0 failed, EXIT 0. Live check: the final mirror up printed 'already live on us-east-001 — replaced' for east and south and a first deploy on west, then 'noisetable.com is serving this bundle', EXIT 0. After that, noisetable.com/ and /app return 200. /api/issues still returns 404 on every origin (see gotcha).")
 //! @yah:handoff("LIVE ON ALL THREE FRONT DOORS, 2026-09-22, operator-authorised ssh mission. On us-east-001, us-south-001 and us-west-001, added /etc/systemd/system/kamaji.service.d/60-inner-door-routes.conf (`[Service]` + `ReadWritePaths=/var/lib/passway/routes`), then daemon-reload + restart kamaji. This mirrors the template grant until the nodes take the new unit on a roll, after which the drop-in is redundant and can be deleted. passway-inner-noisetable-marketing now runs on all three nodes on 127.0.0.1:12310. COSTS OF THE RESTARTS: (a) east's restart SIGKILLed noisetable-account's durability tail, and kamaji 0.8.41 cannot re-arm tails after a restart (R932's re-arm code is only in e5ff39f6 and later). Re-armed by `yah cloud workload rolling noisetable-account`: epoch 5, state current, one 502 in 120 probes. (b) On south, yubaba's reconciler re-forked headscale about 9s after the restart, and its tail came back on its own (epoch 7). (c) west had no natives and no tails, and its two containers kept their pids.")
-//! @yah:handoff("OUTER DOORS REPOINTED, 2026-09-22 05:40 UTC, operator-authorised. On all three nodes, /etc/passway-noisetable.env gained `PASSWAY_UPSTREAMS=noisetable.com=127.0.0.1:12310`, with a comment block and the backup at /etc/passway-noisetable.env.bak-r931b5, followed by `systemctl reload passway-noisetable` (a graceful upgrade). The static pin beats discovery for that hostname only (R858-T1, 'upstream set Host(\"noisetable.com\") (static pin)' in each journal). api.noisetable.com and the `*` catch-all still discover from east's yubaba. Verified per origin with --resolve: noisetable.com /, /app and /api/issues, plus api.noisetable.com/__mesofact/health, all return 200 on 51.81.85.145, 45.32.194.254 and 15.204.89.240. /api/issues was a 404 before the change.")
+//! @yah:handoff("OUTER DOORS REPOINTED, 2026-09-22 05:40 UTC, operator-authorised. On all three nodes, /etc/passway-noisetable.env gained `PASSWAY_UPSTREAMS=noisetable.com=127.0.0.1:12310`, with a comment block and the backup at /etc/passway-noisetable.env.bak-r931b5, followed by `systemctl reload passway-noisetable` (a graceful upgrade). The static pin beats discovery for that hostname only (R858-T1, 'upstream set Host(\"noisetable.com\") (static pin)' in each journal). api.noisetable.com and the `*` catch-all still discover from east's yubaba. Verified per origin with --resolve: noisetable.com /, /app and /api/issues, plus api.noisetable.com/__mesofact/health, all return 200 on 203.0.113.13, 203.0.113.12 and 203.0.113.11. /api/issues was a 404 before the change.")
 //! @yah:gotcha("MIRROR UP'S PRINTED FRONT-DOOR STEP DOES NOT MATCH THE LIVE DOORS. It suggests `yah cloud ingress deploy <node> --provider passway --image <ref> --upstream noisetable.com=127.0.0.1:12310`, which stands up a CONTAINERISED passway appliance. The live noisetable doors are HOST systemd units (passway-noisetable.service, EnvironmentFile=/etc/passway-noisetable.env, ExecReload=passway-graceful-upgrade). Running the printed command would have added a second door rather than repointing the existing one, so the repoint was done as a hand edit of the env file. The pin now lives only in those three node-local files: nothing in the tree renders /etc/passway-noisetable.env, so a node rebuilt from source loses it.")
 
 use std::collections::HashMap;
@@ -390,6 +390,33 @@ pub struct Registry {
     /// honest answer to "is this workload still deployed with that spec" is
     /// `None`/"redeploy", which is exactly what an empty map yields.
     specs: HashMap<WorkloadId, DeployedSpec>,
+    /// Recorded deploys this kamaji found on restart and deliberately did NOT
+    /// start, because they carry [`WORKLOAD_INTENT_STAMP_ANNOTATION`]: yubaba's
+    /// replicated intent owns where those run, and a node that was away cannot
+    /// know whether it still does (R977-B14). The **held-until-owner-confirms**
+    /// seam: yubaba's rejoin cleanup is the single thing that ends a hold —
+    /// a `Deploy` of the id confirms it (the copy starts through the ordinary
+    /// deploy path), a `Stop` discards it. Kamaji makes no ownership decision.
+    ///
+    /// Visible on the wire so yubaba can find them: `List` reports each as
+    /// `Pending` with no `spec_digest`, `Describe` returns its spec. Not in
+    /// `specs`, so `restart.rs` (which restarts only specs it holds) and
+    /// `tail::resume` (which arms only live rows) leave it alone.
+    held: HashMap<WorkloadId, workload_spec::Workload>,
+}
+
+/// The annotation yubaba's workload intent stamps on every copy it places
+/// (`yubaba_consensus::workload_intent::WORKLOAD_INTENT_STAMP_ANNOTATION`; the
+/// string is the contract, kamaji does not parse the value). A recorded deploy
+/// carrying it is held on restart rather than resumed — see [`Registry::held`].
+pub const WORKLOAD_INTENT_STAMP_ANNOTATION: &str = "yah.workload-intent.stamp";
+
+/// Whether a recorded deploy must wait for yubaba to confirm this node still
+/// owns it before it may start again (R977-B14).
+pub fn held_until_owner_confirms(workload: &workload_spec::Workload) -> bool {
+    workload
+        .container_spec()
+        .is_some_and(|s| s.annotations.contains_key(WORKLOAD_INTENT_STAMP_ANNOTATION))
 }
 
 /// One admitted deploy's `Workload` and the digest of it (R870-B24).
@@ -628,6 +655,131 @@ pub struct BundleBackend {
     /// on every write, including to a directory an older kamaji already
     /// created at 0755.
     pub records_dir: PathBuf,
+    /// R983-B1: which post-Ack run of each workload is the live one, and the
+    /// gate its fork step goes through. See [`BundleRuns`].
+    pub runs: BundleRuns,
+}
+
+/// R983-B1: per-workload ordering for the asynchronous half of a bundle deploy.
+///
+/// A bundle deploy is recorded at admission and run on a detached task, so two
+/// runs of one workload can be in flight at once (a redeploy during a slow
+/// materialize, a restart-resume racing a fresh apply, a retry). Without an
+/// order, whichever *forks last* wins — which can be the older digest — while
+/// the record says the newer one. Each [`BundleRuns::begin`] bumps the
+/// workload's generation; a run forks only while holding the workload's gate
+/// AND still being the newest generation, so the last *admitted* deploy is the
+/// one left running. `Stop` bumps the generation too ([`BundleRuns::supersede`])
+/// so a run still materializing cannot resurrect a stopped workload.
+///
+/// The gate is held around the fork only, never across a materialize: a cold
+/// fetch can take minutes, and `Stop` must not wait that long.
+#[cfg(feature = "bundle-serving")]
+pub struct BundleRuns {
+    slots: std::sync::Mutex<HashMap<String, BundleRunSlot>>,
+    /// First retry delay after a failed run; doubles per attempt.
+    first_backoff: std::time::Duration,
+    /// Ceiling on the retry delay.
+    max_backoff: std::time::Duration,
+}
+
+#[cfg(feature = "bundle-serving")]
+impl Default for BundleRuns {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+            first_backoff: std::time::Duration::from_secs(5),
+            max_backoff: std::time::Duration::from_secs(300),
+        }
+    }
+}
+
+#[cfg(feature = "bundle-serving")]
+#[derive(Default)]
+struct BundleRunSlot {
+    generation: u64,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// One run's claim on a workload — see [`BundleRuns`].
+#[cfg(feature = "bundle-serving")]
+#[derive(Clone, Debug)]
+pub struct BundleRunTicket {
+    id: String,
+    generation: u64,
+}
+
+#[cfg(feature = "bundle-serving")]
+impl BundleRuns {
+    /// Override the retry backoff (first delay, ceiling). Tests use this to
+    /// exercise a retry without waiting out the production five seconds.
+    pub fn with_retry_backoff(mut self, first: std::time::Duration, max: std::time::Duration) -> Self {
+        self.first_backoff = first;
+        self.max_backoff = max;
+        self
+    }
+
+    /// The (first delay, ceiling) a failed run retries on.
+    pub fn retry_backoff(&self) -> (std::time::Duration, std::time::Duration) {
+        (self.first_backoff, self.max_backoff)
+    }
+
+    /// Start a new run of `id`, superseding every earlier one.
+    pub fn begin(&self, id: &str) -> BundleRunTicket {
+        let mut slots = self.slots.lock().expect("bundle run table poisoned");
+        let slot = slots.entry(id.to_string()).or_default();
+        slot.generation += 1;
+        BundleRunTicket {
+            id: id.to_string(),
+            generation: slot.generation,
+        }
+    }
+
+    /// Supersede every in-flight run of `id` without starting a new one
+    /// (`Stop`), and return the gate so the caller can tear down under it.
+    pub fn supersede(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut slots = self.slots.lock().expect("bundle run table poisoned");
+        let slot = slots.entry(id.to_string()).or_default();
+        slot.generation += 1;
+        Arc::clone(&slot.gate)
+    }
+
+    /// Whether `ticket` is still the newest run of its workload.
+    pub fn is_current(&self, ticket: &BundleRunTicket) -> bool {
+        let slots = self.slots.lock().expect("bundle run table poisoned");
+        slots
+            .get(&ticket.id)
+            .is_some_and(|slot| slot.generation == ticket.generation)
+    }
+
+    /// Take the workload's fork gate, then confirm `ticket` is still current.
+    /// `None` means a newer deploy (or a `Stop`) owns the workload now and this
+    /// run must touch nothing — not the process, not `DeployStatus`.
+    pub async fn enter(&self, ticket: &BundleRunTicket) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let gate = {
+            let slots = self.slots.lock().expect("bundle run table poisoned");
+            Arc::clone(&slots.get(&ticket.id)?.gate)
+        };
+        let guard = gate.lock_owned().await;
+        self.is_current(ticket).then_some(guard)
+    }
+}
+
+/// Why a post-Ack bundle run ended without the workload running (R983-B1).
+#[cfg(feature = "bundle-serving")]
+#[derive(Debug)]
+enum BundleRunError {
+    /// A newer deploy or a `Stop` owns the workload; this run stood down.
+    Superseded,
+    /// The run failed; the reason is what `DeployStatus` reports.
+    Failed(String),
+}
+
+#[cfg(feature = "bundle-serving")]
+impl From<String> for BundleRunError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
 }
 
 /// R755-B5: everything `Deploy` handed kamaji for one serve-bundle workload,
@@ -664,7 +816,7 @@ pub struct BundleDeployRecord {
 /// @yah:next("FIX SHAPE: create the tmp file with mode 0600 (OpenOptions + std::os::unix::fs::OpenOptionsExt::mode, or fs::set_permissions on the tmp before the rename — set it on the TMP, since setting it after the rename leaves a window where the final path is readable), and chmod the records_dir (server.rs:510, state_dir.join(&quot;deploys&quot;)) to 0700 at creation. Then remediate the fleet: the existing 0644 files on every node need chmod, and any credential that has been sitting world-readable on a multi-tenant box should be treated as disclosed and rotated — that rotation call is the operator's, not an agent's.")
 /// @yah:verify("Reproduce: `ssh &lt;node&gt; 'stat -c &quot;%a %U:%G %n&quot; /var/lib/yah/kamaji/bundles/state/deploys/*.json /var/lib/yah/kamaji/bundles/state/deploys'` as the unprivileged login user — currently 644 on the files and 755 on the dir. After the fix a freshly-recorded deploy must be 600 in a 700 dir, still readable by kamaji (root) on restart-replay, and `resume_bundle_workloads()` must still find and replay it. NOTE for whoever takes this: R876-B5's hotship activation resolves service -&gt; bundle digest by reading these same files as the LOGIN user (scripts/hotship.sh, bundle_serve_remote). Tightening the mode to 0600/0700 will break that read — it must move behind `sudo` in the same pass, or the fix lands a broken hot-ship. That is a two-line change in the remote script (sudo on the grep and on the deploys-dir listing), not a redesign.")
 /// @yah:handoff("CODE FIXED at the write site. BundleBackend::record_deploy (oss/kamaji/crates/kamaji-bin/src/server.rs, now ~:660) no longer uses std::fs::write. The tmp is created through OpenOptions with .mode(0o600) AND then f.set_permissions(0o600) on the open handle before any bytes are written - the second call is not redundant: .mode() applies only when THAT call creates the file, so a 0644 tmp left by an older kamaji that crashed mid-write would otherwise be reused as-is. The mode is set on the TMP and never after the rename, so the final path is never observable world-readable. records_dir is chmodded 0700 on EVERY record_deploy rather than only at creation, because DirBuilder::mode applies solely to dirs it creates (the same fact bind_listener documents at :1084) - so an upgraded node whose deploys/ already exists at 0755 self-heals on its next deploy instead of staying loose forever. Imports (std::io::Write, std::os::unix::fs::OpenOptionsExt) are scoped inside the fn: the module also compiles without the bundle-serving feature, where both would be unused. Doc comments at both sites (records_dir field and record_deploy) state why.")
-/// @yah:handoff("EXPOSURE INVENTORY - what the operator needs to scope a rotation. Credential NAMES only; no value was read, printed or logged anywhere. ONE NODE IS AFFECTED: us-east-001 (vps-8dba9ff8, debian@51.81.85.145). FILE 1: /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json, was 644 root:root, and it is the one carrying credential material - CLOUDFLARE_API_TOKEN, MESOFACT_S3_ACCESS_KEY_ID, MESOFACT_S3_SECRET_ACCESS_KEY, in cleartext in its revalidate env block. FILE 2: deploys/noisetable.json, also was 644 root:root, but a grep for the whole TOKEN/SECRET/KEY/PASSWORD name class returned zero hits, so no credential of that class is in it. Parent dir state/deploys was 755 root:root. DURATION, lower bound: the deploys DIRECTORY birth is 2026-08-31 19:42:36Z, i.e. at least 9 days of exposure to 2026-09-09. Do NOT read the per-file birth times as the exposure start - yah-marketing.json birth 2026-09-09 01:34:53Z and noisetable.json birth 2026-09-09 07:45:31Z are the CURRENT inodes only, because each redeploy renames a fresh file over the old one; the record itself has existed since the dir did. EXPLOITABILITY CONFIRMED, not inferred: read end to end as the plain debian login user with no sudo (READ OK before, READ DENIED after). NO OTHER NODE HAS RECORDS - checked us-west-001 (no /var/lib/yah/kamaji/bundles at all), us-south-001 (state/ exists, no deploys/), us-west-003, us-west-011, us-west-013, us-west-014, us-west-015: all absent. us-west-002 is the ONE GAP: ssh to struc@100.64.0.4 timed out, so it is unverified rather than clean. ROTATION IS THE OPERATOR CALL AND WAS NOT TOUCHED: nothing was rotated, revoked or re-issued by this ticket.")
+/// @yah:handoff("EXPOSURE INVENTORY - what the operator needs to scope a rotation. Credential NAMES only; no value was read, printed or logged anywhere. ONE NODE IS AFFECTED: us-east-001 (vps-8dba9ff8, debian@203.0.113.13). FILE 1: /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json, was 644 root:root, and it is the one carrying credential material - CLOUDFLARE_API_TOKEN, MESOFACT_S3_ACCESS_KEY_ID, MESOFACT_S3_SECRET_ACCESS_KEY, in cleartext in its revalidate env block. FILE 2: deploys/noisetable.json, also was 644 root:root, but a grep for the whole TOKEN/SECRET/KEY/PASSWORD name class returned zero hits, so no credential of that class is in it. Parent dir state/deploys was 755 root:root. DURATION, lower bound: the deploys DIRECTORY birth is 2026-08-31 19:42:36Z, i.e. at least 9 days of exposure to 2026-09-09. Do NOT read the per-file birth times as the exposure start - yah-marketing.json birth 2026-09-09 01:34:53Z and noisetable.json birth 2026-09-09 07:45:31Z are the CURRENT inodes only, because each redeploy renames a fresh file over the old one; the record itself has existed since the dir did. EXPLOITABILITY CONFIRMED, not inferred: read end to end as the plain debian login user with no sudo (READ OK before, READ DENIED after). NO OTHER NODE HAS RECORDS - checked us-west-001 (no /var/lib/yah/kamaji/bundles at all), us-south-001 (state/ exists, no deploys/), us-west-003, us-west-011, us-west-013, us-west-014, us-west-015: all absent. us-west-002 is the ONE GAP: ssh to struc@100.64.0.4 timed out, so it is unverified rather than clean. ROTATION IS THE OPERATOR CALL AND WAS NOT TOUCHED: nothing was rotated, revoked or re-issued by this ticket.")
 /// @yah:handoff("FLEET REMEDIATED, us-east-001 only (it is the only node with records). sudo chmod 0600 on both deploys/*.json and sudo chmod 0700 on the deploys dir, one node, live. Health confirmed after and identical to the before-baseline: all four serve pids still alive by /proc presence - 610122 (almanac-feed), 614524 (noisetable serve), 619423 (yah-marketing revalidate), 619436 (yah-marketing bundle) - kamaji and yubaba both systemctl is-active, and yah.dev 200/44242, yah.dev/releases 200/41629, noisetable.com 200/8441, byte-identical sizes to the pre-chmod reading. Nothing was restarted; a chmod is invisible to a process that already holds the file open, and kamaji reads these as root. AN INCIDENTAL PROOF WORTH KNOWING: the verification stat failed the first time with a literal-glob error because the LOGIN user's shell could no longer expand deploys/*.json - that failure is itself the confirmation the dir is closed, and any later check of these files needs the glob inside sudo sh -c, not outside it.")
 /// @yah:verify("THE TICKET'S OWN REPRODUCTION, run as the unprivileged debian login user on us-east-001, before and after. BEFORE: 755 root:root on state and on state/deploys, 644 root:root on both deploys/noisetable.json and deploys/yah-marketing.json, and an unprivileged cat of yah-marketing.json succeeded (READ OK). AFTER: 700 root:root on state/deploys, 600 root:root on both json files, and the same unprivileged cat now fails - READ DENIED, with ls reporting Permission denied on the directory. state/ itself was deliberately left 755: only the records dir needed closing, and tightening the shared state dir would have reached past the fix into the native supervisor's capture-dir siblings.")
 /// @yah:verify("TESTS, against a baseline measured BEFORE the change on the same tree. BASELINE: cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features bundle-serving = lib 270 passed / 0 failed / 0 ignored, plus the five integration targets (0+0+2+2+1) and 0 doc-tests, exit 0. AFTER: lib 271 passed / 0 failed / 0 ignored, same five targets unchanged, exit 0 - the +1 is exactly the one test added. cargo check --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --all-targets (i.e. WITHOUT bundle-serving) exit 0 with no unused-import warning, which is the check the fn-scoped imports exist for; the only two warnings on that run are the pre-existing never-used control_sock_from_spec (:2184) and free_port (:8277). NEW TEST a_deploy_record_is_written_owner_only_and_still_replays asserts all three claims together: mode 0600 on the record and 0700 on the dir; that a PRE-EXISTING 0755 dir and a stale 0644 tmp are tightened rather than trusted (the case that makes the explicit chmod load-bearing rather than decorative); and that recorded_deploys still round-trips the record byte-equal, which is the availability half - this fix must not trade a disclosure bug for a restart-replay bug. The existing end-to-end a_recorded_keepalive_bundle_is_resumed_by_a_fresh_kamaji also gained the two mode assertions, because it is the only test that reaches record_deploy through handle_message, so a regression that tightened only the direct callers would pass the focused test alone.")
@@ -672,9 +824,9 @@ pub struct BundleDeployRecord {
 /// @yah:handoff("FLEET REMEDIATION WAS DONE, NOT JUST THE WRITE PATH — that distinction matters, because fixing only `record_deploy` would have left every already-written 0644 file exposed forever. us-east-001 was the only node in the fleet carrying deploy records and was remediated live: files 0600, dir 0700, unprivileged read now denied, all four serve pids alive, and yah.dev / yah.dev/releases / noisetable.com byte-identical 200s afterwards. **us-west-002 is UNREACHABLE and therefore UNVERIFIED, not clean** — if it comes back and holds deploy records, it still needs the chmod.")
 /// @yah:verify("THE R876-B5 COUPLING HELD: `scripts/hotship.sh --dry-run --services yah-marketing` still resolves the bundle digest and reverse-maps the out-of-scope noisetable pid through B5's sudo route against the now-0700 dir, so no script change was needed. This was the one way B9 could have silently disarmed the hot-ship arm, and it was checked rather than assumed. Leader re-verification of the sibling ticket also came back clean: yah-cloud lib re-run 1137/0/4 exactly as R876-B7 reported, and `public-ip` confirmed an AFFINITY key by code (`taint_effect` returns `Repels` only for `no-<archetype>` keys; `AFFINITY_TAINT_KEYS` holds `PUBLIC_IP_TAINT`), so B7 did not move any live placement.")
 /// @yah:gotcha("THE CREDENTIAL ROTATION IS DELIBERATELY NOT DONE AND IS THE OPERATOR'S CALL — do not read this ticket reaching review as \"the exposure is closed\". Three credentials (CLOUDFLARE_API_TOKEN, MESOFACT_S3_ACCESS_KEY_ID, MESOFACT_S3_SECRET_ACCESS_KEY, values never reproduced) sat world-readable in /var/lib/yah/kamaji/bundles/state/deploys/ on us-east-001, a multi-tenant production box, for a 9-day LOWER BOUND measured from the deploys dir birth time. The permissions are now closed; the secrets should still be treated as disclosed until rotated.")
-/// @yah:gotcha("THE ROTATION THIS TICKET LEFT TO THE OPERATOR IS HALF DONE, AND THE REMAINING HALF IS A YAH-SIDE ACTION. Noisetable R131-T19 rotated the account-scoped R2 admin pair on 2026-09-10 (option A: mint the replacement, write both vault slots, leave the old token alive so nothing goes down) and its step 3 is now BLOCKED on this camp. The vault is correct and unchanged — `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives f293d33294250d04 and cloudflare-r2-secret-key gives 8d0ad8c9470d48df. But /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 — the exact file this ticket measured at 644 — still carries the OLD value inline as MESOFACT_S3_ACCESS_KEY_ID: re-measured 2026-09-11T06:02Z, that field hashes to 38da59ad427a7e1f. THE ASK: re-apply the yah-marketing mirror from a host whose vault holds the new pair, so that field stops hashing to 38da59ad427a7e1f and starts matching f293d33294250d04. It is materialized by `yah cloud apply` out of those same slots (app/yah/cli/src/cloud.rs, revalidate-receiver block) and nothing in the noisetable repo can do it. UNTIL THAT LANDS THE DISCLOSURE STAYS OPEN AND THE OLD TOKEN MUST NOT BE DELETED: Cloudflare token 92414fa46ea2b8a5f06df51bae1a3512, name `yah-dev-1a3512`, issued 2026-05-26, is deliberately still ALIVE because yah-marketing revalidate is still running on its inline copy — deleting it before the re-apply breaks revalidate. AND ONE THING ONLY THE YAH CAMP KNOWS: that token is account-wide and the noisetable camp never enumerated its yah-side users, so before it is deleted someone on your side has to confirm it was only ever the R2 admin pair. THE SAME TEXT IS ALSO ON R876-B5, so a reader of either ticket finds the other; act on it once.")
+/// @yah:gotcha("THE ROTATION THIS TICKET LEFT TO THE OPERATOR IS HALF DONE, AND THE REMAINING HALF IS A YAH-SIDE ACTION. Noisetable R131-T19 rotated the account-scoped R2 admin pair on 2026-09-10 (option A: mint the replacement, write both vault slots, leave the old token alive so nothing goes down) and its step 3 is now BLOCKED on this camp. The vault is correct and unchanged — `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` gives <fingerprint> and cloudflare-r2-secret-key gives <fingerprint>. But /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 — the exact file this ticket measured at 644 — still carries the OLD value inline as MESOFACT_S3_ACCESS_KEY_ID: re-measured 2026-09-11T06:02Z, that field hashes to <fingerprint>. THE ASK: re-apply the yah-marketing mirror from a host whose vault holds the new pair, so that field stops hashing to <fingerprint> and starts matching <fingerprint>. It is materialized by `yah cloud apply` out of those same slots (app/yah/cli/src/cloud.rs, revalidate-receiver block) and nothing in the noisetable repo can do it. UNTIL THAT LANDS THE DISCLOSURE STAYS OPEN AND THE OLD TOKEN MUST NOT BE DELETED: Cloudflare token <cf-token-id>, name `yah-dev-1a3512`, issued 2026-05-26, is deliberately still ALIVE because yah-marketing revalidate is still running on its inline copy — deleting it before the re-apply breaks revalidate. AND ONE THING ONLY THE YAH CAMP KNOWS: that token is account-wide and the noisetable camp never enumerated its yah-side users, so before it is deleted someone on your side has to confirm it was only ever the R2 admin pair. THE SAME TEXT IS ALSO ON R876-B5, so a reader of either ticket finds the other; act on it once.")
 /// @yah:gotcha("FILING PROVENANCE, so nobody re-files this as a duplicate: noisetable R131-T19's step-3 next-step cites R876-B5 as the ticket that 'already owns the exposure record'. That is a mis-citation — R876-B5 is the hotship bundle-serve activation-scoping bug; THIS ticket (R876-B9) is the one carrying the credential-exposure and rotation record. The gotcha above was written to R876-B5 first, following that citation, and is mirrored here; the noisetable side is correcting its own citation to point at R876-B9. Two tickets carry the ask on purpose, not by accident.")
-/// @yah:gotcha("THE R2 ROTATION DID NOT CLOSE THIS DEFECT - MEASURED FROM THE NOISETABLE CAMP (R131-T19) ON 2026-09-11. The MESOFACT_S3_* pair this ticket names has now been rotated and the record re-applied (`yah cloud apply --service yah-marketing --env cloud`): /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 (mtime 2026-09-11T06:49:28, size 11815) now carries ONLY the new pair - MESOFACT_S3_ACCESS_KEY_ID at /revalidate/env/MESOFACT_S3_ACCESS_KEY_ID hashes f293d33294250d04 (was 38da59ad427a7e1f) and MESOFACT_S3_SECRET_ACCESS_KEY at /revalidate/env/MESOFACT_S3_SECRET_ACCESS_KEY hashes 8d0ad8c9470d48df, both matching the vault slots; no stale copy remains anywhere in the record. BUT THE SAME ENV BLOCK STILL HOLDS A THIRD LIVE SECRET THAT WAS NOT ROTATED: CLOUDFLARE_API_TOKEN at /revalidate/env/CLOUDFLARE_API_TOKEN, sha256-16 eff3bd48b192aba7, 53 chars, inline in cleartext. Full inventory of that file today, by name and hash only, no value read into any context (extraction and hashing were done on the remote host): CLOUDFLARE_API_TOKEN=eff3bd48b192aba7, MESOFACT_S3_ACCESS_KEY_ID=f293d33294250d04, MESOFACT_S3_SECRET_ACCESS_KEY=8d0ad8c9470d48df - three of three keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL, all still materialized inline. PERMISSION BITS MEASURED TODAY: 600 root:root, i.e. this ticket's own chmod remediation is HOLDING and the file is no longer world-readable - the 0644 half of the title is fixed, the secrets-inline half is not. So the underlying defect - live secrets written inline into a deploy record on disk - is UNCHANGED; only two of the three secrets in it were rotated, and rotation does not remove them from the file. DO NOT CLOSE THIS TICKET ON THE STRENGTH OF THAT ROTATION. Rotating each exposed secret one at a time is not the fix; the fix is that these values should not be materialized inline into an on-disk record at all (indirect by vault-slot reference resolved at process start), or at minimum the record must never be world-readable - and the 0600 currently holding is a runtime property of one node, re-established by `record_deploy`, not a guarantee that a future writer or a manual copy keeps it. Reported by the noisetable camp, which consumes the same control plane: its own deploy record noisetable.json sits in the SAME directory and was measured in the same pass at 600 root:root, size 706, with ZERO keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL - so noisetable is currently unexposed by luck of payload, not by design, and would carry the same inline cleartext the moment its service needs a credential.")
+/// @yah:gotcha("THE R2 ROTATION DID NOT CLOSE THIS DEFECT - MEASURED FROM THE NOISETABLE CAMP (R131-T19) ON 2026-09-11. The MESOFACT_S3_* pair this ticket names has now been rotated and the record re-applied (`yah cloud apply --service yah-marketing --env cloud`): /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 (mtime 2026-09-11T06:49:28, size 11815) now carries ONLY the new pair - MESOFACT_S3_ACCESS_KEY_ID at /revalidate/env/MESOFACT_S3_ACCESS_KEY_ID hashes <fingerprint> (was <fingerprint>) and MESOFACT_S3_SECRET_ACCESS_KEY at /revalidate/env/MESOFACT_S3_SECRET_ACCESS_KEY hashes <fingerprint>, both matching the vault slots; no stale copy remains anywhere in the record. BUT THE SAME ENV BLOCK STILL HOLDS A THIRD LIVE SECRET THAT WAS NOT ROTATED: CLOUDFLARE_API_TOKEN at /revalidate/env/CLOUDFLARE_API_TOKEN, sha256-16 <fingerprint>, 53 chars, inline in cleartext. Full inventory of that file today, by name and hash only, no value read into any context (extraction and hashing were done on the remote host): CLOUDFLARE_API_TOKEN=<fingerprint>, MESOFACT_S3_ACCESS_KEY_ID=<fingerprint>, MESOFACT_S3_SECRET_ACCESS_KEY=<fingerprint> - three of three keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL, all still materialized inline. PERMISSION BITS MEASURED TODAY: 600 root:root, i.e. this ticket's own chmod remediation is HOLDING and the file is no longer world-readable - the 0644 half of the title is fixed, the secrets-inline half is not. So the underlying defect - live secrets written inline into a deploy record on disk - is UNCHANGED; only two of the three secrets in it were rotated, and rotation does not remove them from the file. DO NOT CLOSE THIS TICKET ON THE STRENGTH OF THAT ROTATION. Rotating each exposed secret one at a time is not the fix; the fix is that these values should not be materialized inline into an on-disk record at all (indirect by vault-slot reference resolved at process start), or at minimum the record must never be world-readable - and the 0600 currently holding is a runtime property of one node, re-established by `record_deploy`, not a guarantee that a future writer or a manual copy keeps it. Reported by the noisetable camp, which consumes the same control plane: its own deploy record noisetable.json sits in the SAME directory and was measured in the same pass at 600 root:root, size 706, with ZERO keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL - so noisetable is currently unexposed by luck of payload, not by design, and would carry the same inline cleartext the moment its service needs a credential.")
 #[cfg(feature = "bundle-serving")]
 impl BundleBackend {
     /// Build a bundle backend over `store`, caching materialized trees under
@@ -713,6 +865,7 @@ impl BundleBackend {
             bind_port,
             ports: Arc::new(kamaji::ports::LedgerPorts::open(&state_dir)),
             records_dir: state_dir.join("deploys"),
+            runs: BundleRuns::default(),
         }
     }
 
@@ -1238,6 +1391,39 @@ impl Registry {
         self.specs.remove(id)
     }
 
+    /// Hold a recorded deploy until yubaba confirms or discards it (R977-B14).
+    pub fn hold_for_owner(&mut self, id: WorkloadId, workload: workload_spec::Workload) {
+        self.held.insert(id, workload);
+    }
+
+    /// End a hold — on a confirming `Deploy` or a discarding `Stop`.
+    pub fn release_held(&mut self, id: &WorkloadId) -> Option<workload_spec::Workload> {
+        self.held.remove(id)
+    }
+
+    /// The spec of a held copy, for `Describe`.
+    pub fn held_spec(&self, id: &WorkloadId) -> Option<workload_spec::Workload> {
+        self.held.get(id).cloned()
+    }
+
+    /// `List` rows for every held copy: `Pending`, no pid, no `spec_digest`.
+    pub fn held_entries(&self) -> Vec<WorkloadEntry> {
+        self.held
+            .iter()
+            .map(|(id, w)| WorkloadEntry {
+                id: id.clone(),
+                state: WorkloadState::Pending,
+                pid: None,
+                mesh_ident: w
+                    .container_spec()
+                    .map(|s| s.expose.mesh.identity.0.clone()),
+                ports: Vec::new(),
+                named_ports: Default::default(),
+                spec_digest: None,
+            })
+            .collect()
+    }
+
     /// Stamp each entry with the digest of the spec it was deployed with.
     ///
     /// Applied to the *merged, deduped* list, after every backend has reported,
@@ -1431,7 +1617,62 @@ async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>) -> Result<()> {
         return Ok(());
     }
 
-    let (mut rd, mut wr) = stream.into_split();
+    let (rd, wr) = stream.into_split();
+    serve_frames(rd, wr, ctx, |msg, ctx| async move { handle_message(msg, &ctx).await }).await
+}
+
+/// R977-B16: which requests must keep their arrival order on a connection.
+///
+/// Everything naming a workload is ordered against everything else naming the
+/// SAME workload (a Stop sent after a Deploy must not overtake it); requests
+/// for different workloads, and the id-less reads, run concurrently. The enum
+/// is `#[non_exhaustive]`, so a new id-carrying variant must be added here.
+fn ordering_key(msg: &YubabaToKamaji) -> Option<String> {
+    use YubabaToKamaji as M;
+    match msg {
+        M::Deploy { id, .. }
+        | M::Stop { id, .. }
+        | M::Drain { id, .. }
+        | M::Probe { id, .. }
+        | M::GracefulUpgrade { id, .. }
+        | M::DeployStatus { id, .. }
+        | M::Describe { id, .. }
+        | M::Logs { id, .. }
+        | M::Exec { id, .. }
+        | M::ArmTail { id, .. } => Some(id.0.clone()),
+        M::Hello { .. } | M::List { .. } | M::Capabilities { .. } => None,
+        _ => None,
+    }
+}
+
+/// The per-connection frame loop, with the handler injected so a test can
+/// stub a slow one.
+///
+/// R977-B16: yubaba's sibling client pipelines EVERY request over one
+/// connection (a demux actor, see `kamaji::sibling`), so this loop used to
+/// await each `handle_message` inline. A 367 s hydrate-on-place for headscale
+/// then stalled fleet-git's Deploy, and every List/Probe behind it, until the
+/// restore finished. Now each request runs in its own task and replies are
+/// written as they complete (the client correlates by `RequestId`). Same-id
+/// requests chain on the previous one's completion signal, so per-workload
+/// order is unchanged. Handlers are detached, never aborted: a peer hanging up
+/// mid-deploy must not cancel a half-done restore.
+async fn serve_frames<H, F>(
+    mut rd: tokio::net::unix::OwnedReadHalf,
+    wr: tokio::net::unix::OwnedWriteHalf,
+    ctx: Arc<ServerCtx>,
+    handler: H,
+) -> Result<()>
+where
+    H: Fn(YubabaToKamaji, Arc<ServerCtx>) -> F + Send + Sync + 'static,
+    F: Future<Output = KamajiToYubaba> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    // Held until the first one-reply request, so a Logs/Exec opening its own
+    // connection can still take the write half over.
+    let mut wr = Some(wr);
+    let mut replies: Option<tokio::sync::mpsc::UnboundedSender<KamajiToYubaba>> = None;
+    let mut chains: HashMap<String, tokio::sync::oneshot::Receiver<()>> = HashMap::new();
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
@@ -1450,14 +1691,63 @@ async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>) -> Result<()> {
                         cursor,
                     },
                     _,
-                )) => {
+                )) if wr.is_some() => {
+                    let mut wr = wr.take().expect("checked is_some");
                     return serve_logs(request_id, id, cursor, &ctx, &mut wr).await;
                 }
-                Ok((msg, consumed)) => {
-                    let reply = handle_message(msg, &ctx).await;
-                    let frame = encode_frame(&reply).context("encode reply")?;
-                    wr.write_all(&frame).await.context("write reply")?;
+                // R969-F7: `Exec` streams the same way and takes over its
+                // dedicated connection likewise.
+                Ok((
+                    YubabaToKamaji::Exec {
+                        request_id,
+                        id,
+                        argv,
+                        env,
+                    },
+                    _,
+                )) if wr.is_some() => {
+                    let mut wr = wr.take().expect("checked is_some");
+                    return serve_exec(request_id, id, argv, env, &ctx, &mut wr).await;
+                }
+                // A streaming request on a connection that already carries
+                // one-reply traffic: the write half belongs to the reply
+                // writer, so it cannot be handed over. The protocol already
+                // says these need a dedicated connection.
+                Ok((YubabaToKamaji::Logs { request_id, .. } | YubabaToKamaji::Exec { request_id, .. }, consumed)) => {
                     buf.drain(..consumed);
+                    let tx = replies.as_ref().expect("wr taken implies a writer");
+                    let _ = tx.send(KamajiToYubaba::Error {
+                        request_id: Some(request_id),
+                        code: ErrorCode::Internal,
+                        message: "Logs/Exec must be sent on a dedicated connection".into(),
+                    });
+                }
+                Ok((msg, consumed)) => {
+                    buf.drain(..consumed);
+                    let tx = replies
+                        .get_or_insert_with(|| spawn_reply_writer(wr.take().expect("write half present")))
+                        .clone();
+                    let after = ordering_key(&msg).map(|key| {
+                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                        (chains.insert(key, done_rx), done_tx)
+                    });
+                    let handler = handler.clone();
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let done = match after {
+                            Some((prev, done)) => {
+                                if let Some(prev) = prev {
+                                    // Err = the predecessor's task is gone; either way it is done.
+                                    let _ = prev.await;
+                                }
+                                Some(done)
+                            }
+                            None => None,
+                        };
+                        let reply = handler(msg, ctx).await;
+                        let _ = tx.send(reply);
+                        drop(done);
+                    });
                 }
                 Err(CodecError::Truncated { .. }) => break,
                 Err(e) => {
@@ -1466,8 +1756,16 @@ async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>) -> Result<()> {
                         code: ErrorCode::Internal,
                         message: format!("decode failed: {e}"),
                     };
-                    if let Ok(frame) = encode_frame(&err_reply) {
-                        let _ = wr.write_all(&frame).await;
+                    match (&replies, wr.as_mut()) {
+                        (Some(tx), _) => {
+                            let _ = tx.send(err_reply);
+                        }
+                        (None, Some(wr)) => {
+                            if let Ok(frame) = encode_frame(&err_reply) {
+                                let _ = wr.write_all(&frame).await;
+                            }
+                        }
+                        (None, None) => {}
                     }
                     return Err(anyhow::anyhow!("decode failed: {e}"));
                 }
@@ -1481,6 +1779,31 @@ async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>) -> Result<()> {
         }
         buf.extend_from_slice(&tmp[..n]);
     }
+}
+
+/// R977-B16: the one task that writes a connection's replies, in completion
+/// order. It ends when the last in-flight handler has sent, so a peer hanging
+/// up never drops an earlier request's reply mid-frame.
+fn spawn_reply_writer(
+    mut wr: tokio::net::unix::OwnedWriteHalf,
+) -> tokio::sync::mpsc::UnboundedSender<KamajiToYubaba> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<KamajiToYubaba>();
+    tokio::spawn(async move {
+        while let Some(reply) = rx.recv().await {
+            let frame = match encode_frame(&reply) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    warn!(error = %e, "encode reply");
+                    continue;
+                }
+            };
+            if let Err(e) = wr.write_all(&frame).await {
+                debug!(error = %e, "write reply; peer gone");
+                return;
+            }
+        }
+    });
+    tx
 }
 
 /// Dispatch one decoded message. Visible for unit testing.
@@ -1561,6 +1884,11 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
                     microvm,
                     // R729-F2: this build serves `Logs` for every backend.
                     log_stream: true,
+                    // R969-F7: `Exec` is containerd task exec, nothing else.
+                    exec: exec_capable(ctx),
+                    // R977-B15: this build serves `ArmTail` and holds floater
+                    // tails on restart until yubaba sends it.
+                    arm_tail: true,
                 },
             }
         }
@@ -1580,7 +1908,20 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             // re-deploying (on the JIT tier, re-binding) everything every
             // sweep. After the dedupe: the surviving row is the one that goes
             // out, and the digest is per-id, not per-backend.
-            ctx.registry.lock().await.stamp_spec_digests(&mut entries);
+            {
+                let registry = ctx.registry.lock().await;
+                registry.stamp_spec_digests(&mut entries);
+                // R977-B14: held copies, appended after the stamp so they keep
+                // `spec_digest: None` — that is how yubaba tells one apart.
+                let live: std::collections::HashSet<_> =
+                    entries.iter().map(|e| e.id.clone()).collect();
+                entries.extend(
+                    registry
+                        .held_entries()
+                        .into_iter()
+                        .filter(|e| !live.contains(&e.id)),
+                );
+            }
             KamajiToYubaba::WorkloadList {
                 request_id,
                 entries,
@@ -1691,11 +2032,29 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
             // never admitted (or admitted before a restart) and is reported as
             // such rather than as an error — see `WorkloadDescription`'s doc
             // for why a guard needs those two apart.
-            let spec = ctx.registry.lock().await.deployed_spec(&id);
+            let spec = {
+                let registry = ctx.registry.lock().await;
+                registry.deployed_spec(&id).or_else(|| registry.held_spec(&id))
+            };
             KamajiToYubaba::WorkloadDescription {
                 request_id,
                 id,
                 spec,
+            }
+        }
+        YubabaToKamaji::ArmTail { request_id, id } => {
+            // R977-B15: yubaba's leader confirmed this node still owns the
+            // floater, so the tail held on restart may now arm.
+            match crate::tail::rearm_one(ctx, &id).await {
+                Ok(()) => KamajiToYubaba::Ack {
+                    request_id,
+                    kind: kamaji_proto::AckKind::ArmTail,
+                },
+                Err(message) => KamajiToYubaba::Error {
+                    request_id: Some(request_id),
+                    code: ErrorCode::BackendRefused,
+                    message,
+                },
             }
         }
         // The Yubaba→Kamaji enum is #[non_exhaustive]; reject any variant
@@ -1759,6 +2118,91 @@ async fn find_live_entry(ctx: &Arc<ServerCtx>, id: &WorkloadId) -> Option<Worklo
         .ok()?
         .into_iter()
         .find(|e| e.id == *id || e.mesh_ident.as_deref() == Some(id.as_str()))
+}
+
+/// Whether this Kamaji can serve `Exec` — only with a containerd backend.
+fn exec_capable(ctx: &ServerCtx) -> bool {
+    #[cfg(feature = "containerd-integration")]
+    {
+        ctx.containerd.is_some()
+    }
+    #[cfg(not(feature = "containerd-integration"))]
+    {
+        let _ = ctx;
+        false
+    }
+}
+
+/// Serve one `Exec` request on its dedicated connection (R969-F7): stream
+/// `ExecOutput` frames while the process runs, then one `ExecExit`, or one
+/// `Error` (`UnknownWorkload` when the workload is not running,
+/// `BackendRefused` otherwise — including a Kamaji with no containerd backend,
+/// since native/microVM workloads have no in-workload exec).
+async fn serve_exec<W: tokio::io::AsyncWrite + Unpin>(
+    request_id: kamaji_proto::RequestId,
+    id: WorkloadId,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    ctx: &Arc<ServerCtx>,
+    wr: &mut W,
+) -> Result<()> {
+    let error = |code, message| KamajiToYubaba::Error {
+        request_id: Some(request_id),
+        code,
+        message,
+    };
+    #[cfg(feature = "containerd-integration")]
+    let reply = if let Some(backend) = ctx.containerd.clone() {
+        use crate::containerd::ExecFailure;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::containerd::ExecChunk>(64);
+        let run = backend.exec(&id, argv, env, tx);
+        let mut run = pin!(run);
+        let output_frame = |chunk: crate::containerd::ExecChunk| KamajiToYubaba::ExecOutput {
+            request_id,
+            stream: match chunk.stream {
+                crate::journal::Stream::Stdout => kamaji_proto::LogStreamTag::Stdout,
+                crate::journal::Stream::Stderr => kamaji_proto::LogStreamTag::Stderr,
+            },
+            data: chunk.data,
+        };
+        let result = loop {
+            tokio::select! {
+                biased;
+                Some(chunk) = rx.recv() => {
+                    let frame = encode_frame(&output_frame(chunk)).context("encode exec output")?;
+                    wr.write_all(&frame).await.context("write exec output")?;
+                }
+                r = &mut run => break r,
+            }
+        };
+        while let Ok(chunk) = rx.try_recv() {
+            let frame = encode_frame(&output_frame(chunk)).context("encode exec output")?;
+            wr.write_all(&frame).await.context("write exec output")?;
+        }
+        match result {
+            Ok(code) => KamajiToYubaba::ExecExit { request_id, code },
+            Err(ExecFailure::NotRunning(m)) => {
+                error(ErrorCode::UnknownWorkload, format!("workload {m} is not running"))
+            }
+            Err(ExecFailure::Other(e)) => error(ErrorCode::BackendRefused, format!("{e:#}")),
+        }
+    } else {
+        error(
+            ErrorCode::BackendRefused,
+            "exec needs the containerd backend; this Kamaji has none".to_string(),
+        )
+    };
+    #[cfg(not(feature = "containerd-integration"))]
+    let reply = {
+        let _ = (id, argv, env, ctx);
+        error(
+            ErrorCode::BackendRefused,
+            "exec needs the containerd backend; this Kamaji was built without it".to_string(),
+        )
+    };
+    let frame = encode_frame(&reply).context("encode exec reply")?;
+    wr.write_all(&frame).await.context("write exec reply")?;
+    Ok(())
 }
 
 /// Serve one `Logs` request on its dedicated connection (R729-F2, W257).
@@ -1990,6 +2434,12 @@ async fn deploy_workload(
     spec: workload_spec::Workload,
     mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
+    // R977-B14: any Deploy of a held id is yubaba confirming ownership; the
+    // copy then starts through this ordinary path (hydrate skips a volume
+    // that survived on disk, and the tail is armed as for any deploy).
+    if ctx.registry.lock().await.release_held(&id).is_some() {
+        info!(id = %id.0, "yubaba confirmed a held copy; deploying it (R977-B14)");
+    }
     let record = spec.clone();
     let reply = dispatch_deploy(ctx, request_id, id.clone(), spec, mesh).await;
     if let KamajiToYubaba::DeployAck { .. } = &reply {
@@ -3152,6 +3602,27 @@ fn no_container_backend_error(request_id: kamaji_proto::RequestId) -> KamajiToYu
 /// a bundle workload is therefore not wired — a `Drain` returns
 /// `DrainAck { accepted:false, reason:"unknown workload" }`; teardown is via
 /// `Stop`, which routes to both runtimes' idempotent `teardown_workload`.
+///
+/// @yah:relay(R983, "Kamaji bundle deploy: serve process can lag the recorded digest (filed from noisetable R841-B9)")
+/// @yah:at(2026-10-14T05:40:50Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+///
+/// @yah:ticket(R983-B1, "site.deploy leaves a bundle node's serve process on the OLD bundle while kamaji's record says the new digest")
+/// @yah:status(review)
+/// @yah:at(2026-10-14T23:03:39Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R983)
+/// @yah:severity(high)
+/// @yah:handoff("Filed from noisetable R841-B9; recon not done in yah, code path unverified. Observed 2026-10-13: after `yah qed run site.deploy env=prod` (run 15a715ce), prod bundle node us-south-001 kept serving its Oct 11 bundle 0ae933a7 in its serve process (`ps` showed the old digest) while kamaji's record, and `yah cloud service rolling --env prod --dry-run noisetable-marketing`, said 15e0cde9f858. Prod load-balances across us-east-001 and us-south-001, so 6 of 12 curl samples of /features/chips/add returned the stale 26150 B HTML and 6 the new 31219 B. Suspected cause (inference, not read from code): the deploy/announce RPC records the new digest (BundleBackend::record_deploy, server.rs ~:3314) without re-forking the serve process. Workaround that fixed it: `yah cloud service rolling --env prod --machine us-south-001 noisetable-marketing` (then 10/10 samples at 31219 B).")
+/// @yah:next("Read deploy_bundle_keepalive and the native supervisor path in oss/kamaji to confirm whether a deploy of a different digest on an already-running workload id reuses the resident process; make the deploy replace the process (or fail loudly) whenever the running digest differs from the recorded one, and add a test that asserts the serve child's --bundle dir matches the recorded digest after a second deploy.")
+/// @yah:verify("After a site.deploy with a changed bundle, `ps` on every bundle node shows the new digest in serve --bundle, and ~10 curl samples of one route return a single byte length.")
+/// @yah:handoff("ROOT CAUSE, read from us-south-001's kamaji journal (read-only ssh): `2026-10-14T03:03:24Z WARN asynchronous bundle deploy failed id=noisetable reason=materialize bundle 15e0cde9…: GET https://cdn.noisetable.com/blobs/22901bc4…: error sending request`. The filer's guess (record without re-fork) was close but not it: native deploy_workload DOES tear down + re-fork by ident. Admission persists the record (intent) BEFORE the async materialize; the materialize failed on a transient CDN GET, so the predecessor (0ae933a7) kept serving while the record said 15e0cde9, and nothing ever reconciled the two.")
+/// @yah:handoff("FIX (oss/kamaji/crates/kamaji-bin/src/server.rs): (1) new BundleRuns on BundleBackend — per-workload generation + fork gate. spawn_bundle_run takes a ticket; run_bundle_keepalive/on_demand materialize outside the gate, then fork only under the gate AND only if still the newest generation (else BundleRunError::Superseded, touching neither process nor DeployStatus). (2) A failed run reports Failed with detail '... (attempt N; retrying in Ns — any previously deployed process ... is still serving its old bundle)' and retries on capped backoff (5s doubling to 300s) until it lands or is superseded — the record is intent and the node now converges on it. (3) Stop calls runs.supersede() and tears down under the gate, so an in-flight run cannot resurrect a stopped workload. (4) Lifecycle switch: keep-alive run tears down the JIT copy of the ident first, on-demand run tears down the native copy (previously the other runtime's process survived a redeploy that changed lifecycle). Progress writes (Running/Failed) happen under the gate so a Stop in between is never overwritten.")
+/// @yah:handoff("Also found while reading: two more stale-process paths closed by the same gate — a slower older run forking AFTER a newer one (no per-id ordering existed), and a resume-at-restart racing a fresh apply.")
+/// @yah:verify("cargo test -p kamaji-bin --features bundle-serving --lib (from oss/kamaji): 298 passed / 0 failed, incl. 3 new tests: a_failed_bundle_run_retries_until_the_node_serves_the_recorded_digest (the incident: deploy old, inject GET failure, redeploy new → Failed+'retrying', ps argv still old; heal store → Running, ps argv `serve --bundle <cache>/bundles/<new>`), a_superseded_run_that_finishes_last_does_not_replace_the_newer_deploy, a_stop_during_materialize_is_not_undone_by_the_in_flight_run. cargo check --all-targets clean (only pre-existing warnings).")
+/// @yah:verify("MUTATION: with BundleRuns::enter's is_current check disabled, the overtake and stop tests both FAIL (argv showed the stale digest; 'a stopped workload was forked') — they test the gate, not the happy path.")
+/// @yah:verify("NOT YET ON THE FLEET: needs a kamaji build + `yah cloud rollout` to reach us-east-001/us-south-001 (operator's call). Live check after roll: site.deploy with a changed bundle, `ps` on every bundle node shows the new digest in serve --bundle, ~10 curl samples of one route return one byte length.")
+/// @yah:gotcha("CLI side unchanged: `yah cloud apply`'s wait_for_bundle_deploy bails on the first Failed — correct (loud) — but its 404/Err arms print 'not waiting' and return Ok, so a deploy-status that can't be read still reads as success. Not touched here (app/yah/cli/src/cloud.rs ~:14136).")
 #[allow(unused_variables)]
 async fn deploy_mesofact_bundle(
     ctx: &Arc<ServerCtx>,
@@ -3262,9 +3733,29 @@ async fn deploy_mesofact_bundle(
 /// Route by lifecycle: keep-alive forks a resident process (R599-F10);
 /// on-demand hands the socket to a lazily-forked, idle-reaped process
 /// (R599-F6). Both share the materialize + serve-bin-resolution front.
+///
+/// R983-B1: **the record is intent, and the run converges on it.** Admission
+/// writes the record before any of this runs, so a run that fails — a
+/// transient blob GET is the observed case — used to leave the node with a
+/// record naming the new digest and a process still serving the old one, with
+/// nothing that would ever reconcile the two. us-south-001 sat in exactly that
+/// state for noisetable-marketing (2026-10-14T03:03Z, `materialize bundle
+/// 15e0cde9…: GET https://cdn.noisetable.com/blobs/…: error sending request`)
+/// and served stale HTML for half of prod's traffic until someone noticed.
+///
+/// So a failed run now reports `Failed` (the caller polling `DeployStatus`
+/// still sees it and fails loudly) and then retries on a capped backoff until
+/// it lands or a newer deploy / `Stop` supersedes it ([`BundleRuns`]). The
+/// predecessor keeps serving while it does — on-node availability is not
+/// traded for the convergence — and the `Failed` detail says so.
 #[cfg(feature = "bundle-serving")]
 async fn spawn_bundle_run(ctx: &Arc<ServerCtx>, record: BundleDeployRecord) {
     let id = WorkloadId::new(&record.id);
+    let Some(backend) = ctx.bundle.as_ref() else {
+        return;
+    };
+    let ticket = backend.runs.begin(&record.id);
+    let (first_backoff, max_backoff) = backend.runs.retry_backoff();
     ctx.registry
         .lock()
         .await
@@ -3278,45 +3769,96 @@ async fn spawn_bundle_run(ctx: &Arc<ServerCtx>, record: BundleDeployRecord) {
             mesh: task_mesh,
             ..
         } = record;
-        let outcome = match &task_bundle.lifecycle {
-            workload_spec::BundleLifecycle::KeepAlive => {
-                run_bundle_keepalive(
-                    &task_ctx,
-                    &id,
-                    &task_bundle,
-                    task_revalidate.as_ref(),
-                    task_mesh.as_ref(),
-                )
-                .await
+        let mut backoff = first_backoff;
+        for attempt in 1u32.. {
+            let outcome = match &task_bundle.lifecycle {
+                workload_spec::BundleLifecycle::KeepAlive => {
+                    run_bundle_keepalive(
+                        &task_ctx,
+                        &ticket,
+                        &id,
+                        &task_bundle,
+                        task_revalidate.as_ref(),
+                        task_mesh.as_ref(),
+                    )
+                    .await
+                }
+                workload_spec::BundleLifecycle::OnDemand { idle_ttl } => {
+                    let idle_ttl = *idle_ttl;
+                    run_bundle_on_demand(
+                        &task_ctx,
+                        &ticket,
+                        &id,
+                        &task_bundle,
+                        idle_ttl,
+                        task_revalidate.as_ref(),
+                        task_mesh.as_ref(),
+                    )
+                    .await
+                }
+            };
+            let reason = match outcome {
+                Ok(()) => {
+                    if attempt > 1 {
+                        info!(id = %id.0, digest = %task_bundle.digest.0, attempt,
+                            "bundle deploy converged on its recorded digest after retrying (R983-B1)");
+                    }
+                    // Under the gate, so a `Stop` that landed after the fork
+                    // is not overwritten by a stale `Running`.
+                    let Some(_gate) = gate_if_current(&task_ctx, &ticket).await else {
+                        return;
+                    };
+                    task_ctx
+                        .registry
+                        .lock()
+                        .await
+                        .set_deploy_progress(id, DeployProgress::at(WorkloadState::Running));
+                    return;
+                }
+                Err(BundleRunError::Superseded) => {
+                    debug!(id = %id.0, digest = %task_bundle.digest.0,
+                        "bundle run superseded by a newer deploy or a Stop; standing down (R983-B1)");
+                    return;
+                }
+                Err(BundleRunError::Failed(reason)) => reason,
+            };
+            // Nobody is waiting on this call any more, so the log is the only
+            // place an operator not polling will ever see it.
+            warn!(id = %id.0, %reason, attempt, retry_in_secs = backoff.as_secs(),
+                "asynchronous bundle deploy failed; will retry (R983-B1)");
+            let Some(gate) = gate_if_current(&task_ctx, &ticket).await else {
+                return;
+            };
+            task_ctx.registry.lock().await.set_deploy_progress(
+                id.clone(),
+                DeployProgress::failed(format!(
+                    "{reason} (attempt {attempt}; retrying in {}s — any previously deployed \
+                     process for this workload is still serving its old bundle until a retry \
+                     lands)",
+                    backoff.as_secs()
+                )),
+            );
+            drop(gate);
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+            let still_current = task_ctx
+                .bundle
+                .as_ref()
+                .is_some_and(|b| b.runs.is_current(&ticket));
+            if !still_current {
+                return;
             }
-            workload_spec::BundleLifecycle::OnDemand { idle_ttl } => {
-                let idle_ttl = *idle_ttl;
-                run_bundle_on_demand(
-                    &task_ctx,
-                    &id,
-                    &task_bundle,
-                    idle_ttl,
-                    task_revalidate.as_ref(),
-                    task_mesh.as_ref(),
-                )
-                .await
-            }
-        };
-        let progress = match outcome {
-            Ok(()) => DeployProgress::at(WorkloadState::Running),
-            Err(reason) => {
-                // Nobody is waiting on this call any more, so the log is the
-                // only place an operator not polling will ever see it.
-                warn!(id = %id.0, %reason, "asynchronous bundle deploy failed");
-                DeployProgress::failed(reason)
-            }
-        };
-        task_ctx
-            .registry
-            .lock()
-            .await
-            .set_deploy_progress(id, progress);
+        }
     });
+}
+
+/// [`BundleRuns::enter`] through the ctx's backend.
+#[cfg(feature = "bundle-serving")]
+async fn gate_if_current(
+    ctx: &Arc<ServerCtx>,
+    ticket: &BundleRunTicket,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    ctx.bundle.as_ref()?.runs.enter(ticket).await
 }
 
 #[cfg(feature = "bundle-serving")]
@@ -3481,6 +4023,18 @@ impl ServerCtx {
                     .await
                     .set_deployed_spec(id, record.workload.clone());
                 resumed += 1;
+                continue;
+            }
+            if held_until_owner_confirms(&record.workload) {
+                info!(
+                    id = %record.id,
+                    "recorded containerd deploy carries a workload-intent stamp; held until \
+                     yubaba confirms this node still owns it (R977-B14)"
+                );
+                self.registry
+                    .lock()
+                    .await
+                    .hold_for_owner(id, record.workload.clone());
                 continue;
             }
             info!(id = %record.id, "resuming recorded containerd deploy after restart (R964-B1)");
@@ -3653,11 +4207,12 @@ async fn materialize_and_resolve_serve(
 #[cfg(feature = "bundle-serving")]
 async fn run_bundle_keepalive(
     ctx: &Arc<ServerCtx>,
+    ticket: &BundleRunTicket,
     id: &WorkloadId,
     bundle: &workload_spec::MesofactServeBundle,
     revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
     mesh: Option<&kamaji_proto::MeshAssignment>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), BundleRunError> {
     use std::net::SocketAddr;
 
     // Admission already established the backend is present; re-borrowing it in
@@ -3669,6 +4224,21 @@ async fn run_bundle_keepalive(
         .ok_or_else(|| format!("bundle backend vanished between admission and deploy of {}", id.0))?;
 
     let (bundle_dir, serve_bin) = materialize_and_resolve_serve(backend, id, bundle).await?;
+
+    // R983-B1: everything from here on replaces the running process, so it
+    // happens under the workload's gate and only if no newer deploy (or Stop)
+    // has been admitted while this one materialized.
+    let Some(_gate) = backend.runs.enter(ticket).await else {
+        return Err(BundleRunError::Superseded);
+    };
+
+    // A lifecycle switch (on-demand → keep-alive) must not leave the JIT
+    // runtime holding the socket and serving the previous bundle beside us.
+    backend
+        .jit
+        .teardown_workload(&workload_spec::MeshIdent(id.0.clone()))
+        .await
+        .map_err(|e| format!("tearing down the on-demand predecessor of {}: {e:#}", id.0))?;
 
     // Materialized — the fork is next, which is what `Starting` means.
     ctx.registry
@@ -3766,18 +4336,33 @@ async fn run_bundle_keepalive(
 #[cfg(feature = "bundle-serving")]
 async fn run_bundle_on_demand(
     ctx: &Arc<ServerCtx>,
+    ticket: &BundleRunTicket,
     id: &WorkloadId,
     bundle: &workload_spec::MesofactServeBundle,
     idle_ttl: workload_spec::Millis,
     revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
     mesh: Option<&kamaji_proto::MeshAssignment>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), BundleRunError> {
     let backend = ctx
         .bundle
         .as_ref()
         .ok_or_else(|| format!("bundle backend vanished between admission and deploy of {}", id.0))?;
 
     let (bundle_dir, serve_bin) = materialize_and_resolve_serve(backend, id, bundle).await?;
+
+    // R983-B1: same gate as keep-alive — see `run_bundle_keepalive`.
+    let Some(_gate) = backend.runs.enter(ticket).await else {
+        return Err(BundleRunError::Superseded);
+    };
+
+    // A lifecycle switch (keep-alive → on-demand) must not leave the resident
+    // native process serving the previous bundle — and holding the port this
+    // runtime is about to bind.
+    backend
+        .native
+        .teardown_workload(&workload_spec::MeshIdent(id.0.clone()))
+        .await
+        .map_err(|e| format!("tearing down the keep-alive predecessor of {}: {e:#}", id.0))?;
 
     ctx.registry
         .lock()
@@ -4674,6 +5259,11 @@ pub(crate) async fn stop_workload(
     // fenced by a corpse. The reverse (stopping the tail slightly early) costs
     // at most the last interval's frames, which the next node's hydrate does
     // not need because it restores from what did land.
+    // R977-B14: a Stop of a held copy is yubaba discarding it. The teardown
+    // below is idempotent and forgets its resume record like any other stop.
+    if ctx.registry.lock().await.release_held(&id).is_some() {
+        info!(id = %id.0, "yubaba discarded a held copy (R977-B14)");
+    }
     ctx.tail.stop(&id).await;
     // …and the record that would otherwise re-arm it on the next restart
     // (R932). Best-effort rather than a refusal, unlike the bundle record
@@ -4814,6 +5404,11 @@ pub(crate) async fn stop_workload(
     #[cfg(feature = "bundle-serving")]
     if let Some(backend) = &ctx.bundle {
         let ident = workload_spec::MeshIdent(id.0.clone());
+        // R983-B1: supersede any run of this workload still materializing, and
+        // tear down under its gate, so a fork already past its check finishes
+        // before the teardown rather than landing after it and resurrecting a
+        // stopped workload.
+        let _gate = backend.runs.supersede(&id.0).lock_owned().await;
         // Both runtimes' teardown is idempotent (Ok when the ident is absent), so
         // routing every Stop to both — even a non-bundle one — is safe and keeps
         // Stop's idempotent contract. A given identity lives in at most one.
@@ -4979,6 +5574,77 @@ mod tests {
         WorkloadState as WireWorkloadState,
     };
 
+    /// R977-B16 harness: `serve_frames` over a socketpair with a handler that
+    /// takes `slow` for requests naming `slow_id`, and replies `Ack` at once
+    /// otherwise. Returns the client half. The handler stands in for
+    /// `handle_message`; what is under test is the connection's dispatch.
+    fn serve_stub(slow_id: &'static str, slow: std::time::Duration) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (rd, wr) = server.into_split();
+        tokio::spawn(serve_frames(rd, wr, Arc::new(ServerCtx::new()), move |msg, _ctx| async move {
+            let key = ordering_key(&msg);
+            let YubabaToKamaji::Stop { request_id, .. } = msg else {
+                panic!("stub only speaks Stop");
+            };
+            if key.as_deref() == Some(slow_id) {
+                tokio::time::sleep(slow).await;
+            }
+            KamajiToYubaba::Ack { request_id, kind: AckKind::Stop }
+        }));
+        client
+    }
+
+    async fn read_reply(rd: &mut tokio::net::unix::OwnedReadHalf, buf: &mut Vec<u8>) -> KamajiToYubaba {
+        loop {
+            if let Ok((reply, used)) = decode_frame::<KamajiToYubaba>(buf) {
+                buf.drain(..used);
+                return reply;
+            }
+            let mut tmp = [0u8; 4096];
+            let n = rd.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "server closed");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    fn stop(rid: u64, id: &str) -> Vec<u8> {
+        encode_frame(&YubabaToKamaji::Stop { request_id: RequestId(rid), id: WorkloadId::new(id) }).unwrap()
+    }
+
+    fn rid_of(reply: &KamajiToYubaba) -> u64 {
+        match reply {
+            KamajiToYubaba::Ack { request_id, .. } => request_id.0,
+            other => panic!("expected Ack, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_request_for_one_workload_does_not_delay_another_on_the_same_connection() {
+        // Run 3's shape: headscale's hydrate-on-place holds its request for
+        // minutes while fleet-git's arrives on the same pipelined connection.
+        let (mut rd, mut wr) = serve_stub("headscale", std::time::Duration::from_secs(3)).into_split();
+        wr.write_all(&stop(1, "headscale")).await.unwrap();
+        wr.write_all(&stop(2, "fleet-git")).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut buf = Vec::new();
+        let first = read_reply(&mut rd, &mut buf).await;
+        assert_eq!(rid_of(&first), 2, "fleet-git answered first");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "fleet-git waited {:?}", started.elapsed());
+        assert_eq!(rid_of(&read_reply(&mut rd, &mut buf).await), 1, "headscale still answered");
+    }
+
+    #[tokio::test]
+    async fn requests_for_the_same_workload_keep_their_order() {
+        let (mut rd, mut wr) = serve_stub("headscale", std::time::Duration::from_millis(300)).into_split();
+        wr.write_all(&stop(1, "headscale")).await.unwrap();
+        wr.write_all(&stop(2, "headscale")).await.unwrap();
+        wr.write_all(&stop(3, "headscale")).await.unwrap();
+        let mut buf = Vec::new();
+        for want in [1, 2, 3] {
+            assert_eq!(rid_of(&read_reply(&mut rd, &mut buf).await), want);
+        }
+    }
+
     #[tokio::test]
     async fn hello_with_current_version_returns_welcome() {
         let ctx = Arc::new(ServerCtx::new());
@@ -5019,6 +5685,63 @@ mod tests {
                 assert_eq!(request_id, RequestId(7));
                 assert!(entries.is_empty());
             }
+            other => panic!("expected WorkloadList, got {other:?}"),
+        }
+    }
+
+    /// R977-B14: the restart-resume gate. A stamped spec is held (never
+    /// started); an unstamped one keeps R964-B1's resume.
+    #[test]
+    fn only_a_stamped_spec_is_held_until_its_owner_confirms() {
+        let unstamped = env_carrying_workload("X");
+        assert!(!held_until_owner_confirms(&unstamped));
+        let mut spec = unstamped.container_spec().unwrap().clone();
+        spec.annotations
+            .insert(WORKLOAD_INTENT_STAMP_ANNOTATION.into(), "0:7".into());
+        assert!(held_until_owner_confirms(&workload_spec::Workload::container(spec)));
+    }
+
+    /// R977-B14: a held copy is visible to yubaba (List: Pending, no digest;
+    /// Describe: its spec) and a Stop discards the hold.
+    #[tokio::test]
+    async fn a_held_copy_is_listed_described_and_discarded_by_stop() {
+        let ctx = Arc::new(ServerCtx::new());
+        let id = WorkloadId::new("fleet-git");
+        let workload = env_carrying_workload("X");
+        ctx.registry
+            .lock()
+            .await
+            .hold_for_owner(id.clone(), workload.clone());
+
+        match handle_message(YubabaToKamaji::List { request_id: RequestId(1) }, &ctx).await {
+            KamajiToYubaba::WorkloadList { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].id, id);
+                assert_eq!(entries[0].state, WorkloadState::Pending);
+                assert!(entries[0].pid.is_none());
+                assert!(entries[0].spec_digest.is_none());
+            }
+            other => panic!("expected WorkloadList, got {other:?}"),
+        }
+        match handle_message(
+            YubabaToKamaji::Describe { request_id: RequestId(2), id: id.clone() },
+            &ctx,
+        )
+        .await
+        {
+            KamajiToYubaba::WorkloadDescription { spec, .. } => {
+                assert_eq!(spec.as_ref(), Some(&workload))
+            }
+            other => panic!("expected WorkloadDescription, got {other:?}"),
+        }
+        let _ = handle_message(
+            YubabaToKamaji::Stop { request_id: RequestId(3), id: id.clone() },
+            &ctx,
+        )
+        .await;
+        assert!(ctx.registry.lock().await.held_spec(&id).is_none());
+        match handle_message(YubabaToKamaji::List { request_id: RequestId(4) }, &ctx).await {
+            KamajiToYubaba::WorkloadList { entries, .. } => assert!(entries.is_empty()),
             other => panic!("expected WorkloadList, got {other:?}"),
         }
     }
@@ -7136,13 +7859,30 @@ mod tests {
             with_serve: bool,
             extra_bins: &[&str],
         ) -> String {
+            // A serve bin that just sleeps so the supervised child stays up.
+            let serve: &[u8] = b"#!/bin/sh\nexec sleep 30\n";
+            publish_self_bundle_from(
+                store,
+                "<html>home</html>",
+                with_serve.then_some(serve),
+                extra_bins,
+            )
+        }
+
+        /// The general form: `body` varies `app/index.html` (so two calls give
+        /// two digests), `serve` is the `bins/<triple>/serve` script if any.
+        fn publish_self_bundle_from(
+            store: &dyn ObjectStore,
+            body: &str,
+            serve: Option<&[u8]>,
+            extra_bins: &[&str],
+        ) -> String {
             let dir = tempfile::tempdir().unwrap();
             let mut files: Vec<(String, Vec<u8>)> =
-                vec![("app/index.html".to_string(), b"<html>home</html>".to_vec())];
-            if with_serve {
-                // A serve bin that just sleeps so the supervised child stays up.
+                vec![("app/index.html".to_string(), body.as_bytes().to_vec())];
+            if let Some(script) = serve {
                 let serve_rel = format!("bins/{}/serve", node_triple());
-                files.push((serve_rel, b"#!/bin/sh\nexec sleep 30\n".to_vec()));
+                files.push((serve_rel, script.to_vec()));
             }
             for name in extra_bins {
                 files.push((
@@ -8373,6 +9113,248 @@ mod tests {
                 &ctx,
             )
             .await;
+        }
+
+        // ── R983-B1: the serve process converges on the recorded digest ──────
+
+        /// A store whose GETs fail while `fail` is set and sleep `slow_ms`
+        /// while it is non-zero — the two ways a node's materialize goes wrong.
+        struct GatedStore {
+            inner: Arc<dyn ObjectStore>,
+            fail: std::sync::atomic::AtomicBool,
+            slow_ms: std::sync::atomic::AtomicU64,
+        }
+
+        impl GatedStore {
+            fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+                Arc::new(Self {
+                    inner,
+                    fail: Default::default(),
+                    slow_ms: Default::default(),
+                })
+            }
+        }
+
+        impl ObjectStore for GatedStore {
+            fn put(&self, key: &str, data: Vec<u8>) -> Result<(), yah_object_store::Error> {
+                self.inner.put(key, data)
+            }
+            fn get(&self, key: &str) -> Result<Option<Vec<u8>>, yah_object_store::Error> {
+                use std::sync::atomic::Ordering;
+                let slow = self.slow_ms.load(Ordering::SeqCst);
+                if slow > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(slow));
+                }
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(yah_object_store::Error::Io(format!(
+                        "GET {key}: error sending request (injected)"
+                    )));
+                }
+                self.inner.get(key)
+            }
+            fn delete(&self, key: &str) -> Result<(), yah_object_store::Error> {
+                self.inner.delete(key)
+            }
+            fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, yah_object_store::Error> {
+                self.inner.list_prefix(prefix)
+            }
+        }
+
+        /// A serve script that does NOT `exec`, so the supervised pid stays the
+        /// shell and its argv keeps `serve --bundle <cache>/bundles/<digest>` —
+        /// the same thing `ps` showed on us-south-001.
+        const ARGV_VISIBLE_SERVE: &[u8] = b"#!/bin/sh\nsleep 30\n";
+
+        fn r983_ctx(store: Arc<GatedStore>) -> (Arc<ServerCtx>, tempfile::TempDir, tempfile::TempDir) {
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let mut backend = BundleBackend::new(
+                store,
+                cache.path(),
+                state.path(),
+                kamaji::observe::Collector::disabled(),
+            );
+            backend.runs = BundleRuns::default().with_retry_backoff(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(100),
+            );
+            (Arc::new(ServerCtx::new().with_bundle_backend(backend)), cache, state)
+        }
+
+        async fn r983_deploy(ctx: &Arc<ServerCtx>, id: &str, digest: &str) {
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(983),
+                    id: WorkloadId::new(id),
+                    spec: serve_bundle_workload(digest, BundleLifecycle::KeepAlive),
+                    mesh: None,
+                },
+                ctx,
+            )
+            .await;
+            assert!(
+                matches!(reply, KamajiToYubaba::DeployAck { .. }),
+                "expected DeployAck, got {reply:?}"
+            );
+        }
+
+        /// The argv of the process the native runtime is supervising for `id`.
+        async fn serving_argv(ctx: &Arc<ServerCtx>, id: &str) -> Option<String> {
+            use kamaji::Kamaji as _;
+            let states = ctx.bundle.as_ref()?.native.list_workloads().await.ok()?;
+            let state = states.into_iter().find(|s| s.ident.0 == id)?;
+            let pid = state.container_id.strip_prefix("native-")?.to_string();
+            let out = std::process::Command::new("ps")
+                .args(["-o", "args=", "-p", &pid])
+                .output()
+                .ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+
+        /// Poll `DeployStatus` until it reads `Running`, riding through any
+        /// `Failed` a retrying run reports on the way.
+        async fn await_running(ctx: &Arc<ServerCtx>, id: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut last = None;
+            loop {
+                let reply = handle_message(
+                    YubabaToKamaji::DeployStatus {
+                        request_id: RequestId(984),
+                        id: WorkloadId::new(id),
+                    },
+                    ctx,
+                )
+                .await;
+                if let KamajiToYubaba::DeployStatusResult { state, detail, .. } = reply {
+                    if state == WorkloadState::Running {
+                        return;
+                    }
+                    last = Some((state, detail));
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{id} never converged to Running; last status {last:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn r983_stop(ctx: &Arc<ServerCtx>, id: &str) {
+            let _ = handle_message(
+                YubabaToKamaji::Stop {
+                    request_id: RequestId(985),
+                    id: WorkloadId::new(id),
+                },
+                ctx,
+            )
+            .await;
+        }
+
+        /// The us-south-001 incident. A redeploy is recorded at admission, its
+        /// materialize then fails on a blob GET, and the predecessor keeps
+        /// serving the OLD bundle. Before R983-B1 that was the node's final
+        /// state — record says new, `ps` says old, nothing reconciles. Now the
+        /// failure is still reported (a polling caller fails loudly), the old
+        /// process keeps serving meanwhile, and the run retries until the serve
+        /// child's `--bundle` dir is the recorded digest.
+        #[tokio::test]
+        async fn a_failed_bundle_run_retries_until_the_node_serves_the_recorded_digest() {
+            let inner: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let old = publish_self_bundle_from(inner.as_ref(), "<html>old</html>", Some(ARGV_VISIBLE_SERVE), &[]);
+            let new = publish_self_bundle_from(inner.as_ref(), "<html>new</html>", Some(ARGV_VISIBLE_SERVE), &[]);
+            assert_ne!(old, new);
+            let store = GatedStore::new(inner);
+            let (ctx, _cache, _state) = r983_ctx(Arc::clone(&store));
+
+            r983_deploy(&ctx, "site", &old).await;
+            await_deploy_ok(&ctx, "site").await;
+            let argv = serving_argv(&ctx, "site").await.expect("old bundle forked");
+            assert!(argv.contains(&old), "expected the old digest in {argv:?}");
+
+            store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+            r983_deploy(&ctx, "site", &new).await;
+            let (state, detail) = await_deploy(&ctx, "site").await;
+            assert_eq!(state, WorkloadState::Failed, "the injected GET failure must surface");
+            let detail = detail.unwrap_or_default();
+            assert!(detail.contains("retrying"), "Failed must say it is retrying: {detail}");
+            let argv = serving_argv(&ctx, "site").await.expect("predecessor still supervised");
+            assert!(
+                argv.contains(&old),
+                "while the new bundle cannot be fetched the old process keeps serving: {argv:?}"
+            );
+
+            store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+            await_running(&ctx, "site").await;
+            let argv = serving_argv(&ctx, "site").await.expect("new bundle forked");
+            assert!(
+                argv.contains(&new) && !argv.contains(&old),
+                "the serve child must run the recorded digest {new}, got {argv:?}"
+            );
+
+            r983_stop(&ctx, "site").await;
+        }
+
+        /// Two runs of one workload in flight: the OLDER one is stuck in a slow
+        /// GET while the newer one lands. Before R983-B1 the older run forked
+        /// last and replaced the newer process — record new, process old.
+        #[tokio::test]
+        async fn a_superseded_run_that_finishes_last_does_not_replace_the_newer_deploy() {
+            let inner: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let old = publish_self_bundle_from(inner.as_ref(), "<html>old</html>", Some(ARGV_VISIBLE_SERVE), &[]);
+            let new = publish_self_bundle_from(inner.as_ref(), "<html>new</html>", Some(ARGV_VISIBLE_SERVE), &[]);
+            let store = GatedStore::new(inner);
+            let (ctx, _cache, _state) = r983_ctx(Arc::clone(&store));
+
+            store.slow_ms.store(400, std::sync::atomic::Ordering::SeqCst);
+            r983_deploy(&ctx, "site", &old).await;
+            // Let the old run enter its slow GET, then make the store fast for
+            // the redeploy that overtakes it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            store.slow_ms.store(0, std::sync::atomic::Ordering::SeqCst);
+            r983_deploy(&ctx, "site", &new).await;
+            await_running(&ctx, "site").await;
+
+            // Give the old run ample time to finish its materialize and reach
+            // the fork step it must now decline.
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            let argv = serving_argv(&ctx, "site").await.expect("a serve child is supervised");
+            assert!(
+                argv.contains(&new) && !argv.contains(&old),
+                "the last admitted deploy must be the one running, got {argv:?}"
+            );
+
+            r983_stop(&ctx, "site").await;
+        }
+
+        /// A `Stop` while a run is still materializing must stay a stop: the run
+        /// stands down rather than forking a workload the operator removed.
+        #[tokio::test]
+        async fn a_stop_during_materialize_is_not_undone_by_the_in_flight_run() {
+            let inner: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle_from(inner.as_ref(), "<html>x</html>", Some(ARGV_VISIBLE_SERVE), &[]);
+            let store = GatedStore::new(inner);
+            let (ctx, _cache, _state) = r983_ctx(Arc::clone(&store));
+
+            store.slow_ms.store(300, std::sync::atomic::Ordering::SeqCst);
+            r983_deploy(&ctx, "site", &digest).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            r983_stop(&ctx, "site").await;
+            store.slow_ms.store(0, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+            assert_eq!(serving_argv(&ctx, "site").await, None, "a stopped workload was forked");
+            let reply = handle_message(
+                YubabaToKamaji::DeployStatus {
+                    request_id: RequestId(986),
+                    id: WorkloadId::new("site"),
+                },
+                &ctx,
+            )
+            .await;
+            assert!(
+                matches!(reply, KamajiToYubaba::Error { code: ErrorCode::UnknownWorkload, .. }),
+                "a stopped workload must not report a deploy status, got {reply:?}"
+            );
         }
 
         /// Polling a workload this kamaji never admitted must be

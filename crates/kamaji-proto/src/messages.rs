@@ -358,6 +358,8 @@ pub enum AckKind {
     /// Ack for [`YubabaToKamaji::GracefulUpgrade`] (R600-F9). Appended last to
     /// keep the postcard discriminants of the prior variants wire-stable.
     GracefulUpgrade,
+    /// Ack for [`YubabaToKamaji::ArmTail`] (R977-B15). Appended last.
+    ArmTail,
 }
 
 /// Wire-level error codes. The accompanying `message` carries the concrete
@@ -515,6 +517,33 @@ pub enum YubabaToKamaji {
         id: WorkloadId,
         cursor: Option<String>,
     },
+    /// Run `argv` inside the named workload's running container (R969-F7).
+    ///
+    /// Same stream shape as [`Self::Logs`], and for the same reason sent only
+    /// on a **dedicated** connection: Kamaji answers with any number of
+    /// [`KamajiToYubaba::ExecOutput`] frames and closes with exactly one
+    /// [`KamajiToYubaba::ExecExit`] (or an `Error`). `env` entries are added to
+    /// the container's own process env, overriding a same-named key.
+    ///
+    /// Appended last and gated on [`NodeCapabilities::exec`], not a
+    /// [`ProtocolVersion`] bump — the `Logs` precedent.
+    Exec {
+        request_id: RequestId,
+        id: WorkloadId,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    /// Re-arm the durability tail of a workload this node is already running,
+    /// in adopt mode, without redeploying it (R977-B15). Sent by yubaba's
+    /// floater effector once the leader has confirmed this node still owns the
+    /// floater — a kamaji restart deliberately leaves a floater's tail un-armed
+    /// rather than deciding ownership on its own. Answered with
+    /// [`KamajiToYubaba::Ack`] `{ kind: AckKind::ArmTail }`, or an `Error`.
+    ///
+    /// Appended last so no existing discriminant moves; a caller must gate it
+    /// on a capability flag (the `Logs` / `Exec` precedent), which lands with
+    /// the server-side handler.
+    ArmTail { request_id: RequestId, id: WorkloadId },
 }
 
 /// Which stdio stream a [`LogRecord`] came from.
@@ -710,6 +739,17 @@ pub enum KamajiToYubaba {
         request_id: RequestId,
         cursor: Option<String>,
     },
+    /// A chunk of an [`YubabaToKamaji::Exec`] process's output (R969-F7). Raw
+    /// bytes, not lines: an exec'd shell's output need not be UTF-8 or
+    /// newline-terminated.
+    ExecOutput {
+        request_id: RequestId,
+        stream: LogStreamTag,
+        data: Vec<u8>,
+    },
+    /// The single clean close of an [`YubabaToKamaji::Exec`] stream: the
+    /// process exited with `code` and its output is drained.
+    ExecExit { request_id: RequestId, code: i32 },
 }
 
 /// What one Kamaji can actually dispatch to (R858-T4).
@@ -757,6 +797,16 @@ pub struct NodeCapabilities {
     /// answer its own `/logs` with 501.
     #[serde(default)]
     pub log_stream: bool,
+    /// Whether this Kamaji serves [`YubabaToKamaji::Exec`] (R969-F7) — `true`
+    /// only with the containerd backend attached. Defaults to `false`, which
+    /// genuinely means "cannot", exactly as `log_stream` does.
+    #[serde(default)]
+    pub exec: bool,
+    /// Whether this Kamaji serves [`YubabaToKamaji::ArmTail`] (R977-B15).
+    /// Defaults to `false`, which genuinely means "cannot": such a kamaji still
+    /// re-arms every tail itself on restart, floaters included.
+    #[serde(default)]
+    pub arm_tail: bool,
 }
 
 /// Live microVM-backend health, folded into [`NodeCapabilities`] (R605-T27).
@@ -833,7 +883,9 @@ impl KamajiToYubaba {
             | Self::WorkloadDescription { request_id, .. }
             | Self::DeployAck { request_id, .. }
             | Self::LogBatch { request_id, .. }
-            | Self::LogEnd { request_id, .. } => Some(*request_id),
+            | Self::LogEnd { request_id, .. }
+            | Self::ExecOutput { request_id, .. }
+            | Self::ExecExit { request_id, .. } => Some(*request_id),
             Self::Error { request_id, .. } => *request_id,
             Self::Welcome { .. } | Self::WorkloadStarted { .. } | Self::WorkloadExited { .. } => {
                 None
@@ -917,6 +969,8 @@ mod reply_correlation_tests {
                         detail: None,
                     },
                     log_stream: true,
+                    exec: true,
+                    arm_tail: true,
                 },
             },
             // R870-B24: a `None` spec is still an ANSWER to a request, so it
@@ -1030,6 +1084,38 @@ mod log_stream_wire_tests {
         assert_eq!(back, req);
     }
 
+    /// R969-F7: `Exec` and its replies are appended after the `Logs` family.
+    #[test]
+    fn exec_frames_are_appended_and_correlate() {
+        let req = YubabaToKamaji::Exec {
+            request_id: RequestId(3),
+            id: WorkloadId::new("forge.abc"),
+            argv: vec!["sh".into(), "-c".into(), "true".into()],
+            env: vec![("K".into(), "V".into())],
+        };
+        assert_eq!(postcard::to_allocvec(&req).unwrap()[0], 11);
+        let out = KamajiToYubaba::ExecOutput {
+            request_id: RequestId(3),
+            stream: LogStreamTag::Stderr,
+            data: vec![0xff, b'\n'],
+        };
+        let exit = KamajiToYubaba::ExecExit {
+            request_id: RequestId(3),
+            code: 7,
+        };
+        assert_eq!(postcard::to_allocvec(&out).unwrap()[0], 15);
+        assert_eq!(postcard::to_allocvec(&exit).unwrap()[0], 16);
+        for msg in [out, exit] {
+            let frame = encode_frame(&msg).unwrap();
+            let (back, _): (KamajiToYubaba, usize) = decode_frame(&frame).unwrap();
+            assert_eq!(back.reply_request_id(), Some(RequestId(3)));
+            assert_eq!(back, msg);
+        }
+        let frame = encode_frame(&req).unwrap();
+        let (back, _): (YubabaToKamaji, usize) = decode_frame(&frame).unwrap();
+        assert_eq!(back, req);
+    }
+
     #[test]
     fn capabilities_without_log_stream_mean_cannot() {
         // A pre-F2 Kamaji's capability blob has no `log_stream` key.
@@ -1037,5 +1123,6 @@ mod log_stream_wire_tests {
             "microvm":{"attached":false,"kvm_ok":null,"detail":null}}"#;
         let caps: NodeCapabilities = serde_json::from_str(json).unwrap();
         assert!(!caps.log_stream);
+        assert!(!caps.exec);
     }
 }

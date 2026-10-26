@@ -71,6 +71,40 @@
 //! @yah:gotcha("INERT ON EVERY NODE UNTIL A KAMAJI RELEASE IS ROLLED — do not read a green build as \"us-east-001 is shipping again\". Source only; no node has this binary. The live re-arm on us-east-001 is still owed and belongs to noisetable R131-B36, which this ticket was raised from.")
 //! @yah:gotcha("THE FIRST RESTART AFTER THE ROLL STILL LOSES AN ALREADY-ARMED TAIL, and that is not a defect in the fix — it is its boundary. A record only exists for a tail armed BY THIS BINARY, so a workload whose tail was armed by the old kamaji has nothing under /var/lib/yah/kamaji/tails for resume to read. Closing that on a live node takes one redeploy of each durable workload after the roll (`yah cloud workload deploy <name>`), which writes the record; every restart after that is covered. Whoever rolls this should treat \"redeploy the durable workloads once\" as part of the roll, not as a separate task.")
 //! @yah:assumes("NOTHING RAN AGAINST A LINUX NODE. No ssh, no roll, no deploy; the eight-day symptom itself was never reproduced, only the mechanism @Miravel:polaris read from source. Two specific things are therefore unproven by test: (a) resume_later's retry branch — no test drives it, because a failing `live_workload_entries` needs a configured backend that errors, and no backend can be attached to ServerCtx without one of the feature-gated runtimes and a real socket; the success branch it shares with the inline path IS tested. (b) The stall watchdog's threshold assumes `turso-backup-tail` prints one line per round unconditionally — read at oss/turso-backup/src/bin/tail.rs:149, where every non-fenced RoundOutcome::Backed prints round_json — so silence means a stopped tail rather than an idle database. If that ever becomes conditional, the warn turns into a false alarm on quiet workloads.")
+//!
+//! @yah:ticket(R932-B2, "R932 restart re-arm takes a NEW ownership epoch for a stale container, fencing the live owner on another node; then the stale copy is torn down, leaving zero owners and a spliced WAL chain that refuses restore")
+//! @yah:status(review)
+//! @yah:at(2026-10-15T18:30:43Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R932)
+//! @yah:severity(high)
+//! @yah:next("Found from the noisetable camp 2026-10-15; api.noisetable.com has been down since then (edge /health: api.noisetable.com total_upstreams 0). Journal sequence, read on the nodes: (1) us-south-001 kamaji 2026-10-13T17:40:19Z deploys noisetable-account; its durability tail starts at epoch 39 (displaced epoch 38) and streams 'current' rounds. (2) us-west-001 kamaji restarts; at 17:47:01Z 're-armed a durability tail after restart (R932)' for noisetable-account. That node had last run the workload on 10-10; its container record was stale. The tail starts at epoch 40 and displaces epoch 39, owner us-south-001. (3) 17:47:03Z us-west-001 stops that tail and tears the container down. (4) 17:47:11Z us-south-001's tail reports FENCED ('epoch 39 was superseded by epoch 40 (owner us-west-001)') and stops the live instance. Result: no node runs the workload.")
+//! @yah:next("Second-order damage: a redeploy pinned to us-west-001 (2026-10-15, `yah cloud workload deploy noisetable-account --where=node:us-west-001`) is refused at hydrate with 'generation #1 was written under WAL salt a0b0e8ba/77418174 but the chain starts at salt d35b33b3/22e3f61e ... the source WAL was RECREATED mid-stream ... Restore needs a fresh tier-1a snapshot' (turso-backup stream.rs:1945). So the epoch-40 tail appended frames from us-west's stale 10-10 WAL onto the chain. The refusal is correct; the bug is that resume let a stale node write at all.")
+//! @yah:next("Fix direction (inference, not proven): resume must not take a fresh epoch. It should re-assert its own recorded epoch, and if the claim has moved to another owner it must stand down, not displace. a_recorded_tail_is_not_re_armed_for_a_workload_this_node_is_not_running covers 'not live here'; it does not cover 'live here in containerd, but the ownership moved away while this kamaji was down'.")
+//! @yah:verify("Unit test: a recorded tail whose workload is still listed live, but whose ownership claim moved to another node at a higher epoch, is NOT re-armed, and no claim is written. On the fleet after the roll: restarting kamaji on a node holding a stale container of a floated workload leaves the live owner's epoch unchanged.")
+//! @yah:handoff("FIXED IN SOURCE. A resume no longer mints an epoch. turso-backup: TailRequest.adopt (tail.rs) — with adopt set, start() reads the claim; owner==us keeps the existing epoch (no write), owner!=us returns new TailRefusal::ClaimMoved (nothing written), absent claim acquires. bin/tail.rs reads ADOPT=1 and turns ClaimMoved into the fence verdict (prints outcome:fenced, exit 2) so kamaji's existing supervise path stops the stale container. kamaji-bin/tail.rs: arm()/launch()/command() carry adopt; resume's rearm() arms with adopt=true, Deploy's spawn() with false (placement still displaces on purpose); supervised restarts inherit the arming's adopt, so a resumed tail never bumps epoch on a retry either. Relies on owner_label being the node hostname (stable across restarts), already true in hydrate.rs.")
+//! @yah:handoff("Discovered: nothing outside the two files needed change; TailRequest has no other constructor outside turso-backup tests.")
+//! @yah:verify("oss/turso-backup `cargo test --lib tail::` EXIT 0, 13 passed incl. 3 new: a_resume_after_the_claim_moved_takes_no_new_epoch (claim stays at B's epoch), a_resume_by_the_claim_holder_keeps_its_epoch, a_resume_on_an_unclaimed_prefix_acquires.")
+//! @yah:verify("oss/kamaji `cargo test -p kamaji-bin --lib --features bundle-serving tail::` EXIT 0, 16 passed; the_helper_environment_matches_the_declaration now asserts deploy has no ADOPT and resume sets ADOPT=1. Full kamaji radius and root/yubaba cargo check were NOT re-run after this change.")
+//! @yah:verify("Not exercised: an end-to-end kamaji→real turso-backup-tail binary run; the tail binary must be rolled alongside kamaji (old helper ignores ADOPT and would still take a new epoch).")
+//! @yah:gotcha("ROLL BOTH BINARIES: kamaji and turso-backup-tail ship separately; a new kamaji with the old helper silently keeps the B2 bug because the old helper ignores ADOPT.")
+//!
+//! @yah:ticket(R932-T3, "Restore noisetable-account (api.noisetable.com, noisetable sign-in) from us-south-001's fenced 10-13 copy via a fresh tier-1a snapshot, then redeploy")
+//! @yah:status(review)
+//! @yah:at(2026-10-15T18:37:04Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R932)
+//! @yah:next("Operator 2026-10-15 (noisetable camp): hand the rebuild to the yah camp. api.noisetable.com is 503 with total_upstreams 0, and noisetable sign-in ('send link') fails with 'no ready upstreams'. Cause and journal sequence: R932-B2.")
+//! @yah:next("AUTHORITATIVE COPY: us-south-001:/var/lib/yah/kamaji/volumes/noisetable-account-data/{account,grants,projects,sessions}.db{,-wal}.displaced-1791913634. The suffix decodes to 2026-10-13T17:47:14Z, the moment the live instance was fenced: its S3 restore at 17:40 plus 7 minutes of service. The other copies are older. us-west-001's live set was last written 10-10 (account WAL 02:00, projects WAL 02:15), and us-east-001's on 09-23. sha256 prefixes of the authoritative WALs: account d5a18662685def31, projects cd2d727c3598298e, sessions e22c3112408237b7, grants 202ce9e2733fe875. Nothing was modified by the noisetable session; the refused us-west deploy left us-west's files intact.")
+//! @yah:next("Then: seed a fresh tier-1a snapshot from that set (turso-backup snapshot_and_upload / its snapshot bin) into s3://noisetable-account-backup/noisetable-account, and deploy with `yah cloud workload deploy noisetable-account --where=node:<node>`. Plain deploy refuses because the volume exists on 3 nodes. Ideally land R932-B2 first, or at least restart no kamaji on us-west-001/us-east-001 mid-restore.")
+//! @yah:verify("`curl -s https://api.noisetable.com/health` shows api.noisetable.com ready_upstreams 1. `curl -s -o /dev/null -w '%{http_code}' https://api.noisetable.com/api/v1/status` = 200 on 5/5 polls. A magic-link request from the iOS app no longer says 'no ready upstreams'. Row counts in account.db match the authoritative copy.")
+//! @yah:soft_depends_on(R932-B2)
+//! @yah:handoff("RESTORED 2026-10-15 ~18:36Z. Took the authoritative set (us-south-001 *.displaced-1791913634; WAL sha256 prefixes matched the ticket), ran turso-backup-snapshot per subject into s3://noisetable-account-backup/noisetable-account/<subject>.db (4 new tier-1a snapshots, snapshot-017920893*.db), then MOVED (copy+verify+delete, not deleted) each subject's generations/*.manifest and latest.stream-watermark to noisetable-account/superseded-20261015/ — the stream restore lists every manifest regardless of snapshot age, so a fresh snapshot alone would not have cleared the spliced chain. Full pre-change copy of the prefix is at /tmp/t3/bucket-backup on the camp Mac.")
+//! @yah:handoff("No manual deploy was needed: the yubaba floater on us-south-001 retries every ~30s, hydrated from the new snapshots on its next tick (18:36:44, epoch 5792), started the container and the stream tail (epoch 5793, 'current' rounds). Row counts verified from the new snapshots: account users=2 refresh_tokens=11 ownership=10; projects published_patch=58; sessions session_binding=3; same as the previous snapshot.")
+//! @yah:handoff("Found while there: claim epoch had climbed 40 -> 5788 because that floater's failed hydrate attempts each take the claim every ~30s while the chain was unrestorable. Harmless to correctness, but a failing hydrate should not mint an epoch per retry — worth a ticket.")
+//! @yah:verify("curl https://api.noisetable.com/api/v1/status = 200 on 5/5 polls; /health shows api.noisetable.com ready_upstreams 1 total 1.")
+//! @yah:verify("NOT checked: an actual magic-link request from the iOS app; account.db row counts vs the authoritative copy were compared against the prior snapshot, not via the running service.")
+//! @yah:gotcha("Stale volumes remain on us-west-001 (last written 10-10) and us-east-001 (09-23). B2's fix is not rolled: until kamaji+turso-backup-tail are rolled, restarting kamaji on either node can re-run the epoch-bump bug against the live owner on us-south-001.")
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -146,6 +180,12 @@ pub struct TailRecord {
     pub workload: String,
     /// The helper's whole invocation, re-derived at arm time from nothing else.
     pub args: HydrateArgs,
+    /// `spec.wants_float()` at deploy time (R977-B15). A floater's owner is
+    /// raft's answer, not this node's, so its tail is re-armed through
+    /// [`rearm_one`] once yubaba's leader has confirmed this node still owns
+    /// it. Defaults to `false` for records written before the field existed.
+    #[serde(default)]
+    pub floater: bool,
 }
 
 /// The tails this node is running, one per workload, plus the on-disk record of
@@ -205,6 +245,10 @@ struct Arming {
     stopping: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     last_output: Arc<AtomicU64>,
+    /// R932-B2: this arming is a resume, so the helper (and every supervised
+    /// restart of it) runs with `ADOPT=1` — keep the claim this node holds, never
+    /// mint a new epoch, and exit with the fence verdict if the claim moved.
+    adopt: bool,
 }
 
 impl TailSupervisor {
@@ -445,6 +489,7 @@ pub async fn spawn(ctx: &Arc<ServerCtx>, id: &WorkloadId, spec: &WorkloadSpec) -
         id: id.0.clone(),
         workload: spec.name.clone(),
         args,
+        floater: spec.wants_float(),
     };
     ctx.tail.record(&record).map_err(|e| {
         format!(
@@ -455,7 +500,7 @@ pub async fn spawn(ctx: &Arc<ServerCtx>, id: &WorkloadId, spec: &WorkloadSpec) -
         )
     })?;
 
-    arm(ctx, id, &record, &helper).await?;
+    arm(ctx, id, &record, &helper, false).await?;
     Ok(true)
 }
 
@@ -467,15 +512,17 @@ async fn arm(
     id: &WorkloadId,
     record: &TailRecord,
     helper: &Path,
+    adopt: bool,
 ) -> Result<(), String> {
     let arming = Arming {
+        adopt,
         token: ctx.tail.next_token.fetch_add(1, Ordering::Relaxed),
         stopping: Arc::new(AtomicBool::new(false)),
         shutdown: Arc::new(Notify::new()),
         last_output: Arc::new(AtomicU64::new(now_millis())),
     };
 
-    let (mut child, pid) = launch(helper, &ctx.durability_credentials, record)?;
+    let (mut child, pid) = launch(helper, &ctx.durability_credentials, record, adopt)?;
     let stdout = child.stdout.take();
     ctx.tail.running.lock().await.insert(
         id.clone(),
@@ -584,8 +631,9 @@ fn launch(
     helper: &Path,
     creds: &BucketCredentials,
     record: &TailRecord,
+    adopt: bool,
 ) -> Result<(Child, u32), String> {
-    let child = command(helper, creds, &record.args)
+    let child = command(helper, creds, &record.args, adopt)
         .map_err(|e| format!("workload {}: {e}", record.workload))?
         .spawn()
         .map_err(|e| {
@@ -652,6 +700,7 @@ async fn supervise(
         stopping,
         shutdown,
         last_output,
+        adopt,
     } = arming;
     let mut child = Some(first);
     let mut failures: u32 = 0;
@@ -669,7 +718,7 @@ async fn supervise(
                 ctx.tail.release(&id, token).await;
                 return;
             }
-            match launch(&helper, &ctx.durability_credentials, &record) {
+            match launch(&helper, &ctx.durability_credentials, &record, adopt) {
                 Ok((mut next, pid)) => {
                     let stdout = next.stdout.take();
                     if !ctx.tail.claim_pid(&id, token, pid).await {
@@ -867,10 +916,20 @@ async fn rearm(
             );
             continue;
         }
+        if record.floater {
+            // R977-B15: a floater's owner is raft's answer, not "whichever
+            // kamaji restarted last". Hold the tail until yubaba's leader
+            // confirms this node still owns it and sends `ArmTail`.
+            info!(
+                id = %record.id,
+                "durability tail held until yubaba confirms floater ownership (R977-B15)"
+            );
+            continue;
+        }
         if ctx.tail.is_running(&id).await {
             continue;
         }
-        match arm(ctx, &id, &record, helper).await {
+        match arm(ctx, &id, &record, helper, true).await {
             Ok(()) => {
                 armed += 1;
                 info!(
@@ -882,6 +941,58 @@ async fn rearm(
         }
     }
     armed
+}
+
+/// Re-arm one recorded tail, in adopt mode, for a workload this node is
+/// running — the handler behind `YubabaToKamaji::ArmTail` (R977-B15). yubaba
+/// calls it once its leader has confirmed this node still owns the floater, so
+/// the ownership question is answered by raft rather than by whichever node's
+/// kamaji restarted last. Already armed is success, and so is no record (a
+/// floater that declares no durability has nothing to arm, and yubaba sends
+/// this on every confirmed renewal); no helper, or a workload this node is not
+/// running, is an error, and nothing is armed.
+pub async fn rearm_one(ctx: &Arc<ServerCtx>, id: &WorkloadId) -> Result<(), String> {
+    let Some(record) = ctx.tail.recorded().into_iter().find(|r| r.id == id.0) else {
+        return Ok(());
+    };
+    let Some(helper) = ctx.tail_helper.clone() else {
+        return Err(no_helper_for_rearm(&record));
+    };
+    let live = crate::server::live_workload_entries(ctx).await?;
+    rearm_one_against(ctx, &helper, &record, &live).await
+}
+
+fn no_helper_for_rearm(record: &TailRecord) -> String {
+    format!(
+        "workload {}: this node was started without --tail-helper, so its durability tail cannot \
+         be re-armed",
+        record.workload
+    )
+}
+
+/// [`rearm_one`] with the live view passed in, so it is testable without a
+/// backend.
+async fn rearm_one_against(
+    ctx: &Arc<ServerCtx>,
+    helper: &Path,
+    record: &TailRecord,
+    live: &[kamaji_proto::WorkloadEntry],
+) -> Result<(), String> {
+    let id = WorkloadId::new(&record.id);
+    let state = live.iter().find(|e| e.id == id).map(|e| e.state);
+    if !state.is_some_and(is_live) {
+        return Err(format!(
+            "workload {}: not running on this node ({state:?}); arming its tail would fence the node \
+             that is",
+            record.workload
+        ));
+    }
+    if ctx.tail.is_running(&id).await {
+        return Ok(());
+    }
+    arm(ctx, &id, record, helper, true).await?;
+    info!(id = %record.id, tier = record.args.tier.as_str(), "re-armed a durability tail on yubaba's request (R977-B15)");
+    Ok(())
 }
 
 /// Whether a backend row means "this workload is running here *now*". Draining
@@ -900,8 +1011,12 @@ fn command(
     helper: &std::path::Path,
     creds: &BucketCredentials,
     args: &HydrateArgs,
+    adopt: bool,
 ) -> Result<tokio::process::Command, String> {
     let mut cmd = tokio::process::Command::new(helper);
+    if adopt {
+        cmd.env("ADOPT", "1");
+    }
     cmd.env("VOLUME_ROOT", &args.volume_root)
         .env("SUBJECTS", args.subjects.join(","))
         .env("TIER", args.tier.as_str())
@@ -977,7 +1092,7 @@ mod tests {
         let HydratePlan::Declared(args) = plan(&spec).unwrap() else {
             panic!("a declared spec must plan");
         };
-        let cmd = command(std::path::Path::new("/bin/true"), &creds(), &args).unwrap();
+        let cmd = command(std::path::Path::new("/bin/true"), &creds(), &args, false).unwrap();
         let envs: HashMap<String, Option<String>> = cmd
             .as_std()
             .get_envs()
@@ -989,7 +1104,7 @@ mod tests {
         assert_eq!(envs.get("S3_ACCESS_KEY__YAH_HEADSCALE"), Some(&None));
         assert_eq!(envs.get("S3_SECRET_KEY__BACKUPS"), Some(&None));
 
-        let err = command(std::path::Path::new("/bin/true"), &BucketCredentials::default(), &args)
+        let err = command(std::path::Path::new("/bin/true"), &BucketCredentials::default(), &args, false)
             .unwrap_err();
         assert!(err.contains("S3_ACCESS_KEY__BACKUPS"), "{err}");
     }
@@ -1060,7 +1175,7 @@ mod tests {
         let HydratePlan::Declared(args) = plan(&spec).unwrap() else {
             panic!("a declared spec must plan");
         };
-        let cmd = command(std::path::Path::new("/bin/true"), &creds(), &args).unwrap();
+        let cmd = command(std::path::Path::new("/bin/true"), &creds(), &args, false).unwrap();
         let env: HashMap<String, String> = cmd
             .as_std()
             .get_envs()
@@ -1068,6 +1183,15 @@ mod tests {
                 Some((k.to_str()?.to_string(), v?.to_str()?.to_string()))
             })
             .collect();
+        // R932-B2: a placement never asks the helper to adopt; only a resume does.
+        assert!(!env.contains_key("ADOPT"), "a deploy must displace, not adopt");
+        let resumed = command(std::path::Path::new("/bin/true"), &creds(), &args, true).unwrap();
+        let adopt = resumed
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_str() == Some("ADOPT"))
+            .and_then(|(_, v)| v.and_then(|v| v.to_str()));
+        assert_eq!(adopt, Some("1"), "a resume must keep its claim, not mint an epoch");
         assert_eq!(env.get("S3_BUCKET").map(String::as_str), Some("backups"));
         assert_eq!(env.get("BACKUP_PREFIX").map(String::as_str), Some("acct"));
         assert_eq!(env.get("TIER").map(String::as_str), Some("stream"));
@@ -1247,6 +1371,7 @@ mod tests {
             id: "acct".into(),
             workload: "acct".into(),
             args,
+            floater: false,
         };
         ctx.tail.record(&record).unwrap();
         assert!(!ctx.tail.is_running(&id).await);
@@ -1255,6 +1380,91 @@ mod tests {
         assert_eq!(rearm(&ctx, &helper, ctx.tail.recorded(), &live).await, 1);
         assert!(ctx.tail.is_running(&id).await, "the tail was not re-armed");
         ctx.tail.stop(&id).await;
+    }
+
+    /// R977-B15: a floater's tail is held on restart, even for a workload this
+    /// node is still running; only yubaba's `ArmTail` arms it.
+    #[tokio::test]
+    async fn a_floater_tail_is_not_re_armed_on_restart_until_arm_tail() {
+        let helper = fake_helper("floaterhold", "#!/bin/sh\nexec sleep 30\n");
+        let ctx = ctx_for("floaterhold", Some(helper.clone()));
+        let id = WorkloadId("acct".into());
+        let HydratePlan::Declared(args) = plan(&spec_with_durability()).unwrap() else {
+            panic!("a declared spec must plan");
+        };
+        let record = TailRecord {
+            id: "acct".into(),
+            workload: "acct".into(),
+            args,
+            floater: true,
+        };
+        ctx.tail.record(&record).unwrap();
+
+        let live = vec![live_row("acct", WorkloadState::Running)];
+        assert_eq!(rearm(&ctx, &helper, ctx.tail.recorded(), &live).await, 0);
+        assert!(!ctx.tail.is_running(&id).await, "a floater tail re-armed itself");
+        assert_eq!(ctx.tail.recorded().len(), 1, "the held record must survive");
+
+        rearm_one_against(&ctx, &helper, &record, &live).await.unwrap();
+        assert!(ctx.tail.is_running(&id).await, "ArmTail did not arm the held tail");
+        ctx.tail.stop(&id).await;
+    }
+
+    /// R977-B15: yubaba's `ArmTail` path. Arms against a live row in adopt
+    /// mode, is a no-op when already armed, and refuses for a workload this
+    /// node is not running.
+    #[tokio::test]
+    async fn rearm_one_arms_only_a_running_workload_and_is_idempotent() {
+        let helper = fake_helper("rearmone", "#!/bin/sh\nexec sleep 30\n");
+        let ctx = ctx_for("rearmone", Some(helper.clone()));
+        let id = WorkloadId("acct".into());
+        let HydratePlan::Declared(args) = plan(&spec_with_durability()).unwrap() else {
+            panic!("a declared spec must plan");
+        };
+        let record = TailRecord {
+            id: "acct".into(),
+            workload: "acct".into(),
+            args,
+            floater: true,
+        };
+        ctx.tail.record(&record).unwrap();
+
+        let pending = vec![live_row("acct", WorkloadState::Pending)];
+        assert!(rearm_one_against(&ctx, &helper, &record, &pending).await.is_err());
+        assert!(!ctx.tail.is_running(&id).await);
+
+        let live = vec![live_row("acct", WorkloadState::Running)];
+        rearm_one_against(&ctx, &helper, &record, &live).await.unwrap();
+        assert!(ctx.tail.is_running(&id).await);
+        rearm_one_against(&ctx, &helper, &record, &live).await.unwrap();
+        ctx.tail.stop(&id).await;
+    }
+
+    /// A record written before R977-B15 has no `floater` key and reads as a
+    /// non-floater, and a floater spec records `floater: true`.
+    #[test]
+    fn the_floater_bit_defaults_off_and_follows_the_spec() {
+        let HydratePlan::Declared(args) = plan(&spec_with_durability()).unwrap() else {
+            panic!("a declared spec must plan");
+        };
+        let mut v = serde_json::to_value(TailRecord {
+            id: "acct".into(),
+            workload: "acct".into(),
+            args,
+            floater: true,
+        })
+        .unwrap();
+        v.as_object_mut().unwrap().remove("floater");
+        let old: TailRecord = serde_json::from_value(v).unwrap();
+        assert!(!old.floater);
+
+        let mut spec = spec_with_durability();
+        assert!(!spec.wants_float());
+        spec.annotations.insert(
+            workload_spec::FLOAT_ANNOTATION.into(),
+            workload_spec::FLOAT_VALUE.into(),
+        );
+        assert!(spec.wants_float());
     }
 
     /// And the half that keeps the re-arm from being a weapon. A tail takes the
@@ -1272,6 +1482,7 @@ mod tests {
                 id: "acct".into(),
                 workload: "acct".into(),
                 args,
+                floater: false,
             })
             .unwrap();
 

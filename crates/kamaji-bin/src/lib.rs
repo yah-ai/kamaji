@@ -63,6 +63,8 @@ pub mod journal;
 pub mod logs;
 pub mod pidfd;
 pub mod probe;
+/// R971-B11: apply `restart_policy` to containerd tasks.
+pub mod restart;
 pub mod server;
 /// R850-F1: supervise the declared backup while a stateful workload runs, and
 /// stop that workload when its tail reports another node owns the state.

@@ -65,17 +65,17 @@
 //! @yah:parent(R881)
 //! @yah:severity(high)
 //! @yah:gotcha("R881-T3'S PREMISE IS WRONG FOR A LOOPBACK STUB RESOLVER, AND THE TEST BESIDE IT ALREADY NAMES THE HAZARD. lib.rs:1145-1152 justifies widening the resolv.conf bind past wants_host_network() with: \"a workload joining a namespace kamaji wired has a default route and egress NAT, so the host's resolver is exactly as reachable from inside it as from the host.\" That holds only when the host's nameserver is a ROUTABLE address. On Debian/Ubuntu with systemd-resolved — the fleet's OS — /etc/resolv.conf is the stub `nameserver 127.0.0.53`, and loopback is PER-NETNS. Bind-mounting it into an isolated netns hands the container a 127/8 address with nothing listening behind it. The test docstring at lib.rs:1817-1820 states the exact failure mode it produces: \"a resolv.conf pointing at an unreachable nameserver turns an instant failure into a DNS timeout on every lookup.\" That is what shipped — through the loopback door the author did not check, not the empty-netns door they did.")
-//! @yah:gotcha("MEASURED LIVE, NOT INFERRED — us-east-001 (51.81.85.145), containerd ns `yah`, workload noisetable-account, pid 628063, 2026-09-10 by @Glimmerstone:griffin from the noisetable camp. Read-only; NOTHING was changed on the node and no file was edited in either repo. Inside the container's netns: `ip -4 addr` = lo + `eth0@if8 inet 10.128.3.2/24`, `ip route` = `default via 10.128.3.1 dev eth0` — so R881's addressing fix IS working and this is the next layer down, not a regression of it. Inside its mount ns: /etc/resolv.conf = `nameserver 127.0.0.53` + `search .`, i.e. the host's systemd-resolved stub-resolv.conf verbatim. Egress is FINE and that is the discriminator: from inside the netns, TCP connect to 34.149.236.64:587 (smtp.mailgun.org) SUCCEEDS, as does :443, and TCP 1.1.1.1:53 succeeds. Only name resolution fails. The user-visible symptom was `POST https://api.noisetable.com/api/v1/auth/magic-link/request` returning 502 {\"error\":\"mailer_transport\",\"message\":\"mailer transport: smtp: Connection error: failed to lookup address information: Try again\"} — EAI_AGAIN, the timeout shape, exactly as the test docstring predicts.")
+//! @yah:gotcha("MEASURED LIVE, NOT INFERRED — us-east-001 (203.0.113.13), containerd ns `yah`, workload noisetable-account, pid 628063, 2026-09-10 by @Glimmerstone:griffin from the noisetable camp. Read-only; NOTHING was changed on the node and no file was edited in either repo. Inside the container's netns: `ip -4 addr` = lo + `eth0@if8 inet 10.128.3.2/24`, `ip route` = `default via 10.128.3.1 dev eth0` — so R881's addressing fix IS working and this is the next layer down, not a regression of it. Inside its mount ns: /etc/resolv.conf = `nameserver 127.0.0.53` + `search .`, i.e. the host's systemd-resolved stub-resolv.conf verbatim. Egress is FINE and that is the discriminator: from inside the netns, TCP connect to 34.149.236.64:587 (smtp.mailgun.org) SUCCEEDS, as does :443, and TCP 1.1.1.1:53 succeeds. Only name resolution fails. The user-visible symptom was `POST https://api.noisetable.com/api/v1/auth/magic-link/request` returning 502 {\"error\":\"mailer_transport\",\"message\":\"mailer transport: smtp: Connection error: failed to lookup address information: Try again\"} — EAI_AGAIN, the timeout shape, exactly as the test docstring predicts.")
 //! @yah:next("FIX SITE IS ONE `if`: oss/kamaji/crates/kamaji-containerd-core/src/lib.rs:1153-1159. Today it is `let has_ip_egress = spec.wants_host_network() || pod.join_netns.is_some();` then an unconditional bind of /etc/resolv.conf. The bind is right for a HOST-networked workload (loopback there IS the host's, so 127.0.0.53 resolves) and wrong for an isolated netns. Suggested shape, but the design is the picker-upper's: when NOT wants_host_network(), parse the host /etc/resolv.conf and if every `nameserver` line is in 127.0.0.0/8, do not bind it — bind /run/systemd/resolve/resolv.conf instead, which systemd-resolved maintains with the REAL upstream servers and which exists on every fleet node. Fall back to synthesizing a file under the workload's state dir if neither is usable. Do NOT simply hardcode 1.1.1.1: kamaji already has a resolver-selection precedent on the microVM path (MicroVmConfig.network.dns, default 1.1.1.1, oss/kamaji/crates/kamaji/src/microvm.rs) and the container path should reuse that policy rather than invent a second one — plausibly by making the resolver a field the spec can set, which is also what an air-gapped or split-horizon node will need.")
 //! @yah:verify("EXTEND THE EXISTING TEST RATHER THAN ADDING A PARALLEL ONE — `a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not` at lib.rs:1822 is the right home and its docstring already argues this ticket's case. It needs a third axis the OCI-spec-only assertion cannot reach today: WHICH file gets bound, given a host resolv.conf whose nameservers are all loopback. That means factoring the choice into a pure function (host resolv.conf contents + netns shape -> source path or None) so it is unit-testable without a node, then asserting: all-loopback + isolated netns -> /run/systemd/resolve/resolv.conf; all-loopback + host netns -> /etc/resolv.conf (unchanged, still correct); routable nameserver + isolated netns -> /etc/resolv.conf (unchanged); no usable source -> no mount, since runc refuses a missing source.")
-//! @yah:verify("LIVE ACCEPTANCE, END TO END, AND IT NEEDS THE noisetable CAMP: after redeploying kamaji to us-east-001, `sudo nsenter -t $(sudo ctr -n yah t ls | grep account | awk '{print $2}') -n getent hosts smtp.mailgun.org` returns an address, and then `curl -sS -X POST https://api.noisetable.com/api/v1/auth/magic-link/request -H 'Content-Type: application/json' -H 'Origin: https://noisetable.com' -d '{\"email\":\"<an address you can read>\"}'` returns 2xx instead of the 502 above AND the mail arrives. That last leg is the real oracle: the Mailgun event log for noisetable.com currently shows ZERO events ever, so a non-502 with no delivered event would mean this ticket moved the failure rather than fixed it. Node access is `ssh -i ~/.ssh/yah debian@51.81.85.145` — a bare `ssh debian@...` is publickey-denied.")
+//! @yah:verify("LIVE ACCEPTANCE, END TO END, AND IT NEEDS THE noisetable CAMP: after redeploying kamaji to us-east-001, `sudo nsenter -t $(sudo ctr -n yah t ls | grep account | awk '{print $2}') -n getent hosts smtp.mailgun.org` returns an address, and then `curl -sS -X POST https://api.noisetable.com/api/v1/auth/magic-link/request -H 'Content-Type: application/json' -H 'Origin: https://noisetable.com' -d '{\"email\":\"<an address you can read>\"}'` returns 2xx instead of the 502 above AND the mail arrives. That last leg is the real oracle: the Mailgun event log for noisetable.com currently shows ZERO events ever, so a non-502 with no delivered event would mean this ticket moved the failure rather than fixed it. Node access is `ssh -i ~/.ssh/yah debian@203.0.113.13` — a bare `ssh debian@...` is publickey-denied.")
 //! @yah:verify("CROSS-REPO POINTER: the consumer-side ticket is noisetable R131-T12 (.yah/services/noisetable-api/mirrors/cloud.toml), currently in review believing the deploy is complete. It is not — sign-in is dead at the mail step for this reason. Whoever fixes this should say so there; that camp's operator was asking why no email had arrived when this was found.")
 //! @yah:gotcha("BLAST RADIUS IS EVERY ISOLATED-NETNS CONTAINER ON THE FLEET, not one noisetable service. Any workload that resolves a name — fetching from crates.io, calling an external API, reaching an SMTP relay, talking to another service by hostname — is broken the same way the moment it stops being host-networked, and it fails as a slow timeout rather than a clean error, so it will read as flakiness. noisetable-account is merely the first one deployed in that shape, exactly as it was the first to hit R881 itself. Tier: Warrior — the diagnosis is finished and the fix site is one branch, but it needs a real test seam, a kamaji cross-build and a fleet redeploy to prove.")
 //! @yah:handoff("CODE LANDED, ONE FILE, oss/kamaji/crates/kamaji-containerd-core/src/lib.rs. New pure `resolver_mount_source(host_networked, &HostResolvers) -> Option<&'static str>` plus `HostResolvers::read()` (the only IO) and consts HOST_RESOLV_CONF / SYSTEMD_RESOLVED_UPSTREAM. build_oci_spec_with's resolv.conf branch now binds whatever that returns instead of a hardcoded /etc/resolv.conf; `has_ip_egress` is unchanged. Candidates are RANKED, not first-hit: under host networking the host file always wins (its loopback IS the container's); in an isolated netns a file scores 2 when every nameserver is routable, 1 when only some are, and is discarded at 0 — so a mixed loopback+routable file loses to systemd-resolved's all-routable one, because each loopback entry costs a per-lookup timeout. Ties break on array order (/etc first). NOTHING IS SYNTHESIZED when no candidate is usable: no mount at all, which is a refused connection on the first lookup instead of a 5s timeout on every one. Deliberately did not invent a resolver address — that would be a second policy beside the microVM path's GuestNetwork::dns (kamaji/src/microvm.rs:553, default 1.1.1.1); if a node ever needs one (air-gapped, split-horizon) it belongs in the spec and both paths should read it from there, which is a workload-spec change this ticket does not need.")
 //! @yah:verify("cargo test -p kamaji-containerd-core --features containerd-integration --lib: 37 passed / 0 failed, including the extended a_joined_netns_gets_the_host_resolver_and_a_bare_one_does_not. NOTE the feature flag is load-bearing — the crate is `#![cfg(feature = \"containerd-integration\")]` in full, so a bare `cargo test -p kamaji-containerd-core` compiles it to nothing and reports `0 passed` while looking green. clippy -p kamaji-containerd-core --features containerd-integration --all-targets: 0 warnings (one pre-existing needless_lifetimes on the test helper network_ns was fixed in passing).")
 //! @yah:gotcha("TAILSCALE MAGICDNS IS THE ONE CASE THIS RANKING WAVES THROUGH ON REASONING RATHER THAN MEASUREMENT. oss/yubaba/crates/cloud/src/cloud_init.rs:454 notes that a node which accepts MagicDNS has tailscaled rewrite /etc/resolv.conf to 100.100.100.100 — not loopback, so it scores 2 and gets bound into the container unchanged. I believe it works: container_net's NAT rule (kamaji/src/container_net.rs:498-514) masquerades everything leaving the node that is not headed out the bridge, so a packet to 100.100.100.100 is SNATed to the host and tailscaled answers it on tailscale0. NOT MEASURED — us-east-001 is on the systemd stub, not MagicDNS, so no fleet node exercises it today. If a MagicDNS node ever shows container DNS timing out, this is the first thing to check.")
 //! @yah:verify("THE RANKING'S CHOSEN CANDIDATE IS CONFIRMED REACHABLE FROM INSIDE THE CONTAINER'S NETNS — measured 2026-09-10 by @Glimmerstone:griffin from the noisetable camp, read-only, BEFORE any redeploy, so the landed code's premise is evidence rather than reasoning. On us-east-001 AND us-west-001, identically: /etc/resolv.conf = `nameserver 127.0.0.53` (scores 0, discarded) and /run/systemd/resolve/resolv.conf = `nameserver 213.186.33.99`, OVH's resolver, single entry, all-routable (scores 2, wins). The file is -rw-r--r-- systemd-resolve:systemd-resolve, 788 bytes, so a read-only bind needs no privilege. THE DECISIVE LEG, which a unit test on the OCI spec cannot reach: a real UDP DNS query for smtp.mailgun.org sent to 213.186.33.99:53 from INSIDE the live noisetable-account netns (nsenter -t <pid> -n, containerd ns `yah`) returned rcode=0 with 1 answer. So the SNAT reasoning holds for a real resolver on a real node, and a redeploy should fix this outright rather than trading a loopback stub for an unreachable upstream.")
-//! @yah:gotcha("ALL THREE NODES NOW MEASURED — and south is the case that proves the ranking was the right design, not the binary is-it-loopback check the ticket originally suggested. My earlier \"south is unchecked\" gotcha is deleted rather than corrected beside itself; the ssh identity was fine, the USER was wrong — .yah/infra/machines/us-south-001.toml:97 says `ssh = \"root@45.32.194.254\"` (Vultr image), not the `debian@` that opens the two OVH boxes. Read as root 2026-09-10: south has NO /run/systemd/resolve/resolv.conf at all (ABSENT — systemd-resolved is not managing resolv.conf there), and /etc/resolv.conf carries four real nameservers: 108.61.10.10 (Vultr), 9.9.9.9 (Quad9), 2001:19f0:300:1704::6, 2620:fe::fe. No loopback stub anywhere. Under the landed ranking /etc/resolv.conf scores routable and systemd_upstream is None, so south correctly binds /etc/resolv.conf — the opposite candidate from east and west, chosen by the same rule. A binary loopback check would also have worked here; the ranking earns its keep on mixed files.")
+//! @yah:gotcha("ALL THREE NODES NOW MEASURED — and south is the case that proves the ranking was the right design, not the binary is-it-loopback check the ticket originally suggested. My earlier \"south is unchecked\" gotcha is deleted rather than corrected beside itself; the ssh identity was fine, the USER was wrong — .yah/infra/machines/us-south-001.toml:97 says `ssh = \"root@203.0.113.12\"` (Vultr image), not the `debian@` that opens the two OVH boxes. Read as root 2026-09-10: south has NO /run/systemd/resolve/resolv.conf at all (ABSENT — systemd-resolved is not managing resolv.conf there), and /etc/resolv.conf carries four real nameservers: 108.61.10.10 (Vultr), 9.9.9.9 (Quad9), 2001:19f0:300:1704::6, 2620:fe::fe. No loopback stub anywhere. Under the landed ranking /etc/resolv.conf scores routable and systemd_upstream is None, so south correctly binds /etc/resolv.conf — the opposite candidate from east and west, chosen by the same rule. A binary loopback check would also have worked here; the ranking earns its keep on mixed files.")
 //! @yah:next("ONE REFINEMENT WORTH MAKING WHILE YOU ARE IN THE PREDICATE — THE ROUTABILITY TEST IS ADDRESS-FAMILY-BLIND. It excludes loopback (127/8, ::1) and unspecified, so a global-scope IPv6 nameserver scores as routable. But a container netns has NO IPv6 AT ALL: measured inside the live noisetable-account netns on us-east-001, `ip -6 addr` shows only `::1/128` on lo and `ip -6 route` is EMPTY — container_net.rs wires an IPv4 veth and IPv4 NAT and nothing else. So an IPv6 nameserver bound into a container's resolv.conf is unreachable by construction on every node today, and it is scored as healthy. This is LATENT, NOT LIVE, and does not block the redeploy: east and west are all-loopback so their /etc/resolv.conf loses regardless, and south's file leads with two IPv4 entries that glibc (MAXNS=3, tried in order) reaches first. It bites when a file is ordered IPv6-first or its leading IPv4 resolver fails — precisely the per-lookup-timeout cost the ranking exists to avoid, arriving through the family axis instead of the loopback axis. Cheapest fix: count an IPv6 nameserver as non-routable while the container path is IPv4-only, or better, pass the netns's actual address families into the predicate so it stops being a standing assumption. Same shape of mistake as R881-T3's original premise: a nameserver that is routable from the HOST is not automatically reachable from the CONTAINER.")
 //! @yah:next("LIVE ACCEPTANCE NEEDS A PAIRED SHIP, NOT A KAMAJI-ONLY ONE. kamaji and yubaba self-install as a pair (kamaji-proto version.rs says so: \"the skew window is a restart rather than a rolling fleet upgrade\"), and this tree's kamaji cannot talk to a released yubaba. So whoever finishes this either ships BOTH halves from a tree whose yubaba half is shippable (today it carries R850's in-flight recovery_journal and cloud-reconciler edits), or waits for the next release and verifies against that. The acceptance commands are unchanged and are in this ticket's verify list; the node-side checks that discriminate a real pass are `sudo nsenter -t $(sudo ctr -n yah t ls | grep account | awk '{print $2}') -m cat /etc/resolv.conf` showing a ROUTABLE nameserver (expect 213.186.33.99, us-east-001's upstream) instead of 127.0.0.53, and then `getent hosts smtp.mailgun.org` from inside.")
 //! @yah:handoff("LIVE ACCEPTANCE ATTEMPTED AND ROLLED BACK — the fix is NOT proven live, and the reason is a protocol skew that has nothing to do with the fix. `scripts/hotship.sh --nodes us-east-001 --binaries kamaji` put 0.8.38-h4 (this tree) beside the node's released yubaba 0.8.37. The tree carries an unreleased kamaji-proto bump to V10 (R850-T4, uncommitted in oss/kamaji/crates/kamaji-proto/src/version.rs) that removes AckKind::Deploy and renumbers the rest, so the two halves misframed (`decode failed: frame too large: 542393671 > 1048576`) and yubaba silently fell back to its in-process containerd runtime, which wires no netns — see R881-B8, filed from this session. RESTORED to published bytes with `scripts/roll-node.sh us-east-001 --to 0.8.37 --yes`, then one `yah cloud workload rolling noisetable-account`; the kamaji journal shows `container network namespace wired ... address=10.128.3.2 gateway=10.128.3.1` at 06:57:28 UTC and the container is back to eth0 10.128.3.2 with the loopback-stub resolv.conf, i.e. exactly the pre-session state this ticket describes. Net change to the node: none.")
@@ -96,7 +96,7 @@
 //! @yah:next("Give yubaba admission a pull step for digest-pinned refs from cr.yah.dev (or a `yah cloud workload pull`), and make a failed deploy leave the running workload untouched.")
 //! @yah:next("OPERATOR DECISION 2026-10-06 (relayed from noisetable by @Glimmerstone:eclipse, session:5b0da90e): fix this in the yah camp; no manual ctr pull workaround. Done means: (1) a deploy of a digest-pinned cr.yah.dev ref pulls the image itself; (2) a deploy that fails at admission or pull leaves the running workload serving, with a test that reproduces the teardown red first; (3) placement honours the workload's volume, so noisetable-marketing-issues without --where lands on us-west-001 or refuses, and never silently starts on an empty volume elsewhere. Split (3) into its own R931 bug if it lives in a different crate.")
 //! @yah:next("Also measured: `mirror up --component issues` re-announced passway-inner-noisetable-marketing on all 3 nodes and blacked out noisetable.com / and /app/ for ~20s. A component-scoped deploy should not replace the inner door when its route set is unchanged. File this as its own R931 bug unless it shares the fix.")
-//! @yah:next("Rollout: if the fix runs node-side (kamaji), getting it onto us-west-001/us-east-001 is an operator action. Land and test the code, then say exactly what has to roll where. The gated consumer is noisetable R795-T8 (`board.show R795-T8 --path /Users/leif/ss/noisetable`), which re-runs once this is live.")
+//! @yah:next("Rollout: if the fix runs node-side (kamaji), getting it onto us-west-001/us-east-001 is an operator action. Land and test the code, then say exactly what has to roll where. The gated consumer is noisetable R795-T8 (`board.show R795-T8 --path <noisetable-checkout>`), which re-runs once this is live.")
 //! @yah:handoff("ROOT CAUSE of the teardown: kamaji-bin server.rs deploy_container_backend called build_container_netns BEFORE the image check. container_net setup_commands opens with teardown_commands, which deletes the incumbent's netns/veth. So a deploy with a missing image cut the running workload off the network, then failed (503 'no ready upstreams'). yubaba and ContainerdBackend::deploy_generation already kept the incumbent; the netns step was the destructive one.")
 //! @yah:handoff("FIX (1) pull: kamaji-containerd-core gains lookup_image_target_digest (NotFound -> None), ImageStore trait, ensure_image_with (pull-if-missing), CtrImageStore (shells `ctr --address <sock> --namespace yah images pull <ref>`, 15-min timeout, kill_on_drop), and ensure_image. tokio gains the `process` feature. resolve_image_target_digest is kept, strict, for restore_incumbent. kamaji-bin ContainerdBackend: new socket field and ensure_image(spec); deploy_generation uses kcc::ensure_image.")
 //! @yah:handoff("FIX (2) ordering: new server.rs ordered_container_deploy(ensure_image, wire_netns, deploy) runs the image step before netns wiring; the containerd arm routes through it.")
@@ -1674,7 +1674,7 @@ pub fn build_oci_spec_with(
                 mounts.push(serde_json::json!({
                     "destination": volume.target,
                     "type": "bind",
-                    "source": format!("/var/lib/yah/kamaji/volumes/{name}"),
+                    "source": format!("{NAMED_VOLUME_ROOT}/{name}"),
                     "options": ["rbind", rw_opt, "nosuid", "nodev"],
                 }));
             }
@@ -1752,6 +1752,39 @@ pub fn build_oci_spec_with(
             "cgroupsPath": format!("/yah/{}", spec.name),
         },
     })
+}
+
+/// Host directory a [`workload_spec::VolumeSource::Named`] volume is bound
+/// from: `<root>/<name>`.
+pub const NAMED_VOLUME_ROOT: &str = "/var/lib/yah/kamaji/volumes";
+
+/// Create every [`workload_spec::VolumeSource::Named`] dir `spec` mounts —
+/// the "created on first use" the variant's doc promises (R971-B10).
+///
+/// **Call before [`check_bind_sources`].** The named-volume bind is a source
+/// kamaji itself owns, so a fresh placement on a node that never hosted the
+/// volume must not be refused as a missing host precondition; without this a
+/// first fleet-git placement on us-east-001 500'd until the dir was made by
+/// hand. An existing dir is left untouched (hydrate's empty-vs-populated
+/// trigger still sees the same bytes).
+pub fn ensure_named_volume_dirs(spec: &WorkloadSpec) -> std::io::Result<()> {
+    ensure_named_volume_dirs_in(std::path::Path::new(NAMED_VOLUME_ROOT), spec)
+}
+
+/// [`ensure_named_volume_dirs`] against an explicit root (tests).
+pub fn ensure_named_volume_dirs_in(
+    root: &std::path::Path,
+    spec: &WorkloadSpec,
+) -> std::io::Result<()> {
+    for volume in &spec.volumes {
+        if let workload_spec::VolumeSource::Named { name } = &volume.source {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("creating named volume dir {}: {e}", dir.display()))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Every `(destination, source)` pair an OCI spec's **bind** mounts name.
@@ -3074,6 +3107,46 @@ mod tests {
         }];
         let oci = build_oci_spec(&spec, &[], None);
         assert_eq!(check_bind_sources(&oci), Ok(()));
+    }
+
+    /// R971-B10: a named volume whose dir is missing is created on first use,
+    /// at exactly the path the OCI bind names, so the bind check then passes.
+    #[test]
+    fn named_volume_dir_is_created_before_the_bind_check() {
+        let root = std::env::temp_dir().join(format!("kcc-b10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut spec = test_spec("named");
+        spec.volumes = vec![workload_spec::VolumeMount {
+            source: workload_spec::VolumeSource::Named { name: "fleet-git-repos".into() },
+            target: "/data".into(),
+            read_only: false,
+            from_secret_mount: false,
+        }];
+        let dir = root.join("fleet-git-repos");
+        assert!(!dir.exists());
+        ensure_named_volume_dirs_in(&root, &spec).unwrap();
+        assert!(dir.is_dir());
+        // Idempotent, and leaves contents alone.
+        std::fs::write(dir.join("keep"), b"x").unwrap();
+        ensure_named_volume_dirs_in(&root, &spec).unwrap();
+        assert!(dir.join("keep").exists());
+
+        let oci = build_oci_spec(&spec, &[], None);
+        let (_, source) = bind_mount_sources(&oci)
+            .into_iter()
+            .find(|(d, _)| d == "/data")
+            .unwrap();
+        assert_eq!(source, format!("{NAMED_VOLUME_ROOT}/fleet-git-repos"));
+        // The same bind, re-rooted onto the dir just created, passes the check.
+        let mut oci = oci;
+        for m in oci["mounts"].as_array_mut().unwrap() {
+            if m["destination"] == "/data" {
+                m["source"] = serde_json::json!(dir.to_str().unwrap());
+            }
+        }
+        let others_ok = missing_bind_sources(&oci).iter().all(|(d, _)| d != "/data");
+        assert!(others_ok);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The production failure, reproduced at the layer that can now refuse it:

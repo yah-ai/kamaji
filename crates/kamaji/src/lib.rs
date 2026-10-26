@@ -809,6 +809,32 @@ pub enum LogStreamKind {
     Stderr,
 }
 
+/// One event of a [`Kamaji::exec_in_workload`] run (R969-F7). A stream ends
+/// with exactly one `Exit`; ending without one is a dropped run, not a finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecEvent {
+    /// Raw output bytes — not lines, and not necessarily UTF-8.
+    Output { stream: LogStreamKind, data: Vec<u8> },
+    /// The process exited with this code.
+    Exit { code: i32 },
+}
+
+/// Stream returned by [`Kamaji::exec_in_workload`]. An `Err` item ends it.
+pub type ExecStream = Pin<Box<dyn Stream<Item = anyhow::Result<ExecEvent>> + Send + 'static>>;
+
+/// Typed refusals of [`Kamaji::exec_in_workload`], downcastable from the
+/// `anyhow::Error` so a caller (yubaba's `/exec`) can map them to a status.
+#[derive(Debug, thiserror::Error)]
+pub enum ExecError {
+    /// This backend has no in-workload exec. Only containerd (via the
+    /// kamaji-bin sibling) implements it; native/microVM forges are out of scope.
+    #[error("backend {0:?} does not support exec_in_workload")]
+    Unsupported(Backend),
+    /// No running workload with that identity.
+    #[error("workload {0} is not running")]
+    NotRunning(String),
+}
+
 /// One log line emitted by a workload container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEvent {
@@ -924,47 +950,10 @@ impl StatefulServiceContract {
     }
 }
 
-/// Compile-time descriptor for a built-in (always-present) yah service.
-///
-/// Built-in services ship as Rust constants — their declarations don't live in
-/// any user-visible `.yah/` file because they're identical across all yah
-/// installs. Call [`BuiltinService::contract`] at runtime to obtain an owned
-/// [`StatefulServiceContract`] suitable for registering with kamaji.
-#[derive(Debug, Clone, Copy)]
-pub struct BuiltinService {
-    pub name: &'static str,
-    /// Relative file paths (from camp_root / service root).
-    pub files: &'static [&'static str],
-    /// ISO-8601 date of last schema change.
-    pub schema_version: &'static str,
-    pub backup_target: Option<&'static str>,
-}
-
-impl BuiltinService {
-    pub const fn new(
-        name: &'static str,
-        files: &'static [&'static str],
-        schema_version: &'static str,
-    ) -> Self {
-        Self {
-            name,
-            files,
-            schema_version,
-            backup_target: None,
-        }
-    }
-
-    /// Convert to an owned [`StatefulServiceContract`] for runtime use.
-    pub fn contract(&self) -> StatefulServiceContract {
-        StatefulServiceContract {
-            name: self.name.to_string(),
-            files: self.files.iter().map(|s| s.to_string()).collect(),
-            vend_endpoint: None,
-            schema_version: self.schema_version.to_string(),
-            backup_target: self.backup_target.map(|s| s.to_string()),
-        }
-    }
-}
+// R975-F3 removed `BuiltinService`, the compile-time descriptor for the camp
+// daemon's own databases (W195 §"Built-in camp services"). Nothing ever
+// registered one with kamaji; a camp now declares its databases as a
+// `workload_spec::Durability` in `.yah/camp.toml` (W368 §2).
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
@@ -1051,6 +1040,22 @@ pub trait Kamaji: Send + Sync {
     /// Tear down a workload completely. Idempotent — returns `Ok(())` if the
     /// workload is already gone.
     async fn teardown_workload(&self, ident: &MeshIdent) -> anyhow::Result<()>;
+
+    /// Run `argv` inside the running workload `ident`, with `env` added to its
+    /// process env, streaming its output and then its exit code (R969-F7).
+    ///
+    /// The default refuses with [`ExecError::Unsupported`]: only backends that
+    /// can enter a live container override it (the kamaji-bin sibling, which
+    /// serves it from containerd task exec, and the test fake).
+    async fn exec_in_workload(
+        &self,
+        ident: &MeshIdent,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> anyhow::Result<ExecStream> {
+        let _ = (ident, argv, env);
+        Err(ExecError::Unsupported(self.backend()).into())
+    }
 
     /// Query the health of the underlying backend. Used by the camp / yubaba
     /// `/health` endpoint to report whether the backend socket is reachable.

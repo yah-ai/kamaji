@@ -45,8 +45,8 @@ use tokio_stream::iter as stream_iter;
 use workload_spec::MeshIdent;
 
 use crate::{
-    Backend, DeployResult, Kamaji, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
-    RuntimeHealth, WorkloadState, WorkloadStatus,
+    Backend, DeployResult, ExecError, ExecEvent, ExecStream, Kamaji, LogEvent, LogOpts, LogStream,
+    LogStreamKind, MeshAssignment, RuntimeHealth, WorkloadState, WorkloadStatus,
 };
 
 // ── Chaos vocabulary ──────────────────────────────────────────────────────────
@@ -129,6 +129,11 @@ struct Inner {
     /// clock is otherwise invisible — it converges to the same state, just
     /// hundreds of times more often than it was written to.
     get_workload_calls: usize,
+    /// Scripted `exec_in_workload` replies by mesh ident (R969-F7). An
+    /// unscripted exec echoes its argv to stdout and exits 0.
+    exec_scripts: HashMap<String, Vec<ExecEvent>>,
+    /// `(ident, argv, env)` passed to `exec_in_workload`, in call order.
+    execs: Vec<(String, Vec<String>, Vec<(String, String)>)>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -260,6 +265,21 @@ impl FakeRuntime {
         self.inner.lock().unwrap().get_workload_calls
     }
 
+    /// Script the events the next `exec_in_workload` calls on `ident` stream
+    /// (R969-F7). Persists until replaced.
+    pub fn set_exec_script(&self, ident: impl Into<String>, events: Vec<ExecEvent>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .exec_scripts
+            .insert(ident.into(), events);
+    }
+
+    /// `(ident, argv, env)` of every `exec_in_workload` call, in order.
+    pub fn exec_calls(&self) -> Vec<(String, Vec<String>, Vec<(String, String)>)> {
+        self.inner.lock().unwrap().execs.clone()
+    }
+
     // ── internal helpers ──────────────────────────────────────────────────────
 
     /// Check whether a fault fires for `target`. Updates the fired count and
@@ -378,6 +398,33 @@ impl Kamaji for FakeRuntime {
         }
         let guard = self.inner.lock().unwrap();
         Ok(guard.workloads.get(&ident.0).map(|w| w.state.clone()))
+    }
+
+    async fn exec_in_workload(
+        &self,
+        ident: &MeshIdent,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> anyhow::Result<ExecStream> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.execs.push((ident.0.clone(), argv.clone(), env));
+        let running = guard
+            .workloads
+            .get(&ident.0)
+            .is_some_and(|w| matches!(w.state.status, WorkloadStatus::Running));
+        if !running {
+            return Err(ExecError::NotRunning(ident.0.clone()).into());
+        }
+        let events = guard.exec_scripts.get(&ident.0).cloned().unwrap_or_else(|| {
+            vec![
+                ExecEvent::Output {
+                    stream: LogStreamKind::Stdout,
+                    data: format!("{}\n", argv.join(" ")).into_bytes(),
+                },
+                ExecEvent::Exit { code: 0 },
+            ]
+        });
+        Ok(Box::pin(stream_iter(events.into_iter().map(Ok))))
     }
 
     async fn stream_logs(&self, ident: &MeshIdent, opts: LogOpts) -> anyhow::Result<LogStream> {

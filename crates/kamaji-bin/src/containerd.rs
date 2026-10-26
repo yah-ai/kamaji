@@ -84,7 +84,8 @@ use containerd_client::{
         tasks_client::TasksClient,
         version_client::VersionClient,
         Container, CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest,
-        GetContainerRequest, KillRequest, ListContainersRequest, StartRequest,
+        DeleteProcessRequest, ExecProcessRequest, GetContainerRequest, KillRequest,
+        ListContainersRequest, StartRequest, WaitRequest,
     },
     tonic::{transport::Channel, Request},
     with_namespace,
@@ -414,6 +415,11 @@ impl ContainerdBackend {
         // already gone. Sited after the spec is built rather than over
         // `spec.volumes` so it sees the mounts kamaji *injects* too, which is
         // the class the production failure was in: the node's scryer socket.
+        // Named-volume dirs are kamaji's own to create (R971-B10), so make
+        // them first rather than refuse a fresh placement for lacking one.
+        if let Err(e) = kcc::ensure_named_volume_dirs(spec) {
+            return Err(BackendError::HostPrecondition(format!("workload {container_id}: {e}")));
+        }
         if let Err(message) = kcc::check_bind_sources(&oci_spec) {
             return Err(BackendError::HostPrecondition(format!(
                 "workload {container_id}: {message}"
@@ -666,6 +672,28 @@ impl ContainerdBackend {
                 None
             }
         }
+    }
+
+    /// Start a fresh task for `id` from containerd's own record of its
+    /// container, after the previous task died (R971-B11). Used by
+    /// [`crate::restart`] to apply a workload's `restart_policy`; the same
+    /// rebuild as [`restore_incumbent`](Self::restore_incumbent), so the
+    /// restarted task runs exactly the OCI spec, image and namespace the
+    /// deploy created.
+    pub async fn restart_task(&self, id: &WorkloadId) -> Result<u32, BackendError> {
+        let container_id = id.as_str().to_string();
+        let prev = self.incumbent_record(&container_id).await.ok_or_else(|| {
+            BackendError::Containerd(anyhow::anyhow!("no container record for {container_id}"))
+        })?;
+        let log_dir = self.log_dir(&container_id);
+        self.restore_incumbent(
+            id,
+            prev,
+            &log_dir.join("stdout.fifo"),
+            &log_dir.join("stderr.fifo"),
+        )
+        .await
+        .map_err(BackendError::Containerd)
     }
 
     /// Put back the generation [`deploy_generation`](Self::deploy_generation)
@@ -1146,6 +1174,123 @@ impl ContainerdBackend {
         Ok(())
     }
 
+    /// Run `argv` inside the running container `key` names, as a containerd
+    /// task exec (R969-F7), sending its output to `out` and returning its exit
+    /// code.
+    ///
+    /// The process spec is the container's own `process` (same user, cwd,
+    /// capabilities, env) with `args` replaced and `env` overriding same-named
+    /// keys. Output rides two per-exec FIFOs under the workload's log dir,
+    /// opened read-side BEFORE `Exec` for the same deadlock reason as the
+    /// deploy forwarders. Those are opened `O_RDWR`, so they never see EOF:
+    /// once `Wait` returns, each pump drains until [`EXEC_DRAIN_IDLE`] passes
+    /// with nothing to read. The exec process and its FIFO dir are removed on
+    /// every path.
+    pub async fn exec(
+        &self,
+        key: &WorkloadId,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        out: tokio::sync::mpsc::Sender<ExecChunk>,
+    ) -> Result<i32, ExecFailure> {
+        if argv.is_empty() {
+            return Err(ExecFailure::Other(anyhow::anyhow!("exec: empty argv")));
+        }
+        let container_id = self
+            .resolve_container_key(key)
+            .await
+            .map_err(|e| ExecFailure::Other(anyhow::anyhow!("{e}")))?
+            .as_str()
+            .to_string();
+        let Some(record) = self.incumbent_record(&container_id).await else {
+            return Err(ExecFailure::NotRunning(key.as_str().to_string()));
+        };
+        let process = exec_process_spec(&record, argv, &env).map_err(ExecFailure::Other)?;
+
+        static EXEC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = EXEC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let exec_id = format!("kx-{nanos:x}-{seq}");
+        let dir = self.log_dir(&container_id).join(format!("exec-{exec_id}"));
+        let stdout_fifo = dir.join("stdout.fifo");
+        let stderr_fifo = dir.join("stderr.fifo");
+
+        let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
+        let mut pumps = Vec::new();
+        let result: Result<i32, ExecFailure> = async {
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .with_context(|| format!("creating exec dir {}", dir.display()))?;
+            for (path, stream) in [(&stdout_fifo, Stream::Stdout), (&stderr_fifo, Stream::Stderr)] {
+                ensure_fifo(path).with_context(|| format!("mkfifo {}", path.display()))?;
+                pumps.push(spawn_exec_pump(path, stream, out.clone(), exited_rx.clone())?);
+            }
+            let mut tasks = self.tasks_client();
+            let req = ExecProcessRequest {
+                container_id: container_id.clone(),
+                exec_id: exec_id.clone(),
+                stdin: String::new(),
+                stdout: stdout_fifo.to_string_lossy().into_owned(),
+                stderr: stderr_fifo.to_string_lossy().into_owned(),
+                terminal: false,
+                spec: Some(prost_types::Any {
+                    type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process"
+                        .to_string(),
+                    value: serde_json::to_vec(&process).context("serializing exec process")?,
+                }),
+            };
+            let req = with_namespace!(req, self.namespace);
+            if let Err(status) = tasks.exec(req).await {
+                use containerd_client::tonic::Code;
+                return Err(match status.code() {
+                    Code::NotFound | Code::FailedPrecondition => {
+                        ExecFailure::NotRunning(key.as_str().to_string())
+                    }
+                    _ => ExecFailure::Other(anyhow::anyhow!("exec in {container_id}: {status}")),
+                });
+            }
+            let req = StartRequest {
+                container_id: container_id.clone(),
+                exec_id: exec_id.clone(),
+            };
+            let req = with_namespace!(req, self.namespace);
+            tasks
+                .start(req)
+                .await
+                .with_context(|| format!("starting exec {exec_id} in {container_id}"))?;
+            let req = WaitRequest {
+                container_id: container_id.clone(),
+                exec_id: exec_id.clone(),
+            };
+            let req = with_namespace!(req, self.namespace);
+            let status = tasks
+                .wait(req)
+                .await
+                .with_context(|| format!("waiting on exec {exec_id} in {container_id}"))?
+                .into_inner()
+                .exit_status;
+            Ok(status as i32)
+        }
+        .await;
+
+        let _ = exited_tx.send(true);
+        for pump in pumps {
+            let _ = pump.await;
+        }
+        let mut tasks = self.tasks_client();
+        let req = DeleteProcessRequest {
+            container_id: container_id.clone(),
+            exec_id: exec_id.clone(),
+        };
+        let req = with_namespace!(req, self.namespace);
+        let _ = tasks.delete_process(req).await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        result
+    }
+
     /// Resolve a `Stop` key to the container id it actually names, over live
     /// containerd. See [`resolve_container_key_with`] for the logic.
     async fn resolve_container_key(&self, key: &WorkloadId) -> Result<WorkloadId, BackendError> {
@@ -1474,6 +1619,126 @@ fn spawn_forwarder(
     Err(BackendError::Containerd(anyhow::anyhow!(
         "containerd FIFO log fan-in requires Linux"
     )))
+}
+
+/// One chunk of an exec'd process's output (R969-F7).
+#[derive(Debug)]
+pub struct ExecChunk {
+    pub stream: Stream,
+    pub data: Vec<u8>,
+}
+
+/// Why [`ContainerdBackend::exec`] did not produce an exit code.
+#[derive(Debug, Error)]
+pub enum ExecFailure {
+    /// No container under that key, or its task is not running. The server
+    /// maps this to `ErrorCode::UnknownWorkload`.
+    #[error("workload {0} is not running")]
+    NotRunning(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// How long an exec pump keeps reading after the process has exited before it
+/// treats its `O_RDWR` FIFO (which never reports EOF) as drained.
+#[cfg(target_os = "linux")]
+const EXEC_DRAIN_IDLE: Duration = Duration::from_millis(200);
+
+/// The OCI `process` to exec: the container's own, with `args` = `argv`,
+/// no terminal, and `env` overriding same-named entries.
+fn exec_process_spec(
+    record: &Container,
+    argv: Vec<String>,
+    env: &[(String, String)],
+) -> Result<serde_json::Value> {
+    let spec = record
+        .spec
+        .as_ref()
+        .context("container record carries no OCI spec")?;
+    let spec: serde_json::Value =
+        serde_json::from_slice(&spec.value).context("parsing container OCI spec")?;
+    let mut process = spec
+        .get("process")
+        .cloned()
+        .context("container OCI spec has no `process`")?;
+    let obj = process
+        .as_object_mut()
+        .context("container OCI `process` is not an object")?;
+    obj.insert("args".into(), serde_json::json!(argv));
+    obj.insert("terminal".into(), serde_json::Value::Bool(false));
+    obj.remove("consoleSize");
+    let mut merged: Vec<String> = obj
+        .get("env")
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    for (k, v) in env {
+        let prefix = format!("{k}=");
+        merged.retain(|e| !e.starts_with(&prefix));
+        merged.push(format!("{k}={v}"));
+    }
+    obj.insert("env".into(), serde_json::json!(merged));
+    Ok(process)
+}
+
+/// Open `fifo_path`'s read side and pump it into `out` until the process has
+/// exited (`exited` flips true) and [`EXEC_DRAIN_IDLE`] passes with no data.
+#[cfg(target_os = "linux")]
+fn spawn_exec_pump(
+    fifo_path: &Path,
+    stream: Stream,
+    out: tokio::sync::mpsc::Sender<ExecChunk>,
+    mut exited: tokio::sync::watch::Receiver<bool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use tokio::io::AsyncReadExt;
+    let mut recv = tokio::net::unix::pipe::OpenOptions::new()
+        .read_write(true)
+        .open_receiver(fifo_path)
+        .with_context(|| format!("open FIFO {} for read", fifo_path.display()))?;
+    Ok(tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let read = if *exited.borrow() {
+                match tokio::time::timeout(EXEC_DRAIN_IDLE, recv.read(&mut buf)).await {
+                    Ok(r) => r,
+                    Err(_) => return,
+                }
+            } else {
+                tokio::select! {
+                    r = recv.read(&mut buf) => r,
+                    changed = exited.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            };
+            match read {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let chunk = ExecChunk {
+                        stream,
+                        data: buf[..n].to_vec(),
+                    };
+                    if out.send(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_exec_pump(
+    fifo_path: &Path,
+    stream: Stream,
+    out: tokio::sync::mpsc::Sender<ExecChunk>,
+    exited: tokio::sync::watch::Receiver<bool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let _ = (fifo_path, stream, out, exited);
+    anyhow::bail!("containerd exec requires Linux")
 }
 
 /// The containerd container lookups [`resolve_container_key_with`] needs,
@@ -1982,6 +2247,38 @@ mod tests {
         assert_eq!(map_task_state(5, 0), WorkloadState::Draining);
         assert_eq!(map_task_state(0, 0), WorkloadState::Failed);
         assert_eq!(map_task_state(99, 0), WorkloadState::Failed);
+    }
+
+    // ── R969-F7: exec process spec ────────────────────────────────────────────
+
+    #[test]
+    fn exec_process_spec_replaces_args_and_overrides_env() {
+        let oci = serde_json::json!({
+            "process": {
+                "args": ["/entry"],
+                "terminal": true,
+                "cwd": "/work",
+                "env": ["PATH=/bin", "A=old"],
+            }
+        });
+        let record = Container {
+            spec: Some(prost_types::Any {
+                type_url: String::new(),
+                value: serde_json::to_vec(&oci).unwrap(),
+            }),
+            ..Default::default()
+        };
+        let p = exec_process_spec(
+            &record,
+            vec!["sh".into(), "-c".into(), "id".into()],
+            &[("A".into(), "new".into()), ("B".into(), "2".into())],
+        )
+        .unwrap();
+        assert_eq!(p["args"], serde_json::json!(["sh", "-c", "id"]));
+        assert_eq!(p["terminal"], serde_json::json!(false));
+        assert_eq!(p["cwd"], serde_json::json!("/work"));
+        assert_eq!(p["env"], serde_json::json!(["PATH=/bin", "A=new", "B=2"]));
+        assert!(exec_process_spec(&Container::default(), vec!["x".into()], &[]).is_err());
     }
 
     // ── R406-T10: FIFO log fan-in ─────────────────────────────────────────────

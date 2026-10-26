@@ -102,6 +102,71 @@ pub const DEFAULT_HTTP_PATH: &str = "/_yah/status";
 /// The one verb the channel requires.
 pub const STATUS_CMD: &str = "status";
 
+/// Environment variable carrying the key a process fingerprints its
+/// environment under (R866). Set by the deployer, never by the process, and
+/// never reported back — see [`ProcStatus::env_fingerprint`].
+pub const ENV_FINGERPRINT_KEY_ENV: &str = "YAH_ENV_FINGERPRINT_KEY";
+
+/// Environment variable listing, comma-separated, the names whose values a
+/// process should fingerprint. Names not listed here are never fingerprinted,
+/// so a producer cannot leak a digest of a variable nobody asked about.
+pub const ENV_FINGERPRINT_VARS_ENV: &str = "YAH_ENV_FINGERPRINT_VARS";
+
+/// Fingerprint one environment value: lowercase hex of
+/// `HMAC-SHA256(key = key's UTF-8 bytes, message = value's UTF-8 bytes)`.
+///
+/// That is the whole wire rule, chosen because every language ships it in its
+/// standard library — in Python it is
+/// `hmac.new(key.encode(), value.encode(), hashlib.sha256).hexdigest()` — so a
+/// non-Rust producer conforms without a dependency, the same bar the rest of
+/// this protocol holds itself to. The output is 64 hex characters whatever the
+/// value's length.
+pub fn env_fingerprint(key: &str, value: &str) -> String {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(value.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Fingerprint every variable the deployer listed in
+/// [`ENV_FINGERPRINT_VARS_ENV`], keyed by [`ENV_FINGERPRINT_KEY_ENV`].
+///
+/// Empty when either variable is unset or empty — the process was deployed by
+/// something that does not compare fingerprints. A listed name that is unset
+/// in this process is omitted rather than fingerprinted as `""`: the deployer
+/// reads its absence as "not set in the running process", which is itself the
+/// drift worth reporting.
+pub fn env_fingerprint_from_env() -> std::collections::BTreeMap<String, String> {
+    env_fingerprint_from(|name| std::env::var(name).ok())
+}
+
+/// [`env_fingerprint_from_env`] over an arbitrary lookup — the seam that lets
+/// a producer fingerprint an environment it holds as data (a child it is about
+/// to spawn) and lets tests avoid mutating the process environment.
+pub fn env_fingerprint_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> std::collections::BTreeMap<String, String> {
+    let key = match lookup(ENV_FINGERPRINT_KEY_ENV) {
+        Some(k) if !k.is_empty() => k,
+        _ => return Default::default(),
+    };
+    lookup(ENV_FINGERPRINT_VARS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .filter_map(|name| {
+            let value = lookup(name)?;
+            Some((name.to_string(), env_fingerprint(&key, &value)))
+        })
+        .collect()
+}
+
 /// Lifecycle vocabulary of a supervised process.
 ///
 /// Deliberately identical to [`kamaji_proto::WorkloadState`] on the wire. Kept
@@ -225,6 +290,21 @@ pub struct ProcStatus {
     /// is a status channel, not a metrics pipeline.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub metrics: std::collections::BTreeMap<String, f64>,
+    /// `NAME → keyed fingerprint` of the environment values this process is
+    /// actually running with, for exactly the names its deployer listed in
+    /// [`ENV_FINGERPRINT_VARS_ENV`] (R866, W337 §5).
+    ///
+    /// This is how a deployer tells "the credential I injected" from "the one
+    /// the vault holds now" without either value crossing the wire: it
+    /// recomputes [`env_fingerprint`] over its own copy and compares. No value
+    /// and no value *length* is recoverable from an entry — the digest is
+    /// fixed-width and keyed by a secret the reader of this document does not
+    /// hold. Empty (and absent from the wire) when the deployer asked for
+    /// nothing, which is also what every producer built before this field
+    /// reads as. [`ControlServer`] stamps it from the environment when the
+    /// producer leaves it empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env_fingerprint: std::collections::BTreeMap<String, String>,
 }
 
 impl ProcStatus {
@@ -239,7 +319,20 @@ impl ProcStatus {
             detail: None,
             endpoints: Default::default(),
             metrics: Default::default(),
+            env_fingerprint: Default::default(),
         }
+    }
+
+    /// Report the fingerprints of the environment this process runs with —
+    /// normally [`env_fingerprint_from_env`]'s output. Only needed by a
+    /// producer that answers over its own transport; [`ControlServer`]
+    /// stamps it unasked.
+    pub fn with_env_fingerprint(
+        mut self,
+        fingerprints: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.env_fingerprint = fingerprints;
+        self
     }
 
     /// The one human line that replaces log-grepping.
@@ -399,6 +492,74 @@ mod tests {
         assert_eq!(s.summary(), "starting — replaying WAL 3/7 (v0.8.23)");
         let round: ProcStatus = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(round, s);
+    }
+
+    /// R866. The exact document a producer built BEFORE `env_fingerprint`
+    /// existed emits. A partial fleet roll puts old producers behind new
+    /// consumers, so this must keep parsing — and must read as "reports no
+    /// fingerprints", never as an error.
+    #[test]
+    fn a_document_from_before_env_fingerprint_still_parses() {
+        let pre = r#"{"state":"running","pid":71455,"uptime_secs":41,"version":"0.8.46",
+                      "detail":"serving","endpoints":{"http":"http://10.0.0.1:8080"},
+                      "metrics":{"rps":3.0}}"#;
+        let s: ProcStatus = serde_json::from_str(pre).unwrap();
+        assert_eq!(s.state, ProcState::Running);
+        assert!(s.env_fingerprint.is_empty());
+        assert!(
+            !serde_json::to_string(&s).unwrap().contains("env_fingerprint"),
+            "an empty map stays off the wire, so a new producer with nothing to \
+             report emits byte-for-byte what an old one did"
+        );
+    }
+
+    /// The cross-language test vector. The same pair is pinned in yah-cloud's
+    /// `env_fingerprint` module and mesofact's status route, and was produced
+    /// by Python's stdlib (`hmac.new(b"yah-test-key", b"s3cr3t-value",
+    /// hashlib.sha256).hexdigest()`) — if one implementation drifts, its test
+    /// fails rather than every comparison reading as drift on the live fleet.
+    #[test]
+    fn env_fingerprint_matches_the_cross_language_vector() {
+        assert_eq!(
+            env_fingerprint("yah-test-key", "s3cr3t-value"),
+            "d09f5c67f9abb684a6ec49836260cac2e1d44d86006107e2efc47d381ad93635"
+        );
+    }
+
+    /// The digest must not betray the value's length — the hard constraint
+    /// R866 was filed under.
+    #[test]
+    fn an_env_fingerprint_is_fixed_width_whatever_the_value() {
+        for value in ["", "x", &"y".repeat(4096)] {
+            let fp = env_fingerprint("k", value);
+            assert_eq!(fp.len(), 64, "{value:?}");
+            assert!(!fp.contains(value) || value.is_empty());
+        }
+    }
+
+    #[test]
+    fn only_listed_and_set_variables_are_fingerprinted() {
+        let env: std::collections::BTreeMap<&str, &str> = [
+            (ENV_FINGERPRINT_KEY_ENV, "yah-test-key"),
+            (ENV_FINGERPRINT_VARS_ENV, "SECRET, UNSET_ONE,,"),
+            ("SECRET", "s3cr3t-value"),
+            ("NOT_LISTED", "never-digested"),
+        ]
+        .into_iter()
+        .collect();
+        let got = env_fingerprint_from(|n| env.get(n).map(|v| v.to_string()));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got["SECRET"],
+            "d09f5c67f9abb684a6ec49836260cac2e1d44d86006107e2efc47d381ad93635"
+        );
+        assert!(!got.contains_key(ENV_FINGERPRINT_KEY_ENV), "the key is never reported");
+    }
+
+    #[test]
+    fn no_key_means_no_fingerprints() {
+        let got = env_fingerprint_from(|n| (n == ENV_FINGERPRINT_VARS_ENV).then(|| "A".into()));
+        assert!(got.is_empty());
     }
 
     #[test]

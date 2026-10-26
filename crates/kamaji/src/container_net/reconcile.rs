@@ -271,7 +271,7 @@ mod tests {
 
     const ADDRS: &str = "\
 1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
-2: enp2s0    inet 51.81.85.145/24 scope global enp2s0\\       valid_lft forever preferred_lft forever
+2: enp2s0    inet 203.0.113.13/24 scope global enp2s0\\       valid_lft forever preferred_lft forever
 3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever
 4: yah0    inet 10.128.3.1/24 scope global yah0\\       valid_lft forever preferred_lft forever";
 

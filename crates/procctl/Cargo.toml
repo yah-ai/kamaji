@@ -15,11 +15,18 @@ path = "src/lib.rs"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Environment fingerprints (R866): HMAC-SHA256, the one keyed digest every
+# language's standard library ships, so a non-Rust producer conforms without a
+# dependency. Both are pure-Rust and runtime-free — the default build still
+# links nothing a GUI with no async runtime would object to.
+hmac = "0.12"
+sha2 = "0.10"
+
 # The state vocabulary this crate reuses. Optional, and off by default: a
 # workload adopting the channel must not be made to link the supervisor's wire
 # protocol to answer one JSON line. Supervisor-side consumers (kamaji-bin) turn
 # it on to get the conversions.
-kamaji-proto = { version = "0.8.46", path = "../kamaji-proto", optional = true }
+kamaji-proto = { version = "0.8.48", path = "../kamaji-proto", optional = true }
 
 # Async client. Also off by default — the producer half is std-only on purpose
 # so a GUI app with no runtime can adopt it (noisetable's winit loop is the
