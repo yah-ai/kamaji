@@ -154,6 +154,16 @@ pub(crate) mod supervise;
 #[cfg(all(unix, feature = "native-integration"))]
 pub mod jit;
 
+/// `kamaji shim` — the per-workload parent that outlives kamaji (R1021-F2,
+/// W386 §1). Unix-only: it is a fork parent speaking over a unix socket.
+#[cfg(all(unix, feature = "native-integration"))]
+pub mod shim;
+
+/// The leaf half of kamaji's boot pass (R1021-F3, W386 §2): empty every
+/// workload leaf, shim and own-cgroup stray that no runtime adopted.
+#[cfg(all(unix, feature = "native-integration"))]
+pub mod boot;
+
 /// Socket-custodian primitive (R599-F9): kamaji binds+holds a workload's listen
 /// socket and hands the fd to the workload process over its pingora upgrade
 /// socket. Shared core under R599-F6 (JIT) and R600-F9 (cert-rotation).
@@ -775,6 +785,14 @@ pub enum WorkloadStatus {
         /// operator to raise a ceiling that was never the problem.
         oom_killed: bool,
     },
+    /// The workload's `WorkloadSpec::deadline` fired and kamaji killed it
+    /// (R1019-F2, W384 §2.3). Terminal, and never restarted: a deadline is a
+    /// hard runtime cap, so a restart policy must not buy more time past it.
+    ///
+    /// A **refinement of `Failed`**, like the OOM bit: consumers that treat
+    /// `Failed` as "down, not coming back" treat this identically. It crosses
+    /// the UDS as [`kamaji_proto::WorkloadState::DeadlineExceeded`] (V14).
+    DeadlineExceeded,
 }
 
 impl WorkloadStatus {
@@ -783,7 +801,9 @@ impl WorkloadStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            WorkloadStatus::Stopped | WorkloadStatus::Failed { .. }
+            WorkloadStatus::Stopped
+                | WorkloadStatus::Failed { .. }
+                | WorkloadStatus::DeadlineExceeded
         )
     }
 }

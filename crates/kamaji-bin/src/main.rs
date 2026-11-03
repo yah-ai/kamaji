@@ -557,6 +557,20 @@ fn bundle_port_default_str() -> String {
     }
 }
 
+/// @yah:ticket(R1021-T1, "kamaji handles SIGTERM: stop non-survivable workloads gracefully itself instead of dying on the default action and leaving them to systemd's SIGKILL")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:at(2026-10-27T06:59:25Z)
+/// @yah:phase(P1)
+/// @yah:parent(R1021)
+/// @yah:next("serve_with_ctx's shutdown future waits on tokio::signal::ctrl_c (SIGINT) only. Add SIGTERM. On it: TERM → grace → KILL every workload that cannot survive kamaji (today: all of them; after the shim lands: JIT serve processes and Firecracker only), then exit. Bound the whole thing well inside kamaji.service's TimeoutStopSec=30s.")
+/// @yah:next("Ships independently and FIRST: under today's KillMode=mixed it turns every roll's SIGKILL of headscale and bundle servers into a graceful stop, before any shim exists.")
+/// @yah:verify("A unit/integration test: a running native workload whose binary traps TERM records the TERM when kamaji receives SIGTERM.")
+/// @yah:gotcha("W386 spike T1: under KillMode=mixed a supervisor with no SIGTERM handler dies instantly and systemd SIGKILLs the rest of the cgroup; the workload's TERM trap never runs. Appliances are skipped by POST /workloads/drain, so today they get only that SIGKILL on every roll.")
+/// @arch:see(.yah/docs/working/W386-kamaji-restart-without-workload-downtime.md)
+/// @yah:handoff("Miravel (courier): kamaji now stops its own workloads on SIGTERM. oss/kamaji/crates/kamaji-bin/src/main.rs: the shutdown future selects ctrl_c OR unix SIGTERM. kamaji-bin/src/server.rs: new `ServerCtx::stop_workloads_for_shutdown(cap)` plus `SHUTDOWN_STOP_CAP`=20s, called from serve_with_ctx after the accept loop breaks. It lists and tears down, concurrently via JoinSet, workloads in ctx.native, bundle.native, bundle.jit, tenant_passway and microvm through each runtime's existing teardown_workload (native's stop_child does TERM, TERM_GRACE 5s, KILL). It deliberately does not use stop_workload, because that forgets resume records. containerd/docker are untouched (they already survive). Hook for R1021-F2: `fn survives_supervisor(&MeshIdent)->bool` in server.rs, returns false today; the shim ticket makes it a one-line predicate. Test: server::tests::shutdown_sends_term_to_a_native_workload_so_its_trap_runs (sh trap TERM writes a marker; asserts the marker and an empty list) passes. `cargo test -p kamaji-bin --features native-exec`: 268 passed, 0 failed (the pre-change baseline was not run separately). `cargo check -p kamaji-bin` passes on default features and on native-exec,bundle-serving. kamaji.service is untouched. The camp daemon dropped two runs mid-flight (\"lost by the daemon\"); I reran them and they were fine.")
+/// @yah:handoff("Leader: courier Miravel (session:8b64c408) landed SIGTERM shutdown in kamaji-bin/src/main.rs + ServerCtx::stop_workloads_for_shutdown and survives_supervisor() hook (false today) in kamaji-bin/src/server.rs; tears down native/bundle/JIT/passway/microVM concurrently via existing teardown_workload, capped 20s. Reported cargo test -p kamaji-bin --features native-exec: 268 pass / 0 fail. Independent re-run is folded into R1021-F2's courier as its pre-change baseline.")
+/// @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-bin --features native-exec shutdown_sends_term_to_a_native_workload_so_its_trap_runs")
 fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -612,6 +626,18 @@ fn run() -> Result<()> {
         .build()?;
     runtime.block_on(async move {
         let ctx = build_ctx(&args).await?;
+        // R1021-F3 (W386 §2): adopt the shims that survived the last kamaji,
+        // and kill by leaf whatever cannot be adopted — including any stray in
+        // kamaji's own cgroup (a leafless Firecracker) — BEFORE any replay
+        // below, so nothing is ever spawned beside a live predecessor.
+        #[cfg(all(
+            unix,
+            any(feature = "native-exec", feature = "bundle-serving", feature = "microvm")
+        ))]
+        {
+            let n = ctx.boot_pass().await;
+            tracing::info!(adopted = n, "boot pass done (R1021-F3)");
+        }
         // R755-B5: bring back every bundle the previous kamaji was serving
         // BEFORE the socket answers, so a control-plane roll is a restart of
         // the node's sites and not an undeploy of them.
@@ -629,8 +655,9 @@ fn run() -> Result<()> {
             tracing::info!(resumed = n, "recorded native deploys replayed (R936-B11)");
         }
         // R605-F16: and every service-shaped microVM that asked to outlive
-        // kamaji (a dev-cluster member VM). Its Firecracker process lives in
-        // this unit's cgroup, so the restart that got us here killed it.
+        // kamaji (a dev-cluster member VM). Since R1021-F8 one the boot pass
+        // adopted is still running and is skipped; what replays is a guest
+        // whose VMM died, or a pre-F8 leafless one the boot pass killed.
         #[cfg(feature = "microvm")]
         {
             let n = ctx.resume_microvm_workloads().await;
@@ -657,7 +684,18 @@ fn run() -> Result<()> {
             tracing::info!(rearmed = n, "durability tails re-armed after restart (R932)");
         }
         kamaji_bin::serve_with_ctx(&args.socket, ctx, async {
-            let _ = tokio::signal::ctrl_c().await;
+            // R1021-T1: SIGTERM is what `systemctl stop/restart` sends.
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = async {
+                    match term.as_mut() {
+                        Some(t) => { t.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+            }
         })
         .await
     })
@@ -838,9 +876,14 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                 "native-exec backend attached; Container workloads marked yah.exec=native \
                  will be forked on this host"
             );
-            ctx.with_native_exec(Arc::new(
-                kamaji::native::NativeRuntime::new(dir).with_collector(collector.clone()),
-            ))
+            // R1021-F2: parent each workload through `kamaji shim`, so it
+            // outlives this process (and its exit status survives with it).
+            let native = kamaji::native::NativeRuntime::new(dir).with_collector(collector.clone());
+            #[cfg(unix)]
+            let native = native.with_shim(kamaji::shim::ShimLauncher::this_binary().map_err(
+                |e| anyhow::anyhow!("resolving this binary's path for `kamaji shim`: {e}"),
+            )?);
+            ctx.with_native_exec(Arc::new(native))
             .with_native_deploy_records(kamaji_bin::deploy_records::ResumeRecords::under(
                 kamaji_bin::deploy_records::ResumeBackend::Native,
                 dir,
@@ -1021,7 +1064,13 @@ async fn build_ctx(args: &Args) -> Result<Arc<kamaji_bin::ServerCtx>> {
                     .map(|n| n.get() as u32)
                     .unwrap_or(1),
             };
-            let runtime = kamaji::microvm::MicroVmRuntime::new(cfg)?;
+            // R1021-F8: a service guest's VMM is parented by `kamaji shim`,
+            // so it outlives this process and the next one adopts it.
+            let runtime = kamaji::microvm::MicroVmRuntime::new(cfg)?.with_shim(
+                kamaji::shim::ShimLauncher::this_binary().map_err(|e| {
+                    anyhow::anyhow!("resolving this binary's path for `kamaji shim`: {e}")
+                })?,
+            );
             tracing::info!(
                 microvm_dir = %dir.display(),
                 "microVM backend attached; Container workloads marked yah.exec=microvm \
@@ -1168,6 +1217,14 @@ async fn attach_bundle_backend(
     if let Some(port) = args.bundle_port {
         backend = backend.with_bind_port(port);
     }
+    // R1021-F2: keep-alive bundles (yah-marketing) outlive a kamaji restart
+    // the same way --native-exec-dir workloads do.
+    #[cfg(unix)]
+    {
+        backend = backend.with_shim(kamaji::shim::ShimLauncher::this_binary().map_err(|e| {
+            anyhow::anyhow!("resolving this binary's path for `kamaji shim`: {e}")
+        })?);
+    }
     tracing::info!(
         cache_dir = %cache_dir.display(),
         origin = %origin,
@@ -1179,6 +1236,21 @@ async fn attach_bundle_backend(
 }
 
 fn main() -> ExitCode {
+    // R1021-F2 (W386 §1): `kamaji shim` is the per-workload parent the native
+    // backend forks through. Same binary, so no new release artifact; it reads
+    // its request on stdin and never touches the daemon's arg parser or tokio.
+    #[cfg(all(
+        unix,
+        any(
+            feature = "native-exec",
+            feature = "bundle-serving",
+            feature = "tenant-passway",
+            feature = "microvm"
+        )
+    ))]
+    if std::env::args().nth(1).as_deref() == Some("shim") {
+        return ExitCode::from(kamaji::shim::run_from_stdin().clamp(0, 255) as u8);
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

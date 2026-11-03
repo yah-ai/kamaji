@@ -335,6 +335,29 @@ const DRAIN_BUDGET: Duration = Duration::from_millis(500);
 
 /// Driver scoped to one delegated cgroup subtree. Cheap to clone — only holds
 /// paths.
+///
+/// @yah:ticket(R1021-T4, "kamaji.service KillMode=process, and decommission/rollback paths switch from `systemctl stop` to `systemctl kill kamaji.service`")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:at(2026-10-27T08:21:24Z)
+/// @yah:phase(P1)
+/// @yah:parent(R1021)
+/// @yah:next("app/yah/cli/resources/kamaji.service: KillMode=mixed → process; rewrite the 'Kill the cgroup on stop' comment to point at the boot pass as the floor. Audit every stop site: scripts/roll-node.sh:699 and scripts/hotship.sh:1250 rollback hints, .yah/infra/cloud-init/{stand-up-yubaba,standalone-node,dev-raft-node}.sh, and anything that 'resets' a node by stopping kamaji.")
+/// @yah:next("MUST ship in the same release as R1021-F3's boot pass, never earlier: control_plane_install.sh installs the unit and daemon-reloads BEFORE restarting kamaji, so the old kamaji is already stopped under the new KillMode. A new unit with an old binary leaves surviving Firecrackers that nothing kills.")
+/// @yah:verify("On a dev voter: `systemctl show kamaji -p KillMode` = process; `sudo systemctl restart kamaji` leaves headscale/bundle pids unchanged; `sudo systemctl kill kamaji && sudo systemctl stop kamaji` leaves /sys/fs/cgroup/yubaba.slice/kamaji.service/ with no populated leaf.")
+/// @yah:gotcha("W386 spike T5: under KillMode=process, stopping the unit AND stopping the slice both leave every shim and workload running — systemd's floor is gone entirely (reboot still kills all). R2: `systemctl kill <unit>` (whom=all) then stop removes everything. Journal will log 'Found left-over process … Ignoring.' on every start with survivors; that is expected, not an error.")
+/// @arch:see(.yah/docs/working/W386-kamaji-restart-without-workload-downtime.md)
+/// @yah:depends_on(R1021-F3)
+/// @yah:depends_on(R1021-T1)
+/// @yah:handoff("DECIDED 2026-10-26 by the operator: W386 option A. kamaji.service moves to KillMode=process, the boot pass (R1021-F3) becomes the floor, and decommission is `systemctl kill kamaji.service`. Option B (a systemd scope per shim, keeping mixed) is rejected. Still gated on R1021-F3 + R1021-T1 shipping in the same release or earlier.")
+/// @yah:gotcha("kamaji.service has a peer's finished, uncommitted R1019-T22 hunks: /var/lib/yah/leases in ReadWritePaths, and yah/leases + a 2-line comment in StateDirectory. They're already live on us-west-004/002. They don't overlap KillMode or the kill-cgroup comment, so edit only your hunks and leave those intact.")
+/// @yah:handoff("Unit: app/yah/cli/resources/kamaji.service KillMode=mixed -> process; comment rewritten (boot pass boot.rs ServerCtx::boot_pass is the floor; 'Found left-over process ... Ignoring.' expected; full teardown = systemctl kill kamaji.service then stop; plain stop leaves workloads). Peer's R1019-T22 leases hunks untouched.")
+/// @yah:handoff("Stop sites CHANGED (kill + stop): scripts/roll-node.sh ~699 rollback hint (added kill line before stop); scripts/hotship.sh ~1446 rollback hint (one-line surgical edit, outside golem's visible hunk; file re-read first; the ~1250 line cited in the ticket is a different area, no stop hint there); scripts/fleet-git-live-drill.sh:143 (drill simulating node loss: kill then stop keeps its old mixed-mode semantics).")
+/// @yah:handoff("Sites deliberately LEFT as restart: cloud-init dev-raft-node.sh:390, stand-up-yubaba.sh:389, standalone-node.sh:115 (all `systemctl restart kamaji.service`; stand-up-yubaba:368 is reset-failed only), control_plane_install.sh:326 restart. No cloud-init script stops kamaji for teardown. scripts/pi-nvme-init.sh:35 only mentions stopping services in a comment (not audited/changed). Rust grep hits (kamaji.stop(...) in oss/yubaba) are workload-level RPCs, not unit stops.")
+/// @yah:handoff("control_plane_install.sh is oss/yah-base/crates/workload-spec/src/control_plane_install.sh: installs kamaji binary (143) and kamaji.service (145) atomically in the same pair-install, asserts bytes (305), then daemon-reload (325) then restart kamaji (326). So unit + binary ship together from one tree; no version gate added. Caveat: on the first roll, daemon-reload loads the new KillMode before the restart, so the OLD kamaji's workloads survive the stop and the NEW binary's boot pass must clean up non-adoptable ones; this is the ticket's intended transition.")
+/// @yah:handoff("Verified: bash -n ok on the 3 edited scripts; no .rs touched. Unit not systemd-analyze-verified (darwin). Live-node verify (systemctl show KillMode, restart/kill behaviour) remains for a dev voter.")
+/// @yah:handoff("Leader: courier Miravel (session:ae3ef8a7) changed kamaji.service to KillMode=process and rewrote the comment to describe the boot-pass floor, the expected 'Found left-over process' journal lines, and teardown as kill then stop. Three teardown sites now run kill+stop: the roll-node.sh rollback hint, the hotship.sh rollback hint, and fleet-git-live-drill.sh. Four restart sites stay as restart: 3 cloud-init scripts and control_plane_install.sh, which installs the unit and binary together before daemon-reload and restart. The peer's R1019-T22 leases hunks are intact. Checked with bash -n on the edited scripts.")
+/// @yah:verify("Dev voter: `systemctl show kamaji -p KillMode` = process; `systemctl restart kamaji` keeps headscale/bundle pids; kill+stop leaves no populated leaf (covered by R1021-T6)")
 #[derive(Debug, Clone)]
 pub struct CgroupV2 {
     /// The cgroup directory workload leaves are created under.
@@ -411,6 +434,24 @@ impl CgroupV2 {
     /// The directory workload leaves are created under.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// kamaji's own cgroup (`<root>/native` under `DelegateSubgroup=native`),
+    /// when it was resolved from `/proc/self/cgroup`. R1021-F3's boot pass
+    /// kills every other process it finds there.
+    pub fn own(&self) -> Option<&Path> {
+        self.own.as_deref()
+    }
+
+    /// A tempdir driver that also knows "kamaji's own" cgroup — the fixture
+    /// R1021-F3's boot-pass tests stand in for `/sys/fs/cgroup` with.
+    #[cfg(test)]
+    pub(crate) fn with_own(root: impl Into<PathBuf>, own: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            own: Some(own.into()),
+            pids_available: false,
+        }
     }
 
     /// Whether `pids` was enabled on the delegated root. Always `false`
@@ -673,7 +714,7 @@ impl WorkloadLimits {
 /// round is silently wrong rather than an error — a pid written to the node
 /// breaks the no-internal-process rule, and counters read off the leaf are all
 /// absent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CgroupHandle {
     /// `<root>/<workload-id>/<generation>` — where the processes go.
     path: PathBuf,
@@ -682,6 +723,13 @@ pub struct CgroupHandle {
 }
 
 impl CgroupHandle {
+    /// A handle onto a pair that already exists on disk — an adopted
+    /// workload's node and the generation leaf its shim reported (R1021-F3).
+    #[cfg(all(unix, feature = "native-integration"))]
+    pub(crate) fn existing(workload: PathBuf, path: PathBuf) -> Self {
+        Self { path, workload }
+    }
+
     /// The **generation leaf**: the directory this deploy's processes join.
     pub fn path(&self) -> &Path {
         &self.path
@@ -1135,6 +1183,20 @@ fn kill_cgroup(leaf: &Path) -> KillMethod {
         return KillMethod::CgroupKill;
     }
     freeze_and_sweep(leaf)
+}
+
+/// The live processes in a cgroup, kamaji itself excluded (R1021-F3: "is this
+/// leaf populated?"). Unreadable reads as empty.
+pub fn live_members(cgroup: &Path) -> Vec<u32> {
+    member_pids(cgroup).into_iter().filter(|p| is_live(*p)).collect()
+}
+
+/// `cgroup.kill` (or freeze + sweep) a leaf, then wait for it to drain, up to
+/// [`DRAIN_BUDGET`]. Never aim this at kamaji's own cgroup: `cgroup.kill`
+/// does not exempt the writer.
+pub fn kill_and_drain(leaf: &Path) -> Result<(), CgroupError> {
+    kill_cgroup(leaf);
+    drain(leaf)
 }
 
 /// Write to a cgroup control file **without creating it**.

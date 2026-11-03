@@ -241,6 +241,17 @@ use serde::{Deserialize, Serialize};
 /// it is a paired ship. And [`crate::spec_digest`]'s basis moved with the
 /// encoding (domain prefix `v1` → `v2`), so every node reads its recorded
 /// digests as stale and redeploys everything once.
+///
+/// V14 (R1019-F2) appends `WorkloadState::DeadlineExceeded` (discriminant 7),
+/// the terminal state kamaji reports when a lease's `WorkloadSpec::deadline`
+/// fires. It rides a `WorkloadEntry` inside the V13 name-keyed envelope, but an
+/// enum variant is not a field: a V13 peer decoding the unknown variant name
+/// fails the whole entry list, so this is a handshake-refused bump, not a free
+/// addition. V13 is released (the 0.8.48 tree is V13 and R971-B10 rolled kamaji
+/// at V13 to the x86 nodes), so folding it into V13 was not an option. The
+/// `NodeCapabilities::deadline_enforced` field stays: it is the "can this node
+/// enforce a deadline" probe, which V14 alone does not answer for a node that
+/// predates the whole feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ProtocolVersion {
@@ -257,6 +268,7 @@ pub enum ProtocolVersion {
     V11,
     V12,
     V13,
+    V14,
 }
 
 impl Default for ProtocolVersion {
@@ -267,7 +279,7 @@ impl Default for ProtocolVersion {
 
 impl ProtocolVersion {
     /// The version this build of `kamaji-proto` produces by default.
-    pub const CURRENT: Self = Self::V13;
+    pub const CURRENT: Self = Self::V14;
 
     /// The `n` of `Vn`. Surfaced on yubaba's `GET /health` as
     /// `kamaji_protocol` so `scripts/hotship.sh` can compare a tree against the
@@ -285,5 +297,6 @@ mod number_tests {
     fn number_matches_the_variant_name() {
         assert_eq!(ProtocolVersion::V1.number(), 1);
         assert_eq!(ProtocolVersion::V13.number(), 13);
+        assert_eq!(ProtocolVersion::V14.number(), 14);
     }
 }

@@ -143,6 +143,12 @@ pub(crate) trait Supervised: Send + Sync + 'static {
     /// Dispose of an instance replaced by [`Ctrl::Adopt`]. Defaults to dropping
     /// it; a backend with a drain protocol overrides.
     fn discard(&self, _replaced: Self::Instance) {}
+
+    /// Whether `inst` is meant to keep running when the runtime that owns this
+    /// loop is dropped (R1021-F2). Defaults to `false`: stop it.
+    fn outlives_supervisor(&self, _inst: &Self::Instance) -> bool {
+        false
+    }
 }
 
 /// Outcome of the running-phase select: the instance ended, or a control
@@ -241,7 +247,12 @@ pub(crate) async fn supervise<S: Supervised>(
         match ev {
             // Control channel closed — the runtime was dropped. Stop and exit.
             Ev::Ctrl(None) => {
-                sup.stop(&mut inst).await;
+                // A child that outlives its supervisor by design (a shim-parented
+                // native workload, R1021-F2) is left running: the runtime going
+                // away is exactly the event it exists to survive.
+                if !sup.outlives_supervisor(&inst) {
+                    sup.stop(&mut inst).await;
+                }
                 return;
             }
             Ev::Ctrl(Some(Ctrl::Teardown(ack))) => {
@@ -297,7 +308,9 @@ pub(crate) async fn supervise<S: Supervised>(
                 pid.store(0, Ordering::SeqCst);
                 let done = sup.settle(exit).await;
 
-                let should_restart = match &policy {
+                let deadline_hit = matches!(done.terminal, WorkloadStatus::DeadlineExceeded);
+                let should_restart = !deadline_hit
+                    && match &policy {
                     RestartPolicy::Always => true,
                     RestartPolicy::Never => false,
                     RestartPolicy::OnFailure { max_attempts, .. } => {

@@ -459,7 +459,8 @@ impl KamajiClient {
     /// A bundle [`deploy_envelope`] acks on admission, so this is how a caller
     /// learns whether the node actually materialized and forked it. Returns
     /// `(state, detail)`; `detail` is the failure reason on
-    /// [`WorkloadState::Failed`] and `None` otherwise. An id kamaji never
+    /// [`WorkloadState::Failed`], the retry reason on a `Pending` run that hit
+    /// a transient fetch failure (R983-B2), and `None` otherwise. An id kamaji never
     /// admitted comes back as [`ClientError::Remote`] with
     /// [`ErrorCode::UnknownWorkload`], which a polling caller must treat as
     /// terminal rather than as "not yet".
@@ -887,6 +888,8 @@ fn proto_state_to_status(s: ProtoWorkloadState) -> crate::WorkloadStatus {
                 .into(),
             oom_killed: true,
         },
+        // R1019-F2: the deadline kill survives the round trip as itself.
+        ProtoWorkloadState::DeadlineExceeded => crate::WorkloadStatus::DeadlineExceeded,
         // `#[non_exhaustive]` — map unknown future variants to Failed so
         // callers never silently treat an unknown state as healthy. `false` is
         // the honest bit here: an unrecognised state is not evidence of an OOM.
@@ -1272,6 +1275,24 @@ impl KamajiSibling {
         Self { socket, rx }
     }
 
+    /// A sibling that has not connected YET: published as `None` and dialled
+    /// by the same watchdog [`Self::new`] runs, so it attaches the moment
+    /// `socket` answers. [`Self::subscribe`] watchers wake on that first
+    /// connect too, which is the reconnect they would otherwise have waited for.
+    ///
+    /// What a caller holds when its startup budget for the first dial lapses
+    /// (R1021-T6). yubaba used to drop the sibling outright then, serving the
+    /// in-process runtime's view — which cannot see kamaji's workloads — for
+    /// the rest of the process: kamaji's first start after a roll that takes
+    /// longer than the budget took yah.dev down until yubaba was restarted by
+    /// hand, twice on prod us-east-001.
+    pub fn connecting(socket: impl Into<PathBuf>, connect_timeout: Duration) -> Self {
+        let socket: Arc<Path> = socket.into().into();
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(reconnect_watchdog(tx, socket.to_path_buf(), connect_timeout));
+        Self { socket, rx }
+    }
+
     /// A sibling that is **configured but not currently reachable** — what a
     /// fleet node holds while `kamaji.service` is down, wedged, or misframing
     /// across a protocol-version skew (R881-B8).
@@ -1341,11 +1362,14 @@ async fn reconnect_watchdog(
         }
         // Clear immediately: a caller mid-reconnect should see "no kamaji"
         // (and fall back / wait) rather than a handle that will only ever
-        // answer PeerClosed.
-        if tx.send(None).is_err() {
-            return;
+        // answer PeerClosed. Already `None` (a `connecting` seed): nothing to
+        // clear, and re-sending it would wake subscribers for no change.
+        if tx.borrow().is_some() {
+            if tx.send(None).is_err() {
+                return;
+            }
+            warn!(socket = %socket.display(), "kamaji sibling connection lost; reconnecting");
         }
-        warn!(socket = %socket.display(), "kamaji sibling connection lost; reconnecting");
 
         let mut backoff = RECONNECT_INITIAL_BACKOFF;
         loop {
@@ -1758,6 +1782,41 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// R1021-T6: a sibling whose socket did not answer at startup attaches
+    /// once it does, rather than staying absent for the life of the caller.
+    #[tokio::test]
+    async fn a_connecting_sibling_attaches_once_the_socket_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("kamaji.sock");
+        let sibling = KamajiSibling::connecting(sock.clone(), Duration::from_secs(2));
+        let mut woke = sibling.subscribe();
+        assert!(sibling.current().is_none(), "nothing is listening yet");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut conn = ServerConn {
+                stream,
+                buf: Vec::with_capacity(4096),
+            };
+            assert!(matches!(conn.recv().await, YubabaToKamaji::Hello { .. }));
+            conn.send(&KamajiToYubaba::Welcome {
+                version: ProtocolVersion::CURRENT,
+                kamaji_version: "late".into(),
+            })
+            .await;
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), woke.changed())
+            .await
+            .expect("subscribers wake on the first connect")
+            .unwrap();
+        let c = sibling.current().expect("attached after the socket bound");
+        assert_eq!(c.info().kamaji_version, "late");
     }
 
     // ── Cancel-safety and demux ────────────────────────────────────────────

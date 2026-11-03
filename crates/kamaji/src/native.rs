@@ -38,10 +38,20 @@
 //! - **Idempotent teardown**: SIGTERM → grace (fixed 5s) → SIGKILL, and the
 //!   supervisor stops restarting. Same-ident redeploys tear the predecessor
 //!   down first.
-//! - **Crash semantics** per W199 §"Crash semantics": the restart loop lives
-//!   *in* the supervising kamaji process, so if kamaji itself dies its native
-//!   workloads are orphaned; next-boot reconcile re-adopts or re-deploys.
-//!   `kill_on_drop` is intentionally off.
+//! - **Crash semantics**: the restart loop lives *in* the supervising kamaji.
+//!   With a shim (kamaji-bin, R1021-F2) the child's parent is a `kamaji shim`
+//!   that outlives kamaji and latches the exit status, and the next kamaji
+//!   **adopts** it before anything replays ([`NativeRuntime::adopt_survivors`],
+//!   R1021-F3): the shim answers, its `proto` matches, its generation leaf is
+//!   the one it reports, and the workload goes back in the map `Running` at
+//!   the same pid, its supervisor reading exits from the shim so the
+//!   [`RestartPolicy`] holds across the restart. Whatever is not adopted is
+//!   killed by leaf ([`crate::boot`]) — never spawned beside — and comes back
+//!   by replay: a deploy record (R755-B5 bundles, R936-B11 natives), the
+//!   persisted `spec.json` (a shim speaking another `proto`), or yubaba (the
+//!   headscale appliance). Without a delegated cgroup (the desktop camp) the
+//!   pid file is the identity and `deploy_workload` reaps a survivor via
+//!   [`crate::orphan::reap`] (R967-B1). `kill_on_drop` is intentionally off.
 //!
 //! @yah:ticket(R599-F6, "On-demand JIT lifecycle: kamaji holds the listen socket, forks on first connection (fd-passing), reaps after idle TTL")
 //! @yah:status(review)
@@ -209,7 +219,6 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -241,10 +250,81 @@ const UPGRADE_SETTLE: Duration = Duration::from_millis(750);
 /// A freshly fork+exec'd child plus the bookkeeping the supervisor and the
 /// registry need to reason about it.
 struct SpawnedChild {
-    child: Child,
+    proc: Proc,
     pid: u32,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+}
+
+/// Who parents the child, and so where its exit is read from. Shared with
+/// [`crate::microvm`], whose VMM process is one of these too (R1021-F8).
+pub(crate) enum Proc {
+    /// Forked by this kamaji; dies with it (or is orphaned past it, R967-B1).
+    Direct(Child),
+    /// Parented by a `kamaji shim` (R1021-F2); the exit arrives over the shim
+    /// connection and the child outlives this kamaji.
+    #[cfg(unix)]
+    Shim(crate::shim::ShimConn),
+}
+
+/// Unix-only: the shim is a unix-socket fork parent. Elsewhere there is no
+/// launcher to configure, and [`NativeRuntime::with_shim`] does not exist.
+#[cfg(unix)]
+type ShimLauncher = crate::shim::ShimLauncher;
+#[cfg(not(unix))]
+type ShimLauncher = std::convert::Infallible;
+
+impl Proc {
+    /// The exit, if the child has already gone. Never blocks.
+    pub(crate) fn try_exit(&mut self) -> Option<std::io::Result<std::process::ExitStatus>> {
+        match self {
+            Proc::Direct(child) => child.try_wait().transpose(),
+            #[cfg(unix)]
+            Proc::Shim(conn) => conn.try_exit().map(|r| r.map(|e| e.to_status())),
+        }
+    }
+
+    /// Wait for the exit. Cancel-safe for both variants. A shim's latched
+    /// status is released (`ack_exit`) once read, which ends that shim.
+    pub(crate) async fn wait(&mut self) -> Exit {
+        match self {
+            Proc::Direct(child) => child.wait().await,
+            #[cfg(unix)]
+            Proc::Shim(conn) => {
+                let exit = conn.wait_exit().await.map(|e| e.to_status());
+                conn.ack_exit().await;
+                exit
+            }
+        }
+    }
+
+    pub(crate) async fn signal(&mut self, pid: u32, sig: i32) {
+        match self {
+            Proc::Direct(_) => {
+                #[cfg(unix)]
+                // SAFETY: plain kill(2) on a pid we spawned and still hold the
+                // Child for; ESRCH (already exited) is ignored.
+                unsafe {
+                    libc::kill(pid as i32, sig);
+                }
+                #[cfg(not(unix))]
+                let _ = (pid, sig);
+            }
+            #[cfg(unix)]
+            Proc::Shim(conn) => conn.signal(sig).await,
+        }
+    }
+
+    pub(crate) async fn kill(&mut self, pid: u32) {
+        match self {
+            Proc::Direct(child) => {
+                let _ = pid;
+                let _ = child.start_kill();
+            }
+            #[cfg(unix)]
+            Proc::Shim(conn) => conn.signal(libc::SIGKILL).await,
+        }
+    }
 }
 
 /// Registry entry for one supervised workload. The child itself lives in the
@@ -280,6 +360,10 @@ struct WorkloadHandle {
     /// The pid of the currently-running child, or `0` when no child is running
     /// (parked between a terminal exit and a control message).
     pid: Arc<AtomicU32>,
+    /// R870-B24's digest of the envelope this was deployed from, as kamaji-bin
+    /// handed it in (opaque here). Adopted workloads carry it from the shim, so
+    /// a replay of the same spec is skipped and `List` can report it (R1021-F3).
+    spec_digest: Option<String>,
     /// Latest lifecycle status, published by the supervisor.
     status: watch::Receiver<WorkloadStatus>,
     /// Control channel to the supervisor task.
@@ -291,6 +375,27 @@ struct WorkloadHandle {
 
 /// Fork+exec backend. One instance supervises any number of workloads;
 /// bookkeeping lives in-process (see crash semantics above).
+///
+/// @yah:ticket(R1021-F2, "NativeRuntime forks through a per-workload `kamaji shim` that parents the child, keeps its exit status, and outlives kamaji")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:at(2026-10-27T07:58:57Z)
+/// @yah:phase(P1)
+/// @yah:parent(R1021)
+/// @yah:next("`kamaji shim` subcommand of the same binary (no new release artifact): synchronous, no tokio. Joins the one shared leaf kamaji.service/shim/ (NEVER the workload's leaf: its memory.max must not charge the shim and an OOM there must not kill the only holder of the exit status); forks the child, which joins <ident>/<gen>/ in the pre-exec hook spawn_child uses today.")
+/// @yah:next("Lifetime = one child: on exit the shim latches the status until a kamaji sends ack_exit, then exits. Respawn = new shim; the restart loop and RestartPolicy stay in kamaji's supervise(), which now reads exit events from the shim instead of tokio Child::wait.")
+/// @yah:next("Protocol: line-delimited JSON on <state_dir>/<ident>/shim.sock; hello → {proto, ident, generation, spec_digest, shim_pid, child_pid, child_start, boot_id, last_exit} + the child's pidfd via SCM_RIGHTS on Linux; verbs signal, ack_exit; pushed event exit{code|signal}. Persist the spec to <state_dir>/<ident>/spec.json at deploy so an unrecorded survivor (headscale) is restartable after adoption.")
+/// @yah:verify("kamaji crate test: deploy via shim, drop the NativeRuntime, kill nothing; a fresh shim connection from a new process gets hello with the same child_pid, and a child exit 42 is reported as code 42 (W386-assets R1 is the mechanism proof).")
+/// @yah:gotcha("The socket must NOT live under RuntimeDirectory= (/run/kamaji): systemd deletes it on every stop, and W386 spike T3 shows the next supervisor then starts a SECOND shim + workload beside the live one. StateDirectory it is; guard sun_path's 108-byte limit and fail the deploy loudly.")
+/// @yah:gotcha("stdout/stderr are already O_APPEND files opened before exec — the shim stays out of the data path; do not introduce pipes through it.")
+/// @arch:see(.yah/docs/working/W386-kamaji-restart-without-workload-downtime.md)
+/// @yah:gotcha("Sequenced after R1021-T1 by the leader: both edit oss/kamaji/crates/kamaji-bin/src/main.rs and the native stop path in oss/kamaji/crates/kamaji/src/native.rs on one shared tree. Build on T1's SIGTERM handler; after the shim, T1's stop-on-SIGTERM must skip shim-parented native workloads.")
+/// @yah:depends_on(R1021-T1)
+/// @yah:handoff("Ashguard (courier session:a3c9740f), 2026-10-27. BASELINE before any edits, which also re-checks R1021-T1: kamaji-bin --features native-exec ran 268+2+2+1 passed, 0 failed, and that includes shutdown_sends_term_to_a_native_workload_so_its_trap_runs. kamaji (default features) ran 189 passed, 1 ignored. T1 VERIFIED. WHAT LANDED: (1) NEW oss/kamaji/crates/kamaji/src/shim.rs, gated cfg(all(unix, native-integration)). It is a synchronous, threads-only shim with no tokio. The shim reads a ShimRequest as JSON on stdin, calls setsid, and joins <cgroup root>/shim/ (Linux only; if that fails it warns to shim.log). It then guards sun_path (108 bytes on Linux, 104 on macOS) and fails loudly if the path is too long. It unlinks any stale socket and binds <state_dir>/<ident>/shim.sock, then spawns ONE child. Startup handshake: it writes KAMAJI-SHIM-READY|ERR on its own line to fd 1, then points fd 1 at /dev/null. A waiter thread latches the exit and pushes {event:exit, code|signal} to every client. Each connection receives hello {proto=1, ident, generation, spec_digest, shim_pid, child_pid, child_start, boot_id, last_exit}; on Linux the child's pidfd rides that same write via SCM_RIGHTS. Ops: signal {sig}, sent by pidfd_send_signal on Linux and kill otherwise, and ignored once the child has exited (the check holds the lock). ack_exit only acts after the exit; the shim then removes the socket, but only if it is still its own inode (a graceful upgrade's newer shim may own the path by then), and exits. Kamaji side: ShimLauncher {program, args, env} (this_binary() gives `<exe> shim`); launch() starts the shim with kill_on_drop(false) and stderr appended to <ident>/shim.log; ShimConn's reader task publishes the exit on a watch so waiting is cancel-safe. persist_spec writes <ident>/spec.json atomically, and the digest is fnv1a64 of those bytes. (2) native.rs: spawn_child now builds a LaunchPlan (argv, ordered env overrides, cwd, log paths, truncate flag, CgroupHandle, spec). LaunchPlan::command() is now the ONE builder for both paths, with the same hook order as before: cgroup attach, landlock, cap drop, disclaim. SpawnedChild.child became proc: Proc::{Direct(Child), Shim(ShimConn)}. stop_child, drain_reaper, wait, the deadline path and graceful upgrade's try_exit all go through Proc, so teardown TERMs and then KILLs through the shim's signal verb, and the supervisor's wait sends ack_exit, which reaps the shim. New: NativeRuntime::with_shim(launcher) (unix only) and workloads_survive_supervisor(). (3) supervise.rs gets a new Supervised::outlives_supervisor(&inst), default false. When the ctrl channel closes (runtime dropped), the supervisor no longer stops a shim instance. Without this, dropping the runtime TERMed the child; the verify test caught it intermittently as signal 15. (4) cgroup.rs: CgroupHandle now derives Serialize/Deserialize so it can travel in the request. lib.rs: pub mod shim. (5) kamaji-bin main.rs: main() hands `kamaji shim` to kamaji::shim::run_from_stdin() before parsing args (gated on unix plus any of native-exec, bundle-serving or tenant-passway). The --native-exec-dir runtime is now .with_shim(ShimLauncher::this_binary()). server.rs: spawn_native_stops returns early when native.workloads_survive_supervisor(), and the survives_supervisor() doc was updated (it stays false for JIT, passway and microVM). TESTS: kamaji native::tests::a_shimmed_workload_outlives_its_runtime_and_reports_exit_42_to_a_fresh_client is the ticket's verify. It deploys via the shim in its own tokio runtime, drops the NativeRuntime and the whole runtime, and kills nothing. A fresh std UnixStream client then gets a hello with the same child_pid, sees exit code 42, sends ack, and confirms the shim exits and removes its socket. Also added: native::tests::teardown_stops_a_shimmed_child_and_ends_its_shim; shim::tests covering the wire shapes, ExitReport to wait-status, and the sun_path guard; and kamaji-bin server::tests::shutdown_leaves_a_shim_parented_native_workload_running (shutdown does NOT TERM it, the pid stays alive, then teardown TERMs it through the shim). T1's original test is unchanged and covers the non-surviving class, since its runtime has no shim. The test shim re-execs the test harness with `--exact <entry>` plus an env flag. POST-CHANGE: kamaji --features native-integration --lib ran 250 passed, 0 failed, three times in a row after the fix. kamaji-bin --features native-exec ran 270+2+2+1 passed, EXIT 0. kamaji default ran 189 passed. cargo check of kamaji-bin on default features passed. cargo check of kamaji native-integration --tests for aarch64-unknown-linux-gnu passed (compile only).")
+/// @yah:gotcha("LINUX-ONLY PARTS ARE COMPILED, NOT RUN: joining the shim leaf, sending the pidfd over SCM_RIGHTS, pidfd_send_signal, boot_id, and the child joining <ident>/<gen> through the shim. All tests ran on darwin. Run the verify test plus shutdown_leaves_a_shim_parented_native_workload_running on a Linux node with a delegated cgroup before the KillMode=process flip. SCOPE IS OPT-IN: with_shim is set only on kamaji-bin's --native-exec-dir runtime. BundleBackend.native in server.rs, the desktop camp and yubaba's cloud reconcilers still fork directly, because those binaries have no `shim` subcommand. That leaves two fork paths, and I filed no removal ticket; leader's call. spec_digest is fnv1a64 of spec.json, NOT kamaji-proto's R870-B24 spec_digest (not reachable from the kamaji crate without the sibling feature). F3 must pick one. Shim leaf name `shim` can collide with a workload ident literally named `shim`. The shim's kamaji-side ShimConn ignores the pidfd it receives.")
+/// @yah:handoff("Ashguard (session:a3c9740f), leader-call delta, 2026-10-27. (1) BUNDLE BACKEND IS NOW SHIMMED. kamaji-bin server.rs gains BundleBackend::with_shim(launcher) (unix only). It rebuilds the not-yet-shared native runtime by Arc::try_unwrap and panics if the backend was already shared. main.rs calls .with_shim(ShimLauncher::this_binary()) on the bundle backend right after with_bind_port, so a KeepAlive mesofact-static bundle (yah-marketing) is shim-parented like a --native-exec-dir workload. Shutdown is unchanged: spawn_native_stops already returns early per runtime when workloads_survive_supervisor() is true, so bundle.native is skipped. JIT serve processes are still torn down (that is R1021-F7). New test server::tests::bundle_serving::shutdown_leaves_a_shimmed_keep_alive_bundle_running: it deploys a self-runtime KeepAlive bundle through the Deploy handler, runs stop_workloads_for_shutdown, and asserts the serve process is alive and still listed. It then tears the bundle down and asserts the process is gone. server::tests::shim_test_launcher's cfg widened to unix plus native-exec OR bundle-serving. NativeRuntime::with_shim's doc now says the desktop camp and yubaba reconcilers keep the direct fork on purpose: they are other binaries with no shim subcommand and no supervisor-restart hazard. No ticket was filed for this. (2) SHIM LEAF RENAMED: SHIM_LEAF is now `_shim` (was `shim`). Workload nodes are named by mesh ident in the same directory. The ident rule is ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, with forge adding dots, so an ident can never contain `_`. A workload named `shim` now gets its own node, and its deploy is not rejected. This departs from W386's literal `kamaji.service/shim/`, and the W386 doc text is not updated. spec_digest is unchanged. COUNTS: kamaji --features native-integration --lib: 250 passed, 0 failed. kamaji-bin --features native-exec: 270+2+2+1 passed, EXIT 0. kamaji-bin --features native-exec,bundle-serving: 314+2+2+1 passed, EXIT 0, including the new bundle test. cargo check -p kamaji-bin on default features: EXIT 0. The Linux-only paths are still compiled but not run.")
+/// @yah:handoff("Leader: second pass landed. BundleBackend::with_shim wired in kamaji-bin main.rs, so the yah-marketing class (KeepAlive bundle → BundleBackend.native) survives shutdown too. Shim leaf renamed to `_shim` (an ident can't contain `_`). Desktop and yubaba keep the direct fork on purpose (documented at with_shim). Courier counts: kamaji native-integration 250/0; kamaji-bin native-exec 270+2+2+1/0; native-exec,bundle-serving 314+2+2+1/0. spec_digest reconciliation with R870-B24 is handed to R1021-F3.")
+/// @yah:verify("Linux-only paths (shim leaf join, SCM_RIGHTS pidfd, pidfd_send_signal) run on a delegated-cgroup Linux node before R1021-T4's KillMode flip; R1021-T6 LIVE covers it")
 pub struct NativeRuntime {
     state_dir: PathBuf,
     workloads: Mutex<HashMap<String, WorkloadHandle>>,
@@ -315,6 +420,10 @@ pub struct NativeRuntime {
     /// [`Collector::disabled`](crate::observe::Collector::disabled) is the
     /// default and injects nothing, exactly as this backend did before.
     collector: crate::observe::Collector,
+    /// How to start a `kamaji shim` (R1021-F2). `None` forks directly, as every
+    /// embedder without a `shim` subcommand (the desktop camp, yubaba's
+    /// reconcilers) still does; kamaji-bin sets it, so its workloads survive it.
+    shim: Option<ShimLauncher>,
 }
 
 impl NativeRuntime {
@@ -332,8 +441,30 @@ impl NativeRuntime {
             workloads: Mutex::new(HashMap::new()),
             cgroup: resolve_cgroup_root("native", &state_dir),
             collector: crate::observe::Collector::disabled(),
+            shim: None,
             state_dir,
         }
+    }
+
+    /// Parent every workload this runtime starts through a `kamaji shim`
+    /// (R1021-F2, W386 §1), so the workload — and its exit status — outlive
+    /// this process. The binary behind `launcher` must dispatch to
+    /// [`crate::shim::run_from_stdin`].
+    ///
+    /// Scoped, not a shim to remove: the desktop camp and yubaba's cloud
+    /// reconcilers keep the direct fork, because they are other binaries
+    /// with no `shim` subcommand and no supervisor-restart hazard to survive.
+    #[cfg(unix)]
+    pub fn with_shim(mut self, launcher: crate::shim::ShimLauncher) -> Self {
+        self.shim = Some(launcher);
+        self
+    }
+
+    /// Whether this runtime's workloads outlive it (R1021-T1's shutdown hook):
+    /// true exactly when they are shim-parented, so a kamaji SIGTERM must leave
+    /// them running.
+    pub fn workloads_survive_supervisor(&self) -> bool {
+        self.shim.is_some()
     }
 
     /// Point this backend's workloads at the node's local collector
@@ -646,6 +777,8 @@ async fn spawn_child(
     truncate_logs: bool,
     cgroup: Option<&crate::cgroup::CgroupHandle>,
     collector: &crate::observe::Collector,
+    shim: Option<&ShimLauncher>,
+    spec_digest: Option<&str>,
 ) -> Result<SpawnedChild> {
     let ident = &spec.expose.mesh.identity;
     let argv = argv(spec)?;
@@ -658,21 +791,6 @@ async fn spawn_child(
         .with_context(|| format!("creating state dir {}", dir.display()))?;
     let stdout_path = dir.join("stdout.log");
     let stderr_path = dir.join("stderr.log");
-    let open = |path: &Path| -> std::io::Result<std::fs::File> {
-        if truncate_logs {
-            std::fs::File::create(path)
-        } else {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-        }
-    };
-    let stdout_file =
-        open(&stdout_path).with_context(|| format!("opening {}", stdout_path.display()))?;
-    let stderr_file =
-        open(&stderr_path).with_context(|| format!("opening {}", stderr_path.display()))?;
-
     // R870-F23: config the workload reads at startup, carried in the spec.
     // Written on EVERY spawn, not just the initial deploy, and deliberately:
     // a respawn is the process re-reading its config, so the file it reads
@@ -697,27 +815,18 @@ async fn spawn_child(
     // this is ever narrowed to an allow-list, that leg must be part of the
     // change, not a casualty of it. Pinned by
     // `tests::daemon_environment_is_inherited_by_the_child`.
-    let mut cmd = tokio::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .env("YAH_MESH_IP", mesh_ip.to_string())
-        .kill_on_drop(false);
-    if let Some(workdir) = &spec.workdir {
-        cmd.current_dir(workdir);
-    }
+    let mut env: Vec<(String, String)> = vec![("YAH_MESH_IP".into(), mesh_ip.to_string())];
     // "What port did I get?" — one contract (R844-T13). The map is built by the
     // same call that fills `WorkloadState::ports`, so what the workload reads and
     // what kamaji publishes cannot drift apart.
     for (k, v) in crate::ports::port_env(&crate::declared_port_names(&spec.expose.mesh)) {
-        cmd.env(k, v);
+        env.push((k.to_string(), v.to_string()));
     }
     // "Where is my local collector, and what am I called?" — R893-B17, the
     // other half of the deploy-time contract. A native child is a host process
     // in the host's mount namespace, so it gets the socket path verbatim.
     for (k, v) in collector.env_for(spec, crate::observe::MountNs::Host) {
-        cmd.env(k, v);
+        env.push((k.to_string(), v.to_string()));
     }
     // "How do I reach the Windows desktop?" — R918-F8. Only on a WSL host, and
     // only as an offer: a step that never calls the bridge runs exactly as it
@@ -729,7 +838,10 @@ async fn spawn_child(
     .await
     {
         Ok(Some(bridge)) => {
-            cmd.env(crate::win_interactive::ENV, bridge);
+            env.push((
+                crate::win_interactive::ENV.to_string(),
+                bridge.to_string_lossy().into_owned(),
+            ));
         }
         Ok(None) => {}
         Err(e) => tracing::warn!(
@@ -743,7 +855,7 @@ async fn spawn_child(
     for e in &spec.env {
         match &e.value {
             EnvValue::Literal { value } => {
-                cmd.env(&e.name, value);
+                env.push((e.name.clone(), value.clone()));
             }
             EnvValue::FromSecret { secret, .. } => bail!(
                 "workload {}: env {} carries an unresolved FromSecret({secret}) — yubaba \
@@ -763,69 +875,72 @@ async fn spawn_child(
     // Layered last so a graceful upgrade's PASSWAY_UPGRADE=true wins over any
     // (unexpected) spec-level value.
     for (k, v) in extra_env {
-        cmd.env(k, v);
+        env.push((k.to_string(), v.to_string()));
     }
 
-    // R885-B1 — the boundary. The child writes its OWN pid into the leaf's
-    // `cgroup.procs` in the post-fork/pre-exec window, so by the time `execvpe`
-    // hands control to the workload binary the process is already inside its
-    // memory and cpu ceiling. There is no window at all, which is why this needs
-    // no sync pipe: the only thing between fork and the write is that closure.
-    //
-    // The hook itself lives on `CgroupHandle` (R885-B10 moved it there when the
-    // JIT fork path needed the same one); see `CgroupHandle::attach_at_exec` for
-    // why it is a self-attach rather than a parent-attach.
-    #[cfg(target_os = "linux")]
-    if let Some(handle) = cgroup {
-        handle.attach_at_exec(cmd.as_std_mut()).with_context(|| {
-            format!(
-                "installing the cgroup self-attach hook for workload {}",
-                spec.name
-            )
-        })?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = cgroup;
+    // The pre-exec hooks — cgroup self-attach (R885-B1), filesystem
+    // confinement (R885-B11), capability drop (R885-B9), disclaimed exec
+    // (R940-B1) — are installed by `LaunchPlan::command`, the one builder both
+    // the direct fork and the shim use, in that order.
+    let plan = LaunchPlan {
+        argv,
+        env,
+        cwd: spec.workdir.clone(),
+        stdout: stdout_path.clone(),
+        stderr: stderr_path.clone(),
+        truncate_logs,
+        cgroup: cgroup.cloned(),
+        workload_dir: dir.clone(),
+        spec: spec.clone(),
+        confine: true,
+    };
 
-    // R885-B11 — the THIRD boundary: what the child may write. Registered after
-    // the cgroup attach (which writes `cgroup.procs`, a path no ruleset grants)
-    // and before the capability drop, which is the order kamaji-bin's
-    // `pre_exec_in_child` used. Applies only to a workload whose spec describes
-    // its writes — see `sandbox::writable_roots` for that rule — and degrades to
-    // an unconfined spawn with a warning on a kernel without landlock.
-    #[cfg(target_os = "linux")]
-    crate::sandbox::confine_fs_at_exec(spec, &dir, cmd.as_std_mut()).with_context(|| {
-        format!(
-            "installing the filesystem-confinement hook for workload {}",
-            spec.name
-        )
-    })?;
-
-    // R885-B9 — the OTHER boundary, and W344's point that the two are separate
-    // axes: a `memory.max` never took CAP_SYS_ADMIN away from anything. Native
-    // workloads are a plain fork+exec, so until this hook they ran with kamaji's
-    // entire ambient set (measured: byte-identical, 0x2c14e0). Registered AFTER
-    // the cgroup attach because `std` runs pre_exec closures in registration
-    // order and the attach needs the write access this drop removes.
-    #[cfg(target_os = "linux")]
-    crate::sandbox::drop_caps_at_exec(spec, cmd.as_std_mut()).with_context(|| {
-        format!(
-            "installing the capability-drop hook for workload {}",
-            spec.name
-        )
-    })?;
-
-    // R940-B1 — on macOS the workload is its own TCC responsible process, so a
-    // BLE/camera binary is judged by its own embedded Info.plist instead of
-    // being SIGABRTed for whatever app launched the daemon. MUST stay the last
-    // pre_exec hook: it replaces the exec and never returns.
     #[cfg(unix)]
-    crate::disclaim::disclaim_at_exec(cmd.as_std_mut())
-        .with_context(|| format!("preparing the disclaimed exec for workload {}", spec.name))?;
+    if let Some(launcher) = shim {
+        // R1021-F2: the shim parents the child, so the child — and its exit
+        // status — outlive this kamaji.
+        let spec_digest = spec_digest.map(str::to_string);
+        crate::shim::persist_spec(
+            &dir,
+            &crate::shim::PersistedSpec {
+                spec_digest: spec_digest.clone(),
+                mesh_ip,
+                spec: spec.clone(),
+            },
+        )?;
+        let request = crate::shim::ShimRequest {
+            ident: ident.0.clone(),
+            generation: cgroup.map_or_else(|| "0".to_string(), |c| c.generation().to_string()),
+            spec_digest,
+            socket: dir.join(crate::shim::SOCKET_NAME),
+            shim_cgroup: cgroup.and_then(|c| {
+                c.workload_path()
+                    .parent()
+                    .map(|root| root.join(crate::shim::SHIM_LEAF))
+            }),
+            plan,
+            jit: None,
+        };
+        let conn = crate::shim::launch(launcher, &request)
+            .await
+            .with_context(|| format!("starting the shim for workload {}", spec.name))?;
+        let pid = conn.hello.child_pid;
+        crate::orphan::record(state_dir, &ident.0, pid);
+        return Ok(SpawnedChild {
+            proc: Proc::Shim(conn),
+            pid,
+            stdout_path,
+            stderr_path,
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = (shim, spec_digest);
 
+    let mut cmd = tokio::process::Command::from(plan.command()?);
+    cmd.kill_on_drop(false);
     let child = cmd
         .spawn()
-        .with_context(|| format!("spawning {} for workload {}", argv[0], spec.name))?;
+        .with_context(|| format!("spawning {} for workload {}", plan.argv[0], spec.name))?;
     let pid = child
         .id()
         .ok_or_else(|| anyhow!("workload {}: child exited before pid read", spec.name))?;
@@ -833,30 +948,158 @@ async fn spawn_child(
     crate::orphan::record(state_dir, &ident.0, pid);
 
     Ok(SpawnedChild {
-        child,
+        proc: Proc::Direct(child),
         pid,
         stdout_path,
         stderr_path,
     })
 }
 
-/// SIGTERM, grace, SIGKILL.
-async fn stop_child(child: &mut Child, pid: u32) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
+/// Everything needed to exec one workload child, computed by kamaji (async:
+/// directories, spec files, env resolution) and executed either in-process
+/// (the direct path) or by [`crate::shim`] — one builder, so the two paths
+/// cannot drift on hooks or their order.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LaunchPlan {
+    pub argv: Vec<String>,
+    /// Overrides layered over the inherited environment, in order (a later
+    /// entry wins, as with repeated `Command::env`).
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<PathBuf>,
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+    pub truncate_logs: bool,
+    pub cgroup: Option<crate::cgroup::CgroupHandle>,
+    pub workload_dir: PathBuf,
+    /// Carried for the pre-exec hooks (`sandbox`), which read the spec.
+    pub spec: WorkloadSpec,
+    /// Install the filesystem confinement and capability drop (R885-B11,
+    /// R885-B9). `false` only for a microVM's VMM (R1021-F8): the guest is
+    /// that workload's boundary, and a ruleset derived from the guest's spec
+    /// would deny the VMM `/dev/kvm`, its TAP and its disk images. The cgroup
+    /// attach is installed either way.
+    pub confine: bool,
+}
+
+impl LaunchPlan {
+    /// Build the std `Command`, with stdio files opened and every pre-exec hook
+    /// installed in the order `native::spawn_child` has always used.
+    pub(crate) fn command(&self) -> Result<std::process::Command> {
+        self.build(None)
+    }
+
+    /// [`Self::command`] for an on-demand child (R1021-F7): `listen_fd` is
+    /// handed over as fd 3 with `FD_CLOEXEC` cleared, right after the cgroup
+    /// attach — the order `jit::spawn_jit_child` has always used. Both the
+    /// in-process JIT loop and the JIT shim build through here.
+    #[cfg(unix)]
+    pub(crate) fn command_with_listen_fd(
+        &self,
+        listen_fd: std::os::fd::RawFd,
+    ) -> Result<std::process::Command> {
+        self.build(Some(listen_fd))
+    }
+
+    fn build(&self, listen_fd: Option<i32>) -> Result<std::process::Command> {
+        let spec = &self.spec;
+        let open = |path: &Path| -> std::io::Result<std::fs::File> {
+            if self.truncate_logs {
+                std::fs::File::create(path)
+            } else {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+            }
+        };
+        let stdout =
+            open(&self.stdout).with_context(|| format!("opening {}", self.stdout.display()))?;
+        // One file for both streams (a microVM console) is one description, so
+        // a truncating open cannot leave two offsets clobbering each other.
+        let stderr = if self.stderr == self.stdout {
+            stdout.try_clone()
+        } else {
+            open(&self.stderr)
+        }
+        .with_context(|| format!("opening {}", self.stderr.display()))?;
+        let mut cmd = std::process::Command::new(&self.argv[0]);
+        cmd.args(&self.argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+
+        // R885-B1 — the boundary. The child writes its OWN pid into the leaf's
+        // `cgroup.procs` in the post-fork/pre-exec window, so by the time
+        // `execvpe` hands control to the workload binary the process is already
+        // inside its memory and cpu ceiling. See `CgroupHandle::attach_at_exec`
+        // for why it is a self-attach rather than a parent-attach.
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = &self.cgroup {
+            handle.attach_at_exec(&mut cmd).with_context(|| {
+                format!("installing the cgroup self-attach hook for workload {}", spec.name)
+            })?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = &self.workload_dir;
+
+        // R599-F6 — the held listener becomes the child's fd 3 (LISTEN_FDS
+        // socket activation). After the attach so the child is inside its
+        // ceiling before it is handed anything.
+        #[cfg(unix)]
+        if let Some(fd) = listen_fd {
+            crate::jit::inherit_listen_fd_at_exec(&mut cmd, fd);
+        }
+        #[cfg(not(unix))]
+        let _ = listen_fd;
+
+        // R885-B11 — the THIRD boundary: what the child may write. After the
+        // cgroup attach (which writes `cgroup.procs`, a path no ruleset grants)
+        // and before the capability drop. See `sandbox::writable_roots`.
+        #[cfg(target_os = "linux")]
+        if self.confine {
+            crate::sandbox::confine_fs_at_exec(spec, &self.workload_dir, &mut cmd).with_context(
+                || format!("installing the filesystem-confinement hook for workload {}", spec.name),
+            )?;
+        }
+        // R885-B9 — the OTHER boundary (W344): a `memory.max` never took
+        // CAP_SYS_ADMIN away from anything. AFTER the cgroup attach, because
+        // `std` runs pre_exec closures in registration order and the attach
+        // needs the write access this drop removes.
+        #[cfg(target_os = "linux")]
+        if self.confine {
+            crate::sandbox::drop_caps_at_exec(spec, &mut cmd).with_context(|| {
+                format!("installing the capability-drop hook for workload {}", spec.name)
+            })?;
+        }
+        // R940-B1 — on macOS the workload is its own TCC responsible process.
+        // MUST stay the last pre_exec hook: it replaces the exec and never
+        // returns.
+        #[cfg(unix)]
+        crate::disclaim::disclaim_at_exec(&mut cmd)
+            .with_context(|| format!("preparing the disclaimed exec for workload {}", spec.name))?;
+        Ok(cmd)
+    }
+}
+
+/// SIGTERM, grace, SIGKILL — through the shim when one parents the child, so
+/// an explicit stop still stops it after R1021-F2.
+async fn stop_child(proc: &mut Proc, pid: u32) {
+    if proc.try_exit().is_some() {
+        let _ = proc.wait().await;
         return;
     }
     #[cfg(unix)]
-    // SAFETY: plain kill(2) on a pid we spawned and still hold the Child for;
-    // worst case the pid already exited and kill returns ESRCH, which we ignore.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
-    let graceful = tokio::time::timeout(TERM_GRACE, child.wait()).await;
+    proc.signal(pid, libc::SIGTERM).await;
+    let graceful = tokio::time::timeout(TERM_GRACE, proc.wait()).await;
     if graceful.is_err() {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        proc.kill(pid).await;
+        let _ = proc.wait().await;
     }
 }
 
@@ -866,15 +1109,10 @@ async fn stop_child(child: &mut Child, pid: u32) {
 fn drain_reaper(mut old: SpawnedChild) {
     tokio::spawn(async move {
         #[cfg(unix)]
-        // SAFETY: SIGQUIT to a pid we spawned and still own the Child for; ESRCH
-        // (already exited) is benign and ignored.
-        unsafe {
-            libc::kill(old.pid as i32, libc::SIGQUIT);
-        }
-        let _ = tokio::time::timeout(TERM_GRACE, old.child.wait()).await;
-        if matches!(old.child.try_wait(), Ok(None)) {
-            let _ = old.child.start_kill();
-            let _ = old.child.wait().await;
+        old.proc.signal(old.pid, libc::SIGQUIT).await;
+        if tokio::time::timeout(TERM_GRACE, old.proc.wait()).await.is_err() {
+            old.proc.kill(old.pid).await;
+            let _ = old.proc.wait().await;
         }
     });
 }
@@ -1043,6 +1281,18 @@ struct NativeProcess {
     /// down and `mkdir`s a fresh node immediately before the first child, so
     /// there is no prior history to miss.
     oom_kills_settled: std::sync::atomic::AtomicU64,
+    /// When `spec.deadline` fires, on kamaji's own monotonic clock (R1019-F2).
+    /// Armed once at deploy, not per respawn: the deadline is a cap on the
+    /// workload's total runtime, so a crash-restart must not buy more time.
+    deadline_at: Option<tokio::time::Instant>,
+    /// Set by [`Self::wait`] when it killed the child for the deadline, read by
+    /// [`Self::settle`] to publish [`WorkloadStatus::DeadlineExceeded`].
+    deadline_fired: std::sync::atomic::AtomicBool,
+    /// Respawns go through the same parent the first run did (R1021-F2).
+    shim: Option<ShimLauncher>,
+    /// Echoed by every respawn's shim, so an adoption after a crash-restart
+    /// still knows which spec it is running (R1021-F3).
+    spec_digest: Option<String>,
 }
 
 #[async_trait]
@@ -1054,7 +1304,20 @@ impl Supervised for NativeProcess {
     }
 
     async fn wait(&self, inst: &mut SpawnedChild) -> Exit {
-        inst.child.wait().await
+        let Some(at) = self.deadline_at else {
+            return inst.proc.wait().await;
+        };
+        tokio::select! {
+            exit = inst.proc.wait() => exit,
+            // No network involved: the timer is local and monotonic, so a
+            // sleeping laptop or a partitioned yubaba cannot extend the cap.
+            _ = tokio::time::sleep_until(at) => {
+                self.deadline_fired
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                stop_child(&mut inst.proc, inst.pid).await;
+                inst.proc.wait().await
+            }
+        }
     }
 
     /// Respawns **append** to the capture files rather than truncating them, so
@@ -1068,12 +1331,14 @@ impl Supervised for NativeProcess {
             false,
             self.cgroup.as_ref(),
             &self.collector,
+            self.shim.as_ref(),
+            self.spec_digest.as_deref(),
         )
         .await
     }
 
     async fn stop(&self, inst: &mut SpawnedChild) {
-        stop_child(&mut inst.child, inst.pid).await
+        stop_child(&mut inst.proc, inst.pid).await
     }
 
     /// A host process's exit status is **almost** the whole story — there is no
@@ -1123,6 +1388,16 @@ impl Supervised for NativeProcess {
 
         log_exit_telemetry(&self.spec.expose.mesh.identity.0, class, &stats);
 
+        // A deadline kill wins over every other reading: it is why the child
+        // died, whatever signal or exit code that looked like (R1019-F2).
+        if self.deadline_fired.load(std::sync::atomic::Ordering::SeqCst) {
+            return Completion {
+                succeeded: false,
+                exit_code,
+                terminal: WorkloadStatus::DeadlineExceeded,
+            };
+        }
+
         Completion {
             succeeded,
             exit_code,
@@ -1147,18 +1422,29 @@ impl Supervised for NativeProcess {
     fn discard(&self, replaced: SpawnedChild) {
         drain_reaper(replaced)
     }
+
+    /// A shim parents the child, so dropping this runtime (kamaji going away)
+    /// leaves it running; only an explicit teardown stops it.
+    fn outlives_supervisor(&self, inst: &SpawnedChild) -> bool {
+        #[cfg(unix)]
+        if matches!(inst.proc, Proc::Shim(_)) {
+            return true;
+        }
+        let _ = inst;
+        false
+    }
 }
 
-#[async_trait]
-impl Kamaji for NativeRuntime {
-    fn backend(&self) -> Backend {
-        Backend::Native
-    }
-
-    async fn deploy_workload(
+impl NativeRuntime {
+    /// [`Kamaji::deploy_workload`], carrying R870-B24's digest of the envelope
+    /// the caller deployed from (kamaji-bin computes it; opaque here). It rides
+    /// into the shim's `hello` and `spec.json`, which is what lets the next
+    /// kamaji adopt this workload and skip a replay of the same spec (R1021-F3).
+    pub async fn deploy_with_digest(
         &self,
         spec: &WorkloadSpec,
         mesh: &MeshAssignment,
+        spec_digest: Option<String>,
     ) -> Result<DeployResult> {
         if spec.replicas > 1 {
             return Err(anyhow!(
@@ -1186,15 +1472,34 @@ impl Kamaji for NativeRuntime {
 
         let ident = spec.expose.mesh.identity.clone();
 
-        // Idempotent: clear any prior workload with the same identity.
+        // Idempotent: clear any prior workload with the same identity. An
+        // adopted one included: an operator Deploy of a live ident replaces it.
         self.teardown_workload(&ident).await?;
 
-        // R967-B1: a child of a PREVIOUS runtime on this state dir is not in
-        // our map, so the teardown above never saw it — but `LedgerPorts`
-        // hands its remembered port straight back to us. Replace it (the pid
-        // file is its identity), then insist every declared port is bindable:
-        // whatever still holds one is not ours to kill.
-        crate::orphan::reap(&self.state_dir, &ident.0, TERM_GRACE).await;
+        // Never spawn beside a populated leaf (R1021-F3). A process of a
+        // PREVIOUS runtime is not in our map, so the teardown above never saw
+        // it. Where there is a cgroup its leaf is its identity: empty every
+        // generation under this ident before minting ours. Where there is none
+        // (the desktop camp) the pid file is, R967-B1. Either way `LedgerPorts`
+        // hands its remembered port straight back to us, so then insist every
+        // declared port is bindable: whatever still holds one is not ours.
+        match self.cgroup.as_ref() {
+            Some(cg) => {
+                if let Ok(outcome) = cg.destroy_workload(&ident.0) {
+                    if outcome.removed > 0 || !outcome.leaked.is_empty() {
+                        tracing::warn!(
+                            workload = %ident.0, emptied = outcome.removed,
+                            leaked = ?outcome.leaked,
+                            "native backend: emptied leaves a previous runtime left under this \
+                             ident before deploying (R1021-F3)"
+                        );
+                    }
+                }
+            }
+            None => {
+                crate::orphan::reap(&self.state_dir, &ident.0, TERM_GRACE).await;
+            }
+        }
         for (name, number) in crate::declared_port_names(&spec.expose.mesh) {
             if crate::orphan::is_held_settled(mesh.mesh_ip, number).await {
                 return Err(anyhow!(
@@ -1232,6 +1537,8 @@ impl Kamaji for NativeRuntime {
             true,
             cgroup.as_ref(),
             &self.collector,
+            self.shim.as_ref(),
+            spec_digest.as_deref(),
         )
         .await?;
         let start_pid = initial.pid;
@@ -1250,6 +1557,13 @@ impl Kamaji for NativeRuntime {
                 collector: self.collector.clone(),
                 // A freshly minted leaf has no OOM history — see the field doc.
                 oom_kills_settled: std::sync::atomic::AtomicU64::new(0),
+                // Armed here, at workload start (R1019-F2).
+                deadline_at: spec
+                    .deadline
+                    .map(|d| tokio::time::Instant::now() + Duration::from_millis(d.0)),
+                deadline_fired: std::sync::atomic::AtomicBool::new(false),
+                shim: self.shim.clone(),
+                spec_digest: spec_digest.clone(),
             },
             spec.restart_policy.clone(),
             initial,
@@ -1268,6 +1582,7 @@ impl Kamaji for NativeRuntime {
                 stderr_path,
                 cgroup,
                 pid,
+                spec_digest,
                 status: status_rx,
                 ctrl: ctrl_tx,
                 task,
@@ -1281,6 +1596,272 @@ impl Kamaji for NativeRuntime {
             hydrate: None,
             ports: crate::declared_port_names(&spec.expose.mesh),
         })
+    }
+
+}
+
+/// What [`NativeRuntime::adopt_survivors`] found (R1021-F3).
+#[derive(Debug, Default)]
+pub struct Adoption {
+    /// Back in the map, `Running`, at the pid they had: `(ident, child pid)`.
+    pub adopted: Vec<(String, u32)>,
+    /// The leaves and shims [`crate::boot::reap_unadopted`] must leave alone.
+    #[cfg(unix)]
+    pub keep: crate::boot::Keep,
+    /// Shims speaking another `proto`: not driven, left to the leaf reap, and
+    /// restarted from `spec.json` by [`NativeRuntime::restart_incompatible`].
+    pub incompatible: Vec<String>,
+}
+
+#[cfg(unix)]
+impl NativeRuntime {
+    /// The delegated cgroup this runtime confines workloads under, if any.
+    pub fn cgroup_root(&self) -> Option<&crate::cgroup::CgroupV2> {
+        self.cgroup.as_ref()
+    }
+
+    /// The digest this runtime's live `ident` was deployed (or adopted) with.
+    /// `None` when it is not in the map or carries no digest.
+    pub async fn deployed_digest(&self, ident: &str) -> Option<String> {
+        self.workloads.lock().await.get(ident)?.spec_digest.clone()
+    }
+
+    /// The boot pass's adoption half (R1021-F3, W386 §2). Call once, on a fresh
+    /// runtime, BEFORE any replay and before [`crate::boot::reap_unadopted`].
+    ///
+    /// For each `<state_dir>/<ident>/shim.sock`: a shim that answers with this
+    /// kamaji's `proto`, names this ident, and reports a generation leaf that
+    /// exists (and, where `cgroup.procs` is readable, holds its live child) is
+    /// adopted — a `WorkloadHandle` goes back in the map with status `Running`,
+    /// spec from `spec.json`, and a supervisor that waits on the shim's exit
+    /// event, so the [`RestartPolicy`] keeps working. Not held pending owner
+    /// confirmation: adoption continues what never stopped (R977-B14 is about
+    /// starting; yubaba's leader loop owns the stop, R858-T3).
+    ///
+    /// Anything else is NOT adopted and is not touched here: its leaf and shim
+    /// are left for the reap, which kills by leaf.
+    pub async fn adopt_survivors(&self) -> Adoption {
+        let mut adoption = Adoption::default();
+        if self.shim.is_none() {
+            return adoption;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.state_dir) else {
+            return adoption;
+        };
+        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let socket = dir.join(crate::shim::SOCKET_NAME);
+            let Some(ident) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if !socket.exists() {
+                continue;
+            }
+            let conn = match tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::shim::ShimConn::connect(&socket),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) if e.downcast_ref::<crate::shim::IncompatibleProto>().is_some() => {
+                    tracing::warn!(
+                        workload = %ident, error = %e,
+                        "boot pass: shim speaks another proto; it is stopped by its leaf and \
+                         restarted under a current shim (R1021-F3)"
+                    );
+                    adoption.incompatible.push(ident);
+                    continue;
+                }
+                other => {
+                    tracing::info!(
+                        workload = %ident,
+                        error = %match other { Ok(Err(e)) => format!("{e:#}"), _ => "timed out".into() },
+                        "boot pass: no shim answers; whatever its leaf holds is killed (R1021-F3)"
+                    );
+                    continue;
+                }
+            };
+            // R1021-F7: the bundle tier's JIT runtime shares this state dir;
+            // its own pass adopts JIT shims.
+            if conn.hello.mode != crate::shim::ShimMode::Process {
+                continue;
+            }
+            match self.adopt_one(&ident, &dir, conn).await {
+                Ok((pid, leaf, shim_pid)) => {
+                    tracing::info!(
+                        workload = %ident, pid,
+                        "boot pass: adopted a running shim-parented workload (R1021-F3)"
+                    );
+                    adoption.adopted.push((ident, pid));
+                    if let Some(leaf) = leaf {
+                        adoption.keep.leaves.insert(leaf);
+                    }
+                    adoption.keep.shim_pids.insert(shim_pid);
+                    if pid != 0 {
+                        adoption.keep.child_pids.insert(pid);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    workload = %ident, error = %format!("{e:#}"),
+                    "boot pass: shim answered but is not adoptable; its leaf is killed (R1021-F3)"
+                ),
+            }
+        }
+        adoption
+    }
+
+    /// Adopt one answering shim; on `Err` the connection is dropped and
+    /// nothing was inserted.
+    async fn adopt_one(
+        &self,
+        ident: &str,
+        dir: &Path,
+        conn: crate::shim::ShimConn,
+    ) -> Result<(u32, Option<PathBuf>, u32)> {
+        let hello = conn.hello.clone();
+        if hello.ident != ident {
+            bail!("shim at {} says it is {:?}", dir.display(), hello.ident);
+        }
+        let persisted = crate::shim::read_spec(dir)?;
+        if persisted.spec.expose.mesh.identity.0 != ident {
+            bail!("spec.json names {:?}", persisted.spec.expose.mesh.identity.0);
+        }
+        if let (Some(theirs), Some(ours)) = (&hello.boot_id, crate::shim::boot_id()) {
+            if *theirs != ours {
+                bail!("shim reports boot {theirs}, this is boot {ours}");
+            }
+        }
+        let alive = hello.last_exit.is_none();
+        if alive && hello.child_start.is_some()
+            && crate::orphan::start_time(hello.child_pid) != hello.child_start
+        {
+            bail!("pid {} is no longer the child the shim started", hello.child_pid);
+        }
+        // The generation leaf it reports must be the one on disk — and hold
+        // its child, where the kernel lets us read that.
+        let cgroup = match &self.cgroup {
+            Some(cg) => {
+                let node = cg.root().join(ident);
+                let leaf = node.join(&hello.generation);
+                if hello.generation.is_empty() || !leaf.is_dir() {
+                    bail!("generation leaf {} is not there", leaf.display());
+                }
+                if alive
+                    && leaf.join("cgroup.procs").exists()
+                    && !crate::cgroup::live_members(&leaf).contains(&hello.child_pid)
+                {
+                    bail!("child {} is not in its generation leaf {}", hello.child_pid, leaf.display());
+                }
+                Some(crate::cgroup::CgroupHandle::existing(node, leaf))
+            }
+            None if hello.generation == "0" => None,
+            None => bail!("shim reports generation {} on a host with no cgroup", hello.generation),
+        };
+
+        let spec = persisted.spec;
+        let pid = if alive { hello.child_pid } else { 0 };
+        let oom_baseline = cgroup
+            .as_ref()
+            .and_then(|c| c.read_stats().oom_kill)
+            .unwrap_or(0);
+        let initial = SpawnedChild {
+            pid: hello.child_pid,
+            stdout_path: dir.join("stdout.log"),
+            stderr_path: dir.join("stderr.log"),
+            proc: Proc::Shim(conn),
+        };
+        let stdout_path = initial.stdout_path.clone();
+        let stderr_path = initial.stderr_path.clone();
+        let pid_cell = Arc::new(AtomicU32::new(pid));
+        let (status_tx, status_rx) = watch::channel(WorkloadStatus::Running);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        let task = tokio::spawn(supervise(
+            NativeProcess {
+                state_dir: self.state_dir.clone(),
+                spec: spec.clone(),
+                mesh_ip: persisted.mesh_ip,
+                cgroup: cgroup.clone(),
+                collector: self.collector.clone(),
+                // The node's counters predate this kamaji: diff from now.
+                oom_kills_settled: std::sync::atomic::AtomicU64::new(oom_baseline),
+                // Re-armed from adoption: the original start is not recorded,
+                // so an adopted deadline workload gets at most one extra term.
+                deadline_at: spec
+                    .deadline
+                    .map(|d| tokio::time::Instant::now() + Duration::from_millis(d.0)),
+                deadline_fired: std::sync::atomic::AtomicBool::new(false),
+                shim: self.shim.clone(),
+                spec_digest: persisted.spec_digest.clone(),
+            },
+            spec.restart_policy.clone(),
+            initial,
+            Arc::clone(&pid_cell),
+            status_tx,
+            ctrl_rx,
+        ));
+        let leaf = cgroup.as_ref().map(|c| c.path().to_path_buf());
+        self.workloads.lock().await.insert(
+            ident.to_string(),
+            WorkloadHandle {
+                mesh_ip: persisted.mesh_ip,
+                name: spec.name.clone(),
+                ports: crate::declared_port_names(&spec.expose.mesh),
+                stdout_path,
+                stderr_path,
+                cgroup,
+                pid: pid_cell,
+                spec_digest: persisted.spec_digest,
+                status: status_rx,
+                ctrl: ctrl_tx,
+                task,
+            },
+        );
+        Ok((pid, leaf, hello.shim_pid))
+    }
+
+    /// Restart, under a current shim, each workload whose shim spoke another
+    /// `proto` — from its `spec.json`, after [`crate::boot::reap_unadopted`]
+    /// emptied its leaf. One restart each, logged. Returns how many started.
+    pub async fn restart_incompatible(&self, idents: &[String]) -> usize {
+        let mut started = 0;
+        for ident in idents {
+            let persisted = match crate::shim::read_spec(&self.state_dir.join(ident)) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(workload = %ident, error = %format!("{e:#}"),
+                        "boot pass: cannot restart an incompatible shim's workload");
+                    continue;
+                }
+            };
+            let mesh = MeshAssignment::inlined(persisted.mesh_ip);
+            match self.deploy_with_digest(&persisted.spec, &mesh, persisted.spec_digest).await {
+                Ok(r) => {
+                    tracing::warn!(workload = %ident, pid = r.task_pid,
+                        "boot pass: restarted under a current shim (R1021-F3)");
+                    started += 1;
+                }
+                Err(e) => tracing::warn!(workload = %ident, error = %format!("{e:#}"),
+                    "boot pass: restart under a current shim failed"),
+            }
+        }
+        started
+    }
+}
+
+#[async_trait]
+impl Kamaji for NativeRuntime {
+    fn backend(&self) -> Backend {
+        Backend::Native
+    }
+
+    async fn deploy_workload(
+        &self,
+        spec: &WorkloadSpec,
+        mesh: &MeshAssignment,
+    ) -> Result<DeployResult> {
+        self.deploy_with_digest(spec, mesh, None).await
     }
 
     async fn list_workloads(&self) -> Result<Vec<WorkloadState>> {
@@ -1423,6 +2004,10 @@ impl Kamaji for NativeRuntime {
             false,
             cgroup.as_ref(),
             &self.collector,
+            self.shim.as_ref(),
+            // A graceful upgrade carries no envelope; its digest is unknown
+            // until the next Deploy names one.
+            None,
         )
         .await
         .context("spawning graceful-upgrade replacement")?;
@@ -1433,8 +2018,8 @@ impl Kamaji for NativeRuntime {
         //    the old process — the live listener keeps serving the previous cert
         //    rather than dropping to nothing.
         tokio::time::sleep(UPGRADE_SETTLE).await;
-        if let Ok(Some(status)) = replacement.child.try_wait() {
-            stop_child(&mut replacement.child, new_pid).await;
+        if let Some(Ok(status)) = replacement.proc.try_exit() {
+            stop_child(&mut replacement.proc, new_pid).await;
             // R967-B1: spawn_child recorded the replacement; the old process is
             // the one still serving, so the pid file goes back to naming it.
             if old_pid != 0 {
@@ -1592,6 +2177,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            lease_id: None,
+            deadline: None,
             db: Vec::new(),
             capabilities: Vec::new(),
             annotations: Default::default(),
@@ -1630,6 +2217,10 @@ mod tests {
             cgroup: Some(handle),
             collector: crate::observe::Collector::disabled(),
             oom_kills_settled: std::sync::atomic::AtomicU64::new(0),
+            deadline_at: None,
+            deadline_fired: std::sync::atomic::AtomicBool::new(false),
+            shim: None,
+            spec_digest: None,
         };
         (tmp, proc)
     }
@@ -2188,6 +2779,205 @@ mod tests {
         }
     }
 
+    /// Read one JSON line from a blocking shim connection.
+    #[cfg(unix)]
+    fn read_event(r: &mut impl std::io::BufRead) -> crate::shim::ShimEvent {
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad shim line {line:?}: {e}"))
+    }
+
+    /// R1021-F2's verify: a shim-parented workload outlives the runtime that
+    /// started it, a FRESH client (not the one that deployed it) gets a hello
+    /// naming the same child, and the child's own exit code reaches that client.
+    /// The whole runtime — supervisor task, connection, tokio — is dropped
+    /// first, and nothing is killed: that is a kamaji process going away.
+    #[cfg(unix)]
+    #[test]
+    fn a_shimmed_workload_outlives_its_runtime_and_reports_exit_42_to_a_fresh_client() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let go = tmp.path().join("go");
+        let spec = native_spec(
+            "shimmed",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("while [ ! -e {} ]; do sleep 0.05; done; exit 42", go.display()),
+            ],
+        );
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let child_pid = rt.block_on(async {
+            let runtime =
+                NativeRuntime::new(&state).with_shim(crate::shim::test_launcher());
+            assert!(runtime.workloads_survive_supervisor());
+            let deployed = runtime.deploy_workload(&spec, &mesh).await.unwrap();
+            drop(runtime);
+            deployed.task_pid
+        });
+        drop(rt);
+
+        // SAFETY: signal 0 probes existence only.
+        assert_eq!(unsafe { libc::kill(child_pid as i32, 0) }, 0, "child died with kamaji");
+        let dir = state.join("shimmed");
+        assert!(dir.join(crate::shim::SPEC_NAME).exists(), "spec not persisted");
+
+        let sock = dir.join(crate::shim::SOCKET_NAME);
+        let stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let crate::shim::ShimEvent::Hello(hello) = read_event(&mut reader) else {
+            panic!("first line was not hello");
+        };
+        assert_eq!(hello.proto, crate::shim::PROTO);
+        assert_eq!(hello.ident, "shimmed");
+        assert_eq!(hello.child_pid, child_pid);
+        assert_eq!(hello.last_exit, None);
+        assert_ne!(hello.shim_pid, std::process::id());
+        assert_eq!(hello.spec_digest, None, "deploy_workload carries no envelope digest");
+
+        std::fs::write(&go, b"").unwrap();
+        let crate::shim::ShimEvent::Exit(exit) = read_event(&mut reader) else {
+            panic!("expected an exit event");
+        };
+        assert_eq!((exit.code, exit.signal), (Some(42), None), "exit event: {exit:?}");
+
+        writer.write_all(b"{\"op\":\"ack_exit\"}\n").unwrap();
+        let mut rest = String::new();
+        assert_eq!(reader.read_line(&mut rest).unwrap_or(0), 0, "shim kept talking: {rest}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sock.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!sock.exists(), "an acked shim must remove its socket and exit");
+    }
+
+    /// R1021-F3 verify (a), REAL processes: a shimmed workload keeps its pid
+    /// across a NativeRuntime rebuild (old runtime and its whole tokio runtime
+    /// dropped; a fresh one adopts), reports `Running` and the digest it was
+    /// deployed with, is spared by the leaf reap, and its RestartPolicy still
+    /// fires after adoption — the adopted supervisor reads the exit from the
+    /// shim and respawns. The cgroup root is a tempdir (no self-attach off
+    /// Linux), so the leaf-membership check is the "procs unreadable" branch.
+    #[cfg(unix)]
+    #[test]
+    fn an_adopted_workload_keeps_its_pid_across_a_runtime_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let go = tmp.path().join("go");
+        let mut spec = native_spec(
+            "adoptee",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "while [ ! -e {go} ]; do sleep 0.05; done; rm -f {go}; exit 3",
+                    go = go.display()
+                ),
+            ],
+        );
+        spec.restart_policy = RestartPolicy::Always;
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let runtime = || {
+            NativeRuntime::with_cgroup_root(&state, &cgroup_root)
+                .with_shim(crate::shim::test_launcher())
+        };
+
+        let first = tokio::runtime::Runtime::new().unwrap();
+        let pid = first.block_on(async {
+            let rt = runtime();
+            let deployed = rt
+                .deploy_with_digest(&spec, &mesh, Some("d1gest".into()))
+                .await
+                .unwrap();
+            drop(rt);
+            deployed.task_pid
+        });
+        drop(first);
+
+        let second = tokio::runtime::Runtime::new().unwrap();
+        second.block_on(async {
+            let rt = runtime();
+            let adoption = rt.adopt_survivors().await;
+            assert_eq!(adoption.adopted, vec![("adoptee".to_string(), pid)]);
+            assert!(adoption.incompatible.is_empty());
+            assert_eq!(rt.deployed_digest("adoptee").await.as_deref(), Some("d1gest"));
+            let listed = rt.list_workloads().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].status, WorkloadStatus::Running);
+            assert_eq!(listed[0].container_id, format!("native-{pid}"), "pid changed");
+
+            let reaped = crate::boot::reap_unadopted(
+                rt.cgroup_root().unwrap(),
+                &adoption.keep,
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(reaped.leaves.is_empty() && reaped.shims.is_empty(), "{reaped:?}");
+            // SAFETY: signal 0 probes existence only.
+            assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0, "adopted child died");
+
+            // The adopted supervisor still owns the RestartPolicy.
+            std::fs::write(&go, b"").unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let respawned = loop {
+                let l = rt.list_workloads().await.unwrap();
+                if l[0].status == WorkloadStatus::Running
+                    && l[0].container_id != format!("native-{pid}")
+                    && l[0].container_id != "native-0"
+                {
+                    break l[0].container_id.clone();
+                }
+                assert!(tokio::time::Instant::now() < deadline, "no respawn after adoption: {l:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert_ne!(respawned, format!("native-{pid}"));
+            rt.teardown_workload(&MeshIdent("adoptee".into())).await.unwrap();
+        });
+    }
+
+    /// Explicit teardown still stops a shim-parented child — through the shim's
+    /// `signal` verb — and the shim, released by the supervisor's ack, exits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_stops_a_shimmed_child_and_ends_its_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime =
+            NativeRuntime::new(tmp.path().join("state")).with_shim(crate::shim::test_launcher());
+        let spec = native_spec(
+            "shim-teardown",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+        );
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let deployed = runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        let sock = tmp
+            .path()
+            .join("state/shim-teardown")
+            .join(crate::shim::SOCKET_NAME);
+        assert!(sock.exists());
+
+        runtime
+            .teardown_workload(&spec.expose.mesh.identity)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (sock.exists() || unsafe { libc::kill(deployed.task_pid as i32, 0) } == 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // SAFETY: signal 0 probes existence only.
+        assert_ne!(unsafe { libc::kill(deployed.task_pid as i32, 0) }, 0, "child survived teardown");
+        assert!(!sock.exists(), "shim outlived the teardown");
+    }
+
     #[tokio::test]
     async fn deploy_status_logs_teardown_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2234,6 +3024,74 @@ mod tests {
         runtime.teardown_workload(&ident).await.unwrap();
         assert!(runtime.get_workload(&ident).await.unwrap().is_none());
         // Idempotent.
+        runtime.teardown_workload(&ident).await.unwrap();
+    }
+
+    /// R1019-F2: a 1 s deadline kills the child on kamaji's own clock and the
+    /// terminal status is the distinct deadline reason, not a plain failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deadline_kills_the_workload_and_reports_the_deadline_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let mut spec = native_spec("leased", vec!["/bin/sleep".into(), "30".into()]);
+        spec.deadline = Some(Millis(1000));
+        spec.lease_id = Some("lease-1".into());
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        let ident = spec.expose.mesh.identity.clone();
+
+        assert_eq!(
+            runtime.get_workload(&ident).await.unwrap().unwrap().status,
+            WorkloadStatus::Running
+        );
+        let started = std::time::Instant::now();
+        let mut terminal = None;
+        while started.elapsed() < Duration::from_secs(10) {
+            let st = runtime.get_workload(&ident).await.unwrap().unwrap().status;
+            if st.is_terminal() {
+                terminal = Some(st);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            terminal,
+            Some(WorkloadStatus::DeadlineExceeded)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        runtime.teardown_workload(&ident).await.unwrap();
+    }
+
+    /// R1019-F2: no deadline, no cap. A short job without one runs to
+    /// completion and is a plain `Stopped`, not a deadline kill.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_deadline_runs_to_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = NativeRuntime::new(tmp.path());
+        let spec = native_spec("unleased", vec!["/bin/sleep".into(), "2".into()]);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        runtime.deploy_workload(&spec, &mesh).await.unwrap();
+        let ident = spec.expose.mesh.identity.clone();
+
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(
+            runtime.get_workload(&ident).await.unwrap().unwrap().status,
+            WorkloadStatus::Running,
+            "past the 1 s mark of the sibling test, still running"
+        );
+        let started = std::time::Instant::now();
+        let mut terminal = None;
+        while started.elapsed() < Duration::from_secs(10) {
+            let st = runtime.get_workload(&ident).await.unwrap().unwrap().status;
+            if st.is_terminal() {
+                terminal = Some(st);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(terminal, Some(WorkloadStatus::Stopped));
         runtime.teardown_workload(&ident).await.unwrap();
     }
 
@@ -2954,7 +3812,7 @@ mod tests {
                  s.bind(('0.0.0.0',0))\ns.listen()\n\
                  print(s.getsockname()[1],flush=True)\ntime.sleep(300)",
             ])
-            .stdout(Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .kill_on_drop(false)
             .spawn()
             .unwrap();

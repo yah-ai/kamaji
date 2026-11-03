@@ -300,11 +300,13 @@ use crate::probe::{run_probe, ProbeTarget};
 
 // The `Kamaji` trait brings deploy/list/teardown into scope for the
 // kamaji-crate backends: the NativeRuntime behind the bundle backend (R599-F10)
-// and the DockerRuntime behind the docker backend (R626-F1).
+// and the DockerRuntime behind the docker backend (R626-F1), and the
+// MicroVmRuntime's list/teardown/health (a microvm-only build lacked it).
 #[cfg(any(
     feature = "bundle-serving",
     feature = "docker-integration",
-    feature = "native-exec"
+    feature = "native-exec",
+    feature = "microvm"
 ))]
 use kamaji::Kamaji as _;
 #[cfg(feature = "bundle-serving")]
@@ -403,6 +405,30 @@ pub struct Registry {
     /// `specs`, so `restart.rs` (which restarts only specs it holds) and
     /// `tail::resume` (which arms only live rows) leave it alone.
     held: HashMap<WorkloadId, workload_spec::Workload>,
+    /// Digests of workloads this kamaji ADOPTED at boot rather than deployed
+    /// (R1021-F3): no envelope passed through here, but the shim carried the
+    /// R870-B24 digest it was deployed with, so `List` still reports it and
+    /// yubaba does not re-send (and so replace) a workload that never stopped.
+    /// A later deploy or teardown of the id supersedes it.
+    adopted: HashMap<WorkloadId, kamaji_proto::SpecDigest>,
+}
+
+/// R870-B24's digest as kamaji (which cannot see `kamaji_proto`) carries it:
+/// lowercase hex, opaque on that side (R1021-F3).
+pub fn digest_hex(digest: &kamaji_proto::SpecDigest) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The inverse of [`digest_hex`]; anything else is "no digest".
+pub fn digest_from_hex(hex: &str) -> Option<kamaji_proto::SpecDigest> {
+    let mut out = [0u8; 32];
+    if hex.len() != 64 || !hex.is_ascii() {
+        return None;
+    }
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// The annotation yubaba's workload intent stamps on every copy it places
@@ -773,6 +799,12 @@ enum BundleRunError {
     Superseded,
     /// The run failed; the reason is what `DeployStatus` reports.
     Failed(String),
+    /// The run hit an I/O failure fetching the bundle or its runtime — the
+    /// observed case is a blob GET that never got a response. The retry is
+    /// expected to land, so `DeployStatus` keeps reporting `Pending` (with
+    /// this reason) instead of a `Failed` that a polling apply would treat as
+    /// final (R983-B2).
+    Transient(String),
 }
 
 #[cfg(feature = "bundle-serving")]
@@ -803,6 +835,11 @@ pub struct BundleDeployRecord {
     pub revalidate: Option<workload_spec::MesofactRevalidateReceiver>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<kamaji_proto::MeshAssignment>,
+    /// R870-B24's digest of the admitted envelope, hex ([`digest_hex`]). Rides
+    /// into the serve process's shim so the next kamaji can adopt it and skip
+    /// this record's replay (R1021-F3). Absent on records written before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 /// @yah:ticket(R876-B9, "kamaji writes bundle deploy records world-readable (0644) with live secrets inside")
@@ -829,6 +866,23 @@ pub struct BundleDeployRecord {
 /// @yah:gotcha("THE R2 ROTATION DID NOT CLOSE THIS DEFECT - MEASURED FROM THE NOISETABLE CAMP (R131-T19) ON 2026-09-11. The MESOFACT_S3_* pair this ticket names has now been rotated and the record re-applied (`yah cloud apply --service yah-marketing --env cloud`): /var/lib/yah/kamaji/bundles/state/deploys/yah-marketing.json on us-east-001 (mtime 2026-09-11T06:49:28, size 11815) now carries ONLY the new pair - MESOFACT_S3_ACCESS_KEY_ID at /revalidate/env/MESOFACT_S3_ACCESS_KEY_ID hashes <fingerprint> (was <fingerprint>) and MESOFACT_S3_SECRET_ACCESS_KEY at /revalidate/env/MESOFACT_S3_SECRET_ACCESS_KEY hashes <fingerprint>, both matching the vault slots; no stale copy remains anywhere in the record. BUT THE SAME ENV BLOCK STILL HOLDS A THIRD LIVE SECRET THAT WAS NOT ROTATED: CLOUDFLARE_API_TOKEN at /revalidate/env/CLOUDFLARE_API_TOKEN, sha256-16 <fingerprint>, 53 chars, inline in cleartext. Full inventory of that file today, by name and hash only, no value read into any context (extraction and hashing were done on the remote host): CLOUDFLARE_API_TOKEN=<fingerprint>, MESOFACT_S3_ACCESS_KEY_ID=<fingerprint>, MESOFACT_S3_SECRET_ACCESS_KEY=<fingerprint> - three of three keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL, all still materialized inline. PERMISSION BITS MEASURED TODAY: 600 root:root, i.e. this ticket's own chmod remediation is HOLDING and the file is no longer world-readable - the 0644 half of the title is fixed, the secrets-inline half is not. So the underlying defect - live secrets written inline into a deploy record on disk - is UNCHANGED; only two of the three secrets in it were rotated, and rotation does not remove them from the file. DO NOT CLOSE THIS TICKET ON THE STRENGTH OF THAT ROTATION. Rotating each exposed secret one at a time is not the fix; the fix is that these values should not be materialized inline into an on-disk record at all (indirect by vault-slot reference resolved at process start), or at minimum the record must never be world-readable - and the 0600 currently holding is a runtime property of one node, re-established by `record_deploy`, not a guarantee that a future writer or a manual copy keeps it. Reported by the noisetable camp, which consumes the same control plane: its own deploy record noisetable.json sits in the SAME directory and was measured in the same pass at 600 root:root, size 706, with ZERO keys matching TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL - so noisetable is currently unexposed by luck of payload, not by design, and would carry the same inline cleartext the moment its service needs a credential.")
 #[cfg(feature = "bundle-serving")]
 impl BundleBackend {
+    /// Parent this backend's keep-alive native processes through `kamaji
+    /// shim` (R1021-F2), so a mesofact-static KeepAlive bundle (yah-marketing)
+    /// survives a kamaji restart. Call before the backend is shared: the
+    /// native and JIT runtimes are rebuilt in place. R1021-F7: the on-demand
+    /// tier's listener and poll-fork-rearm loop move into a JIT-mode shim too,
+    /// so an on-demand bundle keeps accepting across the restart.
+    #[cfg(unix)]
+    pub fn with_shim(mut self, launcher: kamaji::shim::ShimLauncher) -> Self {
+        let native = Arc::try_unwrap(self.native)
+            .unwrap_or_else(|_| panic!("BundleBackend::with_shim called after the backend was shared"));
+        self.native = Arc::new(native.with_shim(launcher.clone()));
+        let jit = Arc::try_unwrap(self.jit)
+            .unwrap_or_else(|_| panic!("BundleBackend::with_shim called after the backend was shared"));
+        self.jit = Arc::new(jit.with_shim(launcher));
+        self
+    }
+
     /// Build a bundle backend over `store`, caching materialized trees under
     /// `cache_dir` and keeping the native supervisor's per-workload log
     /// captures under `state_dir`.
@@ -1373,7 +1427,13 @@ impl Registry {
     /// the previous one visible and read as "unchanged".
     pub fn set_deployed_spec(&mut self, id: WorkloadId, workload: workload_spec::Workload) {
         let digest = kamaji_proto::spec_digest(&workload);
+        self.adopted.remove(&id);
         self.specs.insert(id, DeployedSpec { workload, digest });
+    }
+
+    /// Record the digest an adopted workload was deployed with (R1021-F3).
+    pub fn set_adopted_digest(&mut self, id: WorkloadId, digest: kamaji_proto::SpecDigest) {
+        self.adopted.insert(id, digest);
     }
 
     /// The `Workload` `id` was last deployed with, if this Kamaji admitted it
@@ -1388,6 +1448,7 @@ impl Registry {
     /// nothing is actually bound, and so a `Describe` cannot describe a
     /// workload that is gone.
     pub fn remove_deployed_spec(&mut self, id: &WorkloadId) -> Option<DeployedSpec> {
+        self.adopted.remove(id);
         self.specs.remove(id)
     }
 
@@ -1434,7 +1495,11 @@ impl Registry {
     pub fn stamp_spec_digests(&self, entries: &mut [WorkloadEntry]) {
         for entry in entries.iter_mut() {
             if entry.spec_digest.is_none() {
-                entry.spec_digest = self.specs.get(&entry.id).and_then(|s| s.digest);
+                entry.spec_digest = self
+                    .specs
+                    .get(&entry.id)
+                    .and_then(|s| s.digest)
+                    .or_else(|| self.adopted.get(&entry.id).copied());
             }
         }
     }
@@ -1446,6 +1511,22 @@ impl Registry {
 /// (materialized, fork issued) → `Running`, or lands on `Failed`. `detail` is
 /// the failure reason — the message that a synchronous deploy used to return in
 /// its `Error` reply, and without which an asynchronous failure is undebuggable.
+/// It is also set on a `Pending` whose run is retrying a transient failure
+/// ([`Self::retrying`], R983-B2): still in flight, but with a reason to show.
+///
+/// @yah:ticket(R983-B2, "kamaji reports a bundle deploy it is still retrying as terminal Failed, so the apply aborts on a deploy that later converges")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:at(2026-10-27T23:10:03Z)
+/// @yah:parent(R983)
+/// @yah:severity(medium)
+/// @yah:verify("Inject a fetch failure on attempt 1 that succeeds on attempt 2. The workload must never report Failed in between, and the apply must report success.")
+/// @yah:gotcha("Observed 2026-10-27 on us-east-001, noisetable run 1be085a8. At 21:25:15Z one GET to cdn.noisetable.com/blobs/b626839a… failed with 'error sending request'. kamaji then called DeployProgress::failed('… retrying in 5s …') and the apply stopped. kamaji's backoff retry converged at 21:35:16Z ('bundle deploy converged on its recorded digest after retrying (R983-B1)'), and 1af70926 is serving. The apply reported failure for a deploy that actually landed. CDN reachability from the node was fine: DNS and IPv4 HTTPS both work. The node has no global IPv6 route, so a v6 connect fails instantly. That is a weak lead for the one transient failure, nothing more.")
+/// @yah:handoff("FIX: kamaji's server.rs now distinguishes transient failures from permanent ones. BundleRunError has a new Transient(String) variant. materialize_and_resolve_serve returns BundleRunError and maps BundleError::Io from the bundle materialize or the runtime-asset fetch to Transient; every other reason stays Failed. The spawn_bundle_run retry loop reports a Transient failure as DeployProgress::retrying(detail), which is new and means state Pending with the detail attached; Failed failures still use DeployProgress::failed. Both keep retrying exactly as R983-B1 does. No wire or protocol change: DeployStatusResult already carried detail. CLI (app/yah/cli/src/cloud.rs wait_for_bundle_deploy): while the deploy is non-terminal, prints '<machine> is retrying: <detail>' whenever the detail changes, and appends the last detail to the 600s budget-timeout error. Docs updated on WorkloadDeployStatus.detail (cloud-client) and on KamajiSibling::deploy_status. The test a_failed_bundle_run_retries_until_the_node_serves_the_recorded_digest now asserts Pending plus the retry detail, never Failed (via a new helper, await_retry_reported). The eight permanent-failure tests (bad runtime, undeclared port, missing feed sidecar, etc.) still assert Failed, unchanged.")
+/// @yah:verify("cargo test -p kamaji-bin --features bundle-serving --lib (oss/kamaji): 309 passed, 0 failed, 2026-10-27")
+/// @yah:verify("cargo check -p yah -p cloud-client: EXIT=0")
+/// @yah:verify("Live: needs a kamaji roll to the fleet AND a yah CLI rebuild before noisetable's apply benefits. The kamaji side is the one that matters, because an old CLI already treats Pending as non-terminal and keeps waiting.")
+/// @yah:assumes("The 600s apply budget covers a typical retry. In the observed incident the retry took about 10 minutes to converge, which sits right at that budget. If CDN fetches are routinely that slow, the budget needs its own ticket.")
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployProgress {
     pub state: WorkloadState,
@@ -1465,6 +1546,15 @@ impl DeployProgress {
     pub fn failed(detail: impl Into<String>) -> Self {
         Self {
             state: WorkloadState::Failed,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// Still `Pending`: the last attempt failed transiently and a retry is
+    /// scheduled. Not terminal, so a poller keeps waiting (R983-B2).
+    pub fn retrying(detail: impl Into<String>) -> Self {
+        Self {
+            state: WorkloadState::Pending,
             detail: Some(detail.into()),
         }
     }
@@ -1521,6 +1611,10 @@ where
             }
         }
     }
+
+    // R1021-T1: the workloads that die with us get a TERM of their own before
+    // the process exits, not the unit's SIGKILL.
+    ctx.stop_workloads_for_shutdown(SHUTDOWN_STOP_CAP).await;
 
     let _ = tokio::fs::remove_file(socket).await;
     Ok(())
@@ -1889,6 +1983,8 @@ pub async fn handle_message(msg: YubabaToKamaji, ctx: &Arc<ServerCtx>) -> Kamaji
                     // R977-B15: this build serves `ArmTail` and holds floater
                     // tails on restart until yubaba sends it.
                     arm_tail: true,
+                    // R1019-F2: the native backend arms `WorkloadSpec::deadline`.
+                    deadline_enforced: true,
                 },
             }
         }
@@ -2268,7 +2364,10 @@ async fn serve_logs<W: tokio::io::AsyncWrite + Unpin>(
                     None => true,
                     Some(e) => matches!(
                         e.state,
-                        WorkloadState::Exited | WorkloadState::Failed | WorkloadState::OomKilled
+                        WorkloadState::Exited
+                            | WorkloadState::Failed
+                            | WorkloadState::OomKilled
+                            | WorkloadState::DeadlineExceeded
                     ),
                 },
                 Err(_) => false,
@@ -2497,9 +2596,13 @@ async fn dispatch_deploy(
     spec: workload_spec::Workload,
     mesh: Option<&kamaji_proto::MeshAssignment>,
 ) -> KamajiToYubaba {
+    // R1021-F3: the one digest (R870-B24), handed to the backends that
+    // persist it beside a surviving process.
+    let spec_digest = kamaji_proto::spec_digest(&spec).map(|d| digest_hex(&d));
+    let spec_digest = spec_digest.as_deref();
     match spec {
         workload_spec::Workload::Container(manifest) => match manifest.into_spec() {
-            Ok(spec) => deploy_container(ctx, request_id, &id, &spec, mesh).await,
+            Ok(spec) => deploy_container(ctx, request_id, &id, &spec, mesh, spec_digest).await,
             // R783-F1 / W324: the recipe form of `kind = "container"` is an
             // on-disk Dockerfile build. It names a tag, not a digest, so there
             // is nothing here for containerd to pull. It cannot normally reach
@@ -2522,6 +2625,7 @@ async fn dispatch_deploy(
                     &bundle,
                     w.revalidate_receiver.as_ref(),
                     mesh,
+                    spec_digest,
                 )
                 .await
             }
@@ -2721,6 +2825,7 @@ async fn deploy_container(
     id: &WorkloadId,
     spec: &workload_spec::WorkloadSpec,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> KamajiToYubaba {
     // R850-F1, the backup half. Checked BEFORE the deploy and started AFTER it,
     // and the split is the point: a node that cannot ship this workload's state
@@ -2747,7 +2852,7 @@ async fn deploy_container(
         }
     }
 
-    let reply = deploy_container_inner(ctx, request_id, id, spec, mesh).await;
+    let reply = deploy_container_inner(ctx, request_id, id, spec, mesh, spec_digest).await;
 
     if matches!(reply, KamajiToYubaba::DeployAck { .. }) {
         if let Err(message) = crate::tail::spawn(ctx, id, spec).await {
@@ -2773,6 +2878,7 @@ async fn deploy_container_inner(
     id: &WorkloadId,
     spec: &workload_spec::WorkloadSpec,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> KamajiToYubaba {
     // Signed-recipe admission (R555-F4 / W235 §(c)), at the envelope rather than
     // per backend.
@@ -2826,7 +2932,7 @@ async fn deploy_container_inner(
     // manual step that leaves `yah cloud topology` reporting an extrapolation
     // forever.
     attach_hydrate(
-        deploy_container_backend(ctx, request_id, id, spec, mesh).await,
+        deploy_container_backend(ctx, request_id, id, spec, mesh, spec_digest).await,
         hydrate,
     )
 }
@@ -2865,13 +2971,14 @@ async fn deploy_container_backend(
     id: &WorkloadId,
     spec: &workload_spec::WorkloadSpec,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> KamajiToYubaba {
     if spec.wants_native_exec() {
-        return deploy_native_exec(ctx, request_id, id, spec, mesh).await;
+        return deploy_native_exec(ctx, request_id, id, spec, mesh, spec_digest).await;
     }
 
     if spec.wants_microvm() {
-        return deploy_microvm(ctx, request_id, id, spec, mesh).await;
+        return deploy_microvm(ctx, request_id, id, spec, mesh, spec_digest).await;
     }
 
     #[cfg(feature = "containerd-integration")]
@@ -3140,6 +3247,7 @@ async fn deploy_native_exec(
     id: &WorkloadId,
     spec: &workload_spec::WorkloadSpec,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> KamajiToYubaba {
     if let Err(message) = validate_native_exec_spec(spec) {
         return KamajiToYubaba::Error {
@@ -3152,7 +3260,10 @@ async fn deploy_native_exec(
     #[cfg(feature = "native-exec")]
     if let Some(native) = ctx.native.clone() {
         let mesh = runtime_mesh(mesh);
-        return match native.deploy_workload(spec, &mesh).await {
+        return match native
+            .deploy_with_digest(spec, &mesh, spec_digest.map(str::to_string))
+            .await
+        {
             Ok(result) => {
                 info!(
                     id = %id.0,
@@ -3234,7 +3345,10 @@ async fn deploy_microvm(
     id: &WorkloadId,
     spec: &workload_spec::WorkloadSpec,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> KamajiToYubaba {
+    #[cfg(not(feature = "microvm"))]
+    let _ = spec_digest;
     if let Err(message) = validate_microvm_spec(spec) {
         return KamajiToYubaba::Error {
             request_id: Some(request_id),
@@ -3245,9 +3359,13 @@ async fn deploy_microvm(
 
     #[cfg(feature = "microvm")]
     if let Some(microvm) = ctx.microvm.clone() {
-        use kamaji::Kamaji as _;
         let mesh = runtime_mesh(mesh);
-        return match microvm.deploy_workload(spec, &mesh).await {
+        // R1021-F8: the digest rides into the shim and `spec.json`, so the
+        // next kamaji adopts this guest instead of replaying it.
+        return match microvm
+            .deploy_with_digest(spec, &mesh, spec_digest.map(str::to_string))
+            .await
+        {
             Ok(result) => {
                 info!(
                     id = %id.0,
@@ -3631,6 +3749,7 @@ async fn deploy_mesofact_bundle(
     bundle: &workload_spec::MesofactServeBundle,
     revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> KamajiToYubaba {
     #[cfg(feature = "bundle-serving")]
     {
@@ -3681,6 +3800,7 @@ async fn deploy_mesofact_bundle(
             bundle: bundle.clone(),
             revalidate: revalidate.cloned(),
             mesh: mesh.cloned(),
+            spec_digest: spec_digest.map(str::to_string),
         };
         if let Err(e) = ctx.bundle.as_ref().expect("checked above").record_deploy(&record) {
             return KamajiToYubaba::Error {
@@ -3743,11 +3863,19 @@ async fn deploy_mesofact_bundle(
 /// 15e0cde9…: GET https://cdn.noisetable.com/blobs/…: error sending request`)
 /// and served stale HTML for half of prod's traffic until someone noticed.
 ///
-/// So a failed run now reports `Failed` (the caller polling `DeployStatus`
-/// still sees it and fails loudly) and then retries on a capped backoff until
-/// it lands or a newer deploy / `Stop` supersedes it ([`BundleRuns`]). The
-/// predecessor keeps serving while it does — on-node availability is not
-/// traded for the convergence — and the `Failed` detail says so.
+/// So a failed run now retries on a capped backoff until it lands or a newer
+/// deploy / `Stop` supersedes it ([`BundleRuns`]). The predecessor keeps
+/// serving while it does — on-node availability is not traded for the
+/// convergence — and the reported detail says so.
+///
+/// R983-B2: what `DeployStatus` says meanwhile depends on the failure. A
+/// [`BundleRunError::Transient`] (fetch I/O) stays `Pending` with the reason
+/// attached, so a polling apply keeps waiting, prints why, and fails only on
+/// its own deadline. Reporting it `Failed` made noisetable's apply (run
+/// 1be085a8, us-east-001, 2026-10-27) abort on a deploy whose retry converged
+/// ten minutes later. Anything else (bad runtime selector, a contract the
+/// runtime cannot meet, an undeclared port) is `Failed`: a retry is still
+/// attempted, but the caller is told now, because waiting will not fix it.
 #[cfg(feature = "bundle-serving")]
 async fn spawn_bundle_run(ctx: &Arc<ServerCtx>, record: BundleDeployRecord) {
     let id = WorkloadId::new(&record.id);
@@ -3767,6 +3895,7 @@ async fn spawn_bundle_run(ctx: &Arc<ServerCtx>, record: BundleDeployRecord) {
             bundle: task_bundle,
             revalidate: task_revalidate,
             mesh: task_mesh,
+            spec_digest: task_digest,
             ..
         } = record;
         let mut backoff = first_backoff;
@@ -3780,6 +3909,7 @@ async fn spawn_bundle_run(ctx: &Arc<ServerCtx>, record: BundleDeployRecord) {
                         &task_bundle,
                         task_revalidate.as_ref(),
                         task_mesh.as_ref(),
+                        task_digest.as_deref(),
                     )
                     .await
                 }
@@ -3793,11 +3923,12 @@ async fn spawn_bundle_run(ctx: &Arc<ServerCtx>, record: BundleDeployRecord) {
                         idle_ttl,
                         task_revalidate.as_ref(),
                         task_mesh.as_ref(),
+                        task_digest.as_deref(),
                     )
                     .await
                 }
             };
-            let reason = match outcome {
+            let (reason, transient) = match outcome {
                 Ok(()) => {
                     if attempt > 1 {
                         info!(id = %id.0, digest = %task_bundle.digest.0, attempt,
@@ -3820,23 +3951,29 @@ async fn spawn_bundle_run(ctx: &Arc<ServerCtx>, record: BundleDeployRecord) {
                         "bundle run superseded by a newer deploy or a Stop; standing down (R983-B1)");
                     return;
                 }
-                Err(BundleRunError::Failed(reason)) => reason,
+                Err(BundleRunError::Failed(reason)) => (reason, false),
+                Err(BundleRunError::Transient(reason)) => (reason, true),
             };
             // Nobody is waiting on this call any more, so the log is the only
             // place an operator not polling will ever see it.
-            warn!(id = %id.0, %reason, attempt, retry_in_secs = backoff.as_secs(),
+            warn!(id = %id.0, %reason, transient, attempt, retry_in_secs = backoff.as_secs(),
                 "asynchronous bundle deploy failed; will retry (R983-B1)");
             let Some(gate) = gate_if_current(&task_ctx, &ticket).await else {
                 return;
             };
+            let detail = format!(
+                "{reason} (attempt {attempt}; retrying in {}s — any previously deployed \
+                 process for this workload is still serving its old bundle until a retry \
+                 lands)",
+                backoff.as_secs()
+            );
             task_ctx.registry.lock().await.set_deploy_progress(
                 id.clone(),
-                DeployProgress::failed(format!(
-                    "{reason} (attempt {attempt}; retrying in {}s — any previously deployed \
-                     process for this workload is still serving its old bundle until a retry \
-                     lands)",
-                    backoff.as_secs()
-                )),
+                if transient {
+                    DeployProgress::retrying(detail)
+                } else {
+                    DeployProgress::failed(detail)
+                },
             );
             drop(gate);
             tokio::time::sleep(backoff).await;
@@ -3874,7 +4011,76 @@ impl ServerCtx {
             return 0;
         };
         let records = backend.recorded_deploys();
+        // R1021-T6: partial bundles are torn down CONCURRENTLY, then replayed.
+        // Each teardown can wait out a 5s TERM grace, and this all runs before
+        // the UDS answers; serially, seven members on prod us-east-001 held
+        // the socket closed ~35s, past yubaba's 30s connect budget, and
+        // yah.dev 503'd until yubaba was restarted by hand.
+        let mut teardowns = tokio::task::JoinSet::new();
+        let mut replays = Vec::new();
         for record in &records {
+            // R1021-F3: a keep-alive bundle the boot pass adopted at this
+            // digest is still serving; replaying it would replace it.
+            // Only when EVERY process the record owns came back: a skipped
+            // replay with a dead sibling (revalidate, feed tier) would leave
+            // it dead until the next Deploy. Partial -> tear the adopted ones
+            // down and replay the whole bundle; one extra restart is cheaper.
+            let owned = bundle_owned_idents(record);
+            let digest = record.spec_digest.as_deref();
+            // R1021-F7: an on-demand bundle's serve side is the JIT shim, not a
+            // native process; its siblings (revalidate, feed) stay native.
+            let on_demand = matches!(
+                record.bundle.lifecycle,
+                workload_spec::BundleLifecycle::OnDemand { .. }
+            );
+            let (native_owned, jit_owned): (Vec<String>, Vec<String>) = if on_demand {
+                (owned[1..].to_vec(), vec![record.id.clone()])
+            } else {
+                (owned, Vec::new())
+            };
+            let (native_complete, adopted) =
+                adopted_with_digest(&backend.native, &native_owned, digest).await;
+            let mut jit_complete = true;
+            let mut jit_adopted = Vec::new();
+            for ident in &jit_owned {
+                let live = backend.jit.deployed_digest(ident).await;
+                let present = backend.jit.holds(&workload_spec::MeshIdent(ident.clone())).await;
+                if present {
+                    jit_adopted.push(ident.clone());
+                }
+                // A digest-less record matches a digest-less member, as in
+                // `adopted_with_digest` (R1021-T6).
+                if !present || live.as_deref() != digest {
+                    jit_complete = false;
+                }
+            }
+            // `owned` always holds the record's own id, so this is never the
+            // vacuous empty set.
+            if native_complete && jit_complete {
+                info!(id = %record.id, on_demand, "recorded bundle deploy is adopted and serving; not replayed (R1021-F3/F7)");
+                self.reregister_adopted_bundle(record).await;
+                continue;
+            }
+            for ident in jit_adopted {
+                warn!(id = %record.id, member = %ident,
+                    "on-demand bundle only partly adopted; tearing down to replay it whole (R1021-F7)");
+                let jit = Arc::clone(&backend.jit);
+                teardowns.spawn(async move {
+                    let _ = jit.teardown_workload(&workload_spec::MeshIdent(ident)).await;
+                });
+            }
+            for ident in adopted {
+                warn!(id = %record.id, member = %ident,
+                    "bundle only partly adopted; tearing down to replay it whole (R1021-F3)");
+                let native = Arc::clone(&backend.native);
+                teardowns.spawn(async move {
+                    let _ = native.teardown_workload(&workload_spec::MeshIdent(ident)).await;
+                });
+            }
+            replays.push(record);
+        }
+        while teardowns.join_next().await.is_some() {}
+        for record in replays {
             info!(
                 id = %record.id,
                 digest = %record.bundle.digest.0,
@@ -3884,6 +4090,224 @@ impl ServerCtx {
             spawn_bundle_run(self, record.clone()).await;
         }
         records.len()
+    }
+}
+
+/// Every native process a bundle record owns, by ident: the serve process, its
+/// revalidate receiver when declared, and the feed tier when that declares
+/// feeds (`fork_revalidate_receiver` / `fork_feed_tier` name them so).
+#[cfg(feature = "bundle-serving")]
+fn bundle_owned_idents(record: &BundleDeployRecord) -> Vec<String> {
+    let mut owned = vec![record.id.clone()];
+    if let Some(rv) = &record.revalidate {
+        owned.push(format!("{}-revalidate", record.id));
+        if !rv.feeds.is_empty() {
+            owned.push(format!("{}-feed", record.id));
+        }
+    }
+    owned
+}
+
+/// Whether every one of `idents` is live in `native` at `digest`, plus the
+/// ones that are live at all (R1021-F3).
+///
+/// A record with NO digest matches members that carry none (R1021-T6).
+/// Every record kamaji wrote before R1021-F3 lacks the field — on prod that was
+/// all of them — and a replay forks the members at the record's digest, so they
+/// persist `None` too. Requiring `Some` there tore every keep-alive bundle down
+/// and replayed it on EVERY kamaji restart, not just the first. `None == None`
+/// is sound: only a Deploy rewrites a record, and a Deploy stamps a digest, so
+/// a digest-less member beside a digest-less record was forked from a replay
+/// of that very record. (No pre-shim process survives the boot pass to be
+/// confused with one.)
+#[cfg(feature = "bundle-serving")]
+async fn adopted_with_digest(
+    native: &kamaji::native::NativeRuntime,
+    idents: &[String],
+    digest: Option<&str>,
+) -> (bool, Vec<String>) {
+    use kamaji::Kamaji as _;
+    let mut complete = true;
+    let mut live = Vec::new();
+    for ident in idents {
+        let present = native
+            .get_workload(&workload_spec::MeshIdent(ident.clone()))
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if present {
+            live.push(ident.clone());
+        }
+        if !present || native.deployed_digest(ident).await.as_deref() != digest {
+            complete = false;
+        }
+    }
+    (complete, live)
+}
+
+#[cfg(feature = "bundle-serving")]
+impl ServerCtx {
+    /// What `run_bundle_keepalive` registers after its fork, for a bundle
+    /// whose serve process was adopted instead (R1021-F3): the deploy progress
+    /// `DeployStatus` reads, and the probe target dialing the port it bound.
+    async fn reregister_adopted_bundle(&self, record: &BundleDeployRecord) {
+        let Some(backend) = &self.bundle else {
+            return;
+        };
+        let id = WorkloadId::new(&record.id);
+        if matches!(record.bundle.lifecycle, workload_spec::BundleLifecycle::OnDemand { .. }) {
+            // R1021-F7: what `run_bundle_on_demand` registers — progress only;
+            // no probe, which would fork the serve process every interval.
+            self.registry
+                .lock()
+                .await
+                .set_deploy_progress(id, DeployProgress::at(WorkloadState::Running));
+            return;
+        }
+        let port = backend
+            .native
+            .get_workload(&workload_spec::MeshIdent(record.id.clone()))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|w| w.ports.values().next().copied());
+        let mut registry = self.registry.lock().await;
+        registry.set_deploy_progress(id.clone(), DeployProgress::at(WorkloadState::Running));
+        if let Some(port) = port {
+            registry.insert_probe(
+                id,
+                ProbeTarget::healthcheck(
+                    workload_spec::Healthcheck {
+                        probe: workload_spec::HealthProbe::TcpConnect { port },
+                        interval: workload_spec::Millis::from_ms(1000),
+                        timeout: workload_spec::Millis::from_ms(500),
+                        initial_delay: workload_spec::Millis::from_ms(0),
+                        failure_threshold: 3,
+                    },
+                    std::net::SocketAddr::from((native_bind_ip(record.mesh.as_ref()), port)),
+                ),
+            );
+        }
+    }
+}
+
+/// R1021-F3, W386 §2: kamaji's boot pass. Runs once at startup, BEFORE any
+/// `resume_*` replay and before the socket answers.
+#[cfg(all(
+    unix,
+    any(feature = "native-exec", feature = "bundle-serving", feature = "microvm")
+))]
+impl ServerCtx {
+    /// 1. Every shimmed native runtime (`--native-exec-dir`, and the bundle
+    ///    backend's — yah-marketing's class) adopts the shims that answer, and
+    ///    so does the microVM backend, for service guests (R1021-F8).
+    /// 2. Under the delegated cgroup root, everything nobody adopted is
+    ///    killed by leaf: populated workload leaves, orphaned shims, and every
+    ///    process in kamaji's own `native/` cgroup but kamaji and an adopted
+    ///    shim's child (a pre-F8 leafless Firecracker, which then replays into
+    ///    a leaf). Nothing replays beside a populated leaf.
+    /// 3. A shim speaking another `proto` is restarted from its `spec.json`.
+    ///
+    /// Adopted digests go into the registry so `List` reports them (R870-B24)
+    /// and yubaba does not re-send. Returns how many workloads were adopted.
+    pub async fn boot_pass(self: &Arc<Self>) -> usize {
+        #[allow(unused_mut)]
+        let mut runtimes: Vec<Arc<kamaji::native::NativeRuntime>> = Vec::new();
+        #[cfg(feature = "native-exec")]
+        if let Some(native) = &self.native {
+            runtimes.push(Arc::clone(native));
+        }
+        #[cfg(feature = "bundle-serving")]
+        if let Some(bundle) = &self.bundle {
+            runtimes.push(Arc::clone(&bundle.native));
+        }
+
+        let mut keep = kamaji::boot::Keep::default();
+        let mut incompatible = Vec::new();
+        let mut adopted = 0;
+        // R1021-F7: the on-demand tier's JIT shims. Same state dir as
+        // bundle.native, which skips them; adopted here, never replayed.
+        #[cfg(feature = "bundle-serving")]
+        if let Some(bundle) = &self.bundle {
+            let adoption = bundle.jit.adopt_survivors().await;
+            for (ident, _pid) in &adoption.adopted {
+                adopted += 1;
+                if let Some(digest) =
+                    bundle.jit.deployed_digest(ident).await.as_deref().and_then(digest_from_hex)
+                {
+                    self.registry
+                        .lock()
+                        .await
+                        .set_adopted_digest(WorkloadId::new(ident), digest);
+                }
+            }
+            keep.leaves.extend(adoption.keep.leaves);
+            keep.shim_pids.extend(adoption.keep.shim_pids);
+        }
+        for rt in &runtimes {
+            let adoption = rt.adopt_survivors().await;
+            for (ident, _pid) in &adoption.adopted {
+                adopted += 1;
+                if let Some(digest) = rt.deployed_digest(ident).await.as_deref().and_then(digest_from_hex) {
+                    self.registry
+                        .lock()
+                        .await
+                        .set_adopted_digest(WorkloadId::new(ident), digest);
+                }
+            }
+            keep.leaves.extend(adoption.keep.leaves);
+            keep.shim_pids.extend(adoption.keep.shim_pids);
+            keep.child_pids.extend(adoption.keep.child_pids);
+            incompatible.push((Arc::clone(rt), adoption.incompatible));
+        }
+
+        // R1021-F8: service guests whose VMM a shim still parents. Adopted
+        // here, so `resume_microvm_workloads` skips their replay.
+        #[cfg(feature = "microvm")]
+        if let Some(microvm) = &self.microvm {
+            let adoption = microvm.adopt_survivors().await;
+            for (ident, _pid) in &adoption.adopted {
+                adopted += 1;
+                if let Some(digest) =
+                    microvm.deployed_digest(ident).await.as_deref().and_then(digest_from_hex)
+                {
+                    self.registry
+                        .lock()
+                        .await
+                        .set_adopted_digest(WorkloadId::new(ident), digest);
+                }
+            }
+            keep.leaves.extend(adoption.keep.leaves);
+            keep.shim_pids.extend(adoption.keep.shim_pids);
+            keep.child_pids.extend(adoption.keep.child_pids);
+        }
+
+        // Every runtime resolves the same delegated root; ask whichever has one.
+        let cg = runtimes.iter().find_map(|rt| rt.cgroup_root()).cloned();
+        #[cfg(feature = "microvm")]
+        let cg = cg.or_else(|| self.microvm.as_ref().and_then(|m| m.cgroup_root()).cloned());
+        // The reap needs the delegated PATH, never the controllers. A runtime's
+        // handle is `None` whenever `+cpu +memory` cannot be enabled, and every
+        // dev Pi boots `cgroup_disable=memory`, so keying the reap on it skipped
+        // the kill entirely: on R1021-T6's first roll the pre-shim Firecrackers
+        // survived in `native/` holding their TAPs, and every microVM replay
+        // failed EBUSY beside them.
+        let cg = cg.or_else(kamaji::cgroup::CgroupV2::delegated);
+        if let Some(cg) = &cg {
+            let reaped =
+                kamaji::boot::reap_unadopted(cg, &keep, std::time::Duration::from_secs(5)).await;
+            info!(
+                adopted, strays = ?reaped.strays, shims = ?reaped.shims,
+                leaves = reaped.leaves.len(), leaked = ?reaped.leaked,
+                "boot pass: adopted live shims, killed what could not be adopted (R1021-F3)"
+            );
+        }
+
+        for (rt, idents) in incompatible {
+            rt.restart_incompatible(&idents).await;
+        }
+        adopted
     }
 }
 
@@ -3906,6 +4330,23 @@ impl ServerCtx {
                 warn!(id = %record.id, "native deploy record holds no container spec; skipped");
                 continue;
             };
+            let digest = kamaji_proto::spec_digest(&record.workload).map(|d| digest_hex(&d));
+            // R1021-F3: the boot pass already adopted this exact spec — it is
+            // running, so "bring back what was running" has nothing to do.
+            if let Some(native) = &self.native {
+                if digest.is_some()
+                    && native.deployed_digest(&spec.expose.mesh.identity.0).await == digest
+                {
+                    info!(id = %record.id, "recorded native deploy is adopted and running; not replayed (R1021-F3)");
+                    let mut registry = self.registry.lock().await;
+                    if let Some(sock) = control_sock_from_spec(spec) {
+                        registry.insert_probe(id.clone(), ProbeTarget::control(sock));
+                    }
+                    registry.set_deployed_spec(id, record.workload.clone());
+                    resumed += 1;
+                    continue;
+                }
+            }
             info!(id = %record.id, "resuming recorded native deploy after restart (R936-B11)");
             match deploy_native_exec(
                 self,
@@ -3913,6 +4354,7 @@ impl ServerCtx {
                 &id,
                 spec,
                 record.mesh.as_ref(),
+                digest.as_deref(),
             )
             .await
             {
@@ -3953,6 +4395,23 @@ impl ServerCtx {
                 warn!(id = %record.id, "microVM deploy record holds no container spec; skipped");
                 continue;
             };
+            let digest = kamaji_proto::spec_digest(&record.workload).map(|d| digest_hex(&d));
+            // R1021-F8: the boot pass adopted this exact spec's guest — its VMM
+            // is still running, and a replay would boot a second VM on the
+            // same private root disk.
+            if let Some(microvm) = &self.microvm {
+                if digest.is_some()
+                    && microvm.deployed_digest(&spec.expose.mesh.identity.0).await == digest
+                {
+                    info!(id = %record.id, "recorded microVM deploy is adopted and running; not replayed (R1021-F8)");
+                    self.registry
+                        .lock()
+                        .await
+                        .set_deployed_spec(id, record.workload.clone());
+                    resumed += 1;
+                    continue;
+                }
+            }
             info!(id = %record.id, "resuming recorded microVM deploy after restart (R605-F16)");
             match deploy_microvm(
                 self,
@@ -3960,6 +4419,7 @@ impl ServerCtx {
                 &id,
                 spec,
                 record.mesh.as_ref(),
+                digest.as_deref(),
             )
             .await
             {
@@ -4044,6 +4504,9 @@ impl ServerCtx {
                 &id,
                 spec,
                 record.mesh.as_ref(),
+                kamaji_proto::spec_digest(&record.workload)
+                    .map(|d| digest_hex(&d))
+                    .as_deref(),
             )
             .await
             {
@@ -4073,12 +4536,22 @@ impl ServerCtx {
 /// into a plain string: this now runs *after* the Deploy has been acked, so
 /// there is no longer a reply to put a failure in. It lands in
 /// [`DeployProgress::failed`] and comes back out of a `DeployStatus` poll.
+///
+/// R983-B2: a fetch that fails on I/O (`BundleError::Io`, from the bundle
+/// materialize or the runtime-asset fetch) is [`BundleRunError::Transient`];
+/// every other reason is [`BundleRunError::Failed`].
 #[cfg(feature = "bundle-serving")]
 async fn materialize_and_resolve_serve(
     backend: &BundleBackend,
     id: &WorkloadId,
     bundle: &workload_spec::MesofactServeBundle,
-) -> std::result::Result<(PathBuf, PathBuf), String> {
+) -> std::result::Result<(PathBuf, PathBuf), BundleRunError> {
+    fn fetch_failure(e: &yah_mesofact_bundle::BundleError, reason: String) -> BundleRunError {
+        match e {
+            yah_mesofact_bundle::BundleError::Io(_) => BundleRunError::Transient(reason),
+            _ => BundleRunError::Failed(reason),
+        }
+    }
     // 1. Materialize the bundle tree from the node store (R599-F1). The digest is
     //    the content-address; a bad hex shape is a spec error, not a backend one.
     let digest = yah_mesofact_bundle::BundleHash::parse(bundle.digest.0.clone())
@@ -4105,8 +4578,11 @@ async fn materialize_and_resolve_serve(
     .await;
     let bundle_dir = match materialized {
         Ok(Ok(dir)) => dir,
-        Ok(Err(e)) => return Err(format!("materialize bundle {}: {e}", digest.as_str())),
-        Err(e) => return Err(format!("bundle materialize task failed: {e}")),
+        Ok(Err(e)) => {
+            let reason = format!("materialize bundle {}: {e}", digest.as_str());
+            return Err(fetch_failure(&e, reason));
+        }
+        Err(e) => return Err(format!("bundle materialize task failed: {e}").into()),
     };
 
     // 1b. Read the materialized manifest for the contract version this bundle
@@ -4122,7 +4598,7 @@ async fn materialize_and_resolve_serve(
                 .map_err(|e| format!("parsing {}: {e}", manifest_path.display()))
         }) {
         Ok(manifest) => manifest.requires_contract,
-        Err(e) => return Err(format!("materialized bundle {}: {e}", digest.as_str())),
+        Err(e) => return Err(format!("materialized bundle {}: {e}", digest.as_str()).into()),
     };
 
     // 2. Resolve the serve binary from the runtime selector (W272 §2/§3).
@@ -4166,8 +4642,13 @@ async fn materialize_and_resolve_serve(
             // The error already names the runtime, the triple, and where it
             // looked (BundleError::RuntimeAssetMissing) or both contract
             // versions (BundleError::ContractUnsatisfied).
-            Ok(Err(e)) => return Err(format!("serve runtime asset missing: {e}")),
-            Err(e) => return Err(format!("runtime asset fetch task failed: {e}")),
+            Ok(Err(e @ yah_mesofact_bundle::BundleError::Io(_))) => {
+                return Err(BundleRunError::Transient(format!(
+                    "fetching serve runtime asset: {e}"
+                )));
+            }
+            Ok(Err(e)) => return Err(format!("serve runtime asset missing: {e}").into()),
+            Err(e) => return Err(format!("runtime asset fetch task failed: {e}").into()),
         }
     };
     if !serve_bin.exists() {
@@ -4178,7 +4659,8 @@ async fn materialize_and_resolve_serve(
              bundle must ship bins/<triple>/serve",
             serve_bin.display(),
             bundle.runtime
-        ));
+        )
+        .into());
     }
     // The serve bin must be executable to fork it. materialize_bundle writes blob
     // bytes 0644, and the stock runtime-asset fetch may not set +x either — ensure
@@ -4212,6 +4694,7 @@ async fn run_bundle_keepalive(
     bundle: &workload_spec::MesofactServeBundle,
     revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> std::result::Result<(), BundleRunError> {
     use std::net::SocketAddr;
 
@@ -4277,7 +4760,7 @@ async fn run_bundle_keepalive(
 
     backend
         .native
-        .deploy_workload(&spec, &mesh)
+        .deploy_with_digest(&spec, &mesh, spec_digest.map(str::to_string))
         .await
         .map_err(|e| format!("native fork of mesofact-serve for {} failed: {e:#}", id.0))?;
 
@@ -4312,6 +4795,7 @@ async fn run_bundle_keepalive(
             rv,
             bind_ip,
             bundle.origin.as_deref(),
+            spec_digest,
         )
             .await
             .map_err(|e| {
@@ -4342,6 +4826,7 @@ async fn run_bundle_on_demand(
     idle_ttl: workload_spec::Millis,
     revalidate: Option<&workload_spec::MesofactRevalidateReceiver>,
     mesh: Option<&kamaji_proto::MeshAssignment>,
+    spec_digest: Option<&str>,
 ) -> std::result::Result<(), BundleRunError> {
     let backend = ctx
         .bundle
@@ -4399,9 +4884,11 @@ async fn run_bundle_on_demand(
     );
     let mesh = runtime_mesh(mesh);
 
+    // R1021-F7: the digest rides into the JIT shim's spec.json, so the next
+    // kamaji's boot pass can adopt the shim and skip this replay.
     backend
         .jit
-        .deploy_on_demand(&spec, &mesh, &listen)
+        .deploy_on_demand_with_digest(&spec, &mesh, &listen, spec_digest.map(str::to_string))
         .await
         .map_err(|e| format!("on-demand bind/arm of mesofact-serve for {} failed: {e:#}", id.0))?;
 
@@ -4417,6 +4904,9 @@ async fn run_bundle_on_demand(
             rv,
             bind_ip,
             bundle.origin.as_deref(),
+            // R1021-F7: the JIT serve side is adopted at this digest too, so
+            // the receiver carries it for the whole-bundle replay skip.
+            spec_digest,
         )
             .await
             .map_err(|e| {
@@ -4535,6 +5025,8 @@ fn bundle_workload_spec(
         },
         labels: Default::default(),
         durability: None,
+        lease_id: None,
+        deadline: None,
         db: Vec::new(),
         capabilities: Vec::new(),
         annotations: Default::default(),
@@ -4626,6 +5118,7 @@ async fn fork_revalidate_receiver(
     // the feed tier below resolves its runtime asset from the same store the
     // serve binary came from.
     origin: Option<&str>,
+    spec_digest: Option<&str>,
 ) -> std::result::Result<(), String> {
     let rv_id = WorkloadId(format!("{}-revalidate", id.0));
     // R844-F14: the receiver is its own ident with its own `http` port, not a
@@ -4636,7 +5129,7 @@ async fn fork_revalidate_receiver(
     let mesh = kamaji::MeshAssignment::inlined(bind_ip);
     backend
         .native
-        .deploy_workload(&spec, &mesh)
+        .deploy_with_digest(&spec, &mesh, spec_digest.map(str::to_string))
         .await
         .map(|_res| ())
         .map_err(|e| format!("native fork of mesofact-serve --revalidate failed: {e:#}"))?;
@@ -4645,7 +5138,7 @@ async fn fork_revalidate_receiver(
     // re-renders the data the bundle was built with forever. It is forked after
     // the receiver because its whole job is to poke it.
     if !receiver.feeds.is_empty() {
-        fork_feed_tier(backend, id, bundle_dir, &listen, receiver, origin).await?;
+        fork_feed_tier(backend, id, bundle_dir, &listen, receiver, origin, spec_digest).await?;
     }
     Ok(())
 }
@@ -4684,6 +5177,7 @@ async fn fork_feed_tier(
     receiver_listen: &str,
     receiver: &workload_spec::MesofactRevalidateReceiver,
     origin: Option<&str>,
+    spec_digest: Option<&str>,
 ) -> std::result::Result<(), String> {
     use std::net::Ipv4Addr;
 
@@ -4761,7 +5255,7 @@ async fn fork_feed_tier(
     let mesh = kamaji::MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
     backend
         .native
-        .deploy_workload(&spec, &mesh)
+        .deploy_with_digest(&spec, &mesh, spec_digest.map(str::to_string))
         .await
         .map(|_res| ())
         .map_err(|e| format!("native fork of almanac-feed failed: {e:#}"))
@@ -4938,6 +5432,8 @@ fn liveness_rank(e: &WorkloadEntry) -> (u8, u8) {
         // The catch-all is right for a state this build has never heard of and
         // wrong for one it ships.
         WireState::OomKilled => 1,
+        // A `Failed` that names its cause, exactly like `OomKilled` (R1019-F2).
+        WireState::DeadlineExceeded => 1,
         WireState::Exited => 0,
         // `WorkloadState` is #[non_exhaustive]: a state added by a newer peer
         // ranks with Pending — "a record exists, nothing more is known". It can
@@ -5043,6 +5539,8 @@ fn runtime_state_to_entry(s: kamaji::WorkloadState) -> WorkloadEntry {
                 WireState::Failed
             }
         }
+        // R1019-F2: the deadline kill has its own wire state (V14).
+        WorkloadStatus::DeadlineExceeded => WireState::DeadlineExceeded,
     };
     let pid = s
         .container_id
@@ -5112,6 +5610,8 @@ fn docker_workload_to_entry(w: kamaji::docker::DockerWorkload) -> WorkloadEntry 
                 WireState::Failed
             }
         }
+        // R1019-F2: the deadline kill has its own wire state (V14).
+        WorkloadStatus::DeadlineExceeded => WireState::DeadlineExceeded,
     };
     WorkloadEntry {
         id: WorkloadId(w.workload_id),
@@ -5563,6 +6063,135 @@ fn drain_outcome_to_ack(
             Some(format!("unrecognised DrainOutcome variant: {other:?}")),
         ),
         Err(e) => (false, Some(format!("drain failed: {e}"))),
+    }
+}
+
+/// Overall cap on [`ServerCtx::stop_workloads_for_shutdown`]. kamaji.service
+/// gives the unit `TimeoutStopSec=30s`; this leaves room for the listener
+/// cleanup and process exit well inside it, and past it systemd's SIGKILL is
+/// the backstop anyway.
+pub const SHUTDOWN_STOP_CAP: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Does this workload outlive kamaji on its own, so the supervisor's shutdown
+/// must leave it running? `false` for the tenant-passway class, which has no
+/// shim (W386 "Not in this design"). Native and bundle-JIT workloads are
+/// answered per runtime, and microVMs per guest —
+/// [`kamaji::microvm::MicroVmRuntime::survives_supervisor`] (R1021-F8), true
+/// for a shim-parented service guest, false for a job, which keeps its
+/// TERM-at-shutdown semantics. The per-runtime answers are
+/// [`kamaji::native::NativeRuntime::workloads_survive_supervisor`] (R1021-F2)
+/// and [`kamaji::jit::JitRuntime::workloads_survive_supervisor`] (R1021-F7),
+/// true once a shim parents them — because survival is a property of how the
+/// workload was forked, not of the ident.
+fn survives_supervisor(_ident: &workload_spec::MeshIdent) -> bool {
+    false
+}
+
+impl ServerCtx {
+    /// R1021-T1: stop every workload that cannot survive kamaji, the way
+    /// `systemctl stop` should have always stopped them. Called from
+    /// [`serve_with_ctx`] after SIGTERM/SIGINT, so the workloads get their own
+    /// TERM (and their traps run) instead of the unit's `KillMode=mixed`
+    /// SIGKILL.
+    ///
+    /// Goes through each runtime's `teardown_workload` — TERM, a grace period,
+    /// then KILL, plus cgroup cleanup — concurrently, bounded by `cap`.
+    /// Deliberately NOT [`stop_workload`]: that is yubaba discarding a
+    /// workload and also forgets its resume record, whereas a shutdown must
+    /// leave the records so [`Self::resume_native_workloads`] and friends bring
+    /// the opted-in ones back. Container backends (containerd, docker) are not
+    /// touched: their tasks are not kamaji's children and already survive.
+    pub async fn stop_workloads_for_shutdown(&self, cap: std::time::Duration) {
+        let mut set: tokio::task::JoinSet<(String, anyhow::Result<()>)> =
+            tokio::task::JoinSet::new();
+        #[cfg(feature = "native-exec")]
+        if let Some(native) = &self.native {
+            Self::spawn_native_stops(&mut set, native).await;
+        }
+        #[cfg(feature = "bundle-serving")]
+        if let Some(backend) = &self.bundle {
+            Self::spawn_native_stops(&mut set, &backend.native).await;
+            // R1021-F7: a shimmed JIT tier's listener and serve process outlive
+            // kamaji — answered per runtime, like native.
+            let jit_survives = backend.jit.workloads_survive_supervisor();
+            for st in backend.jit.list_workloads().await {
+                if jit_survives || survives_supervisor(&st.ident) {
+                    continue;
+                }
+                let jit = backend.jit.clone();
+                set.spawn(async move {
+                    (st.ident.0.clone(), jit.teardown_workload(&st.ident).await)
+                });
+            }
+        }
+        #[cfg(feature = "tenant-passway")]
+        if let Some(jit) = &self.tenant_passway {
+            for st in jit.list_workloads().await {
+                if survives_supervisor(&st.ident) {
+                    continue;
+                }
+                let jit = jit.clone();
+                set.spawn(async move {
+                    (st.ident.0.clone(), jit.teardown_workload(&st.ident).await)
+                });
+            }
+        }
+        #[cfg(feature = "microvm")]
+        if let Some(microvm) = &self.microvm {
+            if let Ok(states) = microvm.list_workloads().await {
+                for st in states {
+                    // R1021-F8: a shim-parented service guest outlives kamaji.
+                    if survives_supervisor(&st.ident) || microvm.survives_supervisor(&st.ident).await {
+                        continue;
+                    }
+                    let microvm = microvm.clone();
+                    set.spawn(async move {
+                        (st.ident.0.clone(), microvm.teardown_workload(&st.ident).await)
+                    });
+                }
+            }
+        }
+        if set.is_empty() {
+            return;
+        }
+        info!(workloads = set.len(), "stopping workloads before exit (R1021-T1)");
+        let drained = tokio::time::timeout(cap, async {
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok((id, Err(e))) => warn!(id = %id, error = %format!("{e:#}"),
+                        "shutdown teardown failed"),
+                    Ok((_, Ok(()))) => {}
+                    Err(e) => warn!(error = %e, "shutdown teardown task failed"),
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
+            warn!(?cap, "shutdown stop cap reached; leaving the rest to systemd");
+        }
+    }
+
+    #[cfg(any(feature = "native-exec", feature = "bundle-serving"))]
+    async fn spawn_native_stops(
+        set: &mut tokio::task::JoinSet<(String, anyhow::Result<()>)>,
+        native: &Arc<kamaji::native::NativeRuntime>,
+    ) {
+        // R1021-F2: a shim-parented runtime's workloads outlive kamaji by
+        // design; TERMing them here would turn every roll back into an outage.
+        if native.workloads_survive_supervisor() {
+            return;
+        }
+        if let Ok(states) = native.list_workloads().await {
+            for st in states {
+                if survives_supervisor(&st.ident) {
+                    continue;
+                }
+                let native = native.clone();
+                set.spawn(async move {
+                    (st.ident.0.clone(), native.teardown_workload(&st.ident).await)
+                });
+            }
+        }
     }
 }
 
@@ -6311,6 +6940,149 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// R1021-T1: the shutdown path (what SIGTERM triggers in `serve_with_ctx`)
+    /// TERMs a running native workload, so its trap runs — instead of the unit's
+    /// KillMode=mixed SIGKILL leaving the trap unrun. Records are untouched.
+    #[cfg(all(unix, feature = "native-exec"))]
+    #[tokio::test]
+    async fn shutdown_sends_term_to_a_native_workload_so_its_trap_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("term-marker");
+        let ctx = Arc::new(
+            ServerCtx::new()
+                .with_native_exec(Arc::new(kamaji::native::NativeRuntime::new(dir.path()))),
+        );
+        let mut inner = make_minimal_container_spec("trapper");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        inner.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "trap 'echo TERM > {}; exit 0' TERM; while :; do sleep 0.1; done",
+                marker.display()
+            ),
+        ]);
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(1021),
+                id: WorkloadId::new("trapper"),
+                spec: workload_spec::Workload::container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+        assert!(matches!(reply, KamajiToYubaba::DeployAck { .. }), "got {reply:?}");
+        // Let the shell install its trap before we signal it.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        ctx.stop_workloads_for_shutdown(std::time::Duration::from_secs(15)).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "TERM",
+            "the workload's TERM trap must have run before kamaji exited"
+        );
+        let left = ctx.native.as_ref().unwrap().list_workloads().await.unwrap();
+        assert!(left.is_empty(), "workload should be torn down, got {left:?}");
+    }
+
+    /// The shim's `main` when [`shim_test_launcher`] re-execs this harness
+    /// (R1021-F2). A plain run (env unset) passes trivially.
+    #[cfg(unix)]
+    #[test]
+    fn shim_test_entry() {
+        if std::env::var_os("KAMAJI_BIN_TEST_SHIM_ENTRY").is_some() {
+            std::process::exit(kamaji::shim::run_from_stdin());
+        }
+    }
+
+    #[cfg(all(unix, any(feature = "native-exec", feature = "bundle-serving")))]
+    fn shim_test_launcher() -> kamaji::shim::ShimLauncher {
+        kamaji::shim::ShimLauncher {
+            program: std::env::current_exe().unwrap(),
+            args: vec![
+                "--exact".into(),
+                "server::tests::shim_test_entry".into(),
+                "--test-threads=1".into(),
+            ],
+            env: vec![("KAMAJI_BIN_TEST_SHIM_ENTRY".into(), "1".into())],
+        }
+    }
+
+    /// R1021-F2 on top of R1021-T1: once the native runtime parents its
+    /// workloads through `kamaji shim`, the shutdown sweep leaves them alone —
+    /// no TERM, the trap does not run, the child is still alive afterwards.
+    /// (The non-surviving class keeps its graceful stop: see
+    /// `shutdown_sends_term_to_a_native_workload_so_its_trap_runs`, whose
+    /// runtime has no shim.)
+    #[cfg(all(unix, feature = "native-exec"))]
+    #[tokio::test]
+    async fn shutdown_leaves_a_shim_parented_native_workload_running() {
+        use kamaji::Kamaji as _;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("term-marker");
+        let native = Arc::new(
+            kamaji::native::NativeRuntime::new(dir.path()).with_shim(shim_test_launcher()),
+        );
+        let ctx = Arc::new(ServerCtx::new().with_native_exec(native.clone()));
+        let mut inner = make_minimal_container_spec("survivor");
+        inner.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        inner.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "trap 'echo TERM > {}; exit 0' TERM; while :; do sleep 0.1; done",
+                marker.display()
+            ),
+        ]);
+        let reply = handle_message(
+            YubabaToKamaji::Deploy {
+                request_id: RequestId(1022),
+                id: WorkloadId::new("survivor"),
+                spec: workload_spec::Workload::container(inner),
+                mesh: None,
+            },
+            &ctx,
+        )
+        .await;
+        assert!(matches!(reply, KamajiToYubaba::DeployAck { .. }), "got {reply:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let pid: u32 = native.list_workloads().await.unwrap()[0]
+            .container_id
+            .trim_start_matches("native-")
+            .parse()
+            .unwrap();
+
+        ctx.stop_workloads_for_shutdown(std::time::Duration::from_secs(15)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert!(!marker.exists(), "a shim-parented workload must not be TERMed by shutdown");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(alive, "the workload must still run");
+
+        // Explicit teardown still reaches it through the shim.
+        native
+            .teardown_workload(&workload_spec::MeshIdent("survivor".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "TERM",
+            "teardown must TERM the shimmed child"
+        );
     }
 
     /// R936-B11: a native workload that opted in survives kamaji. Deploy it on
@@ -7285,6 +8057,15 @@ mod tests {
             WireWorkloadState::Failed,
             "a plain SIGKILL must NOT be reported as an OOM"
         );
+        // R1019-F2: the deadline kill is its own wire state, never `Failed`.
+        let deadline = runtime_state_to_entry(kamaji::WorkloadState {
+            ident: workload_spec::MeshIdent("svc.deadline".into()),
+            container_id: "native-4243".into(),
+            status: kamaji::WorkloadStatus::DeadlineExceeded,
+            mesh_ip: None,
+            ports: Default::default(),
+        });
+        assert_eq!(deadline.state, WireWorkloadState::DeadlineExceeded);
         assert_ne!(entry_for(true).state, entry_for(false).state);
     }
 
@@ -7396,6 +8177,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            lease_id: None,
+            deadline: None,
             db: Vec::new(),
             capabilities: Vec::new(),
             annotations: Default::default(),
@@ -7830,6 +8613,180 @@ mod tests {
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
+        }
+
+        /// R1021-F2: a keep-alive bundle's native process is shim-parented, so
+        /// kamaji's shutdown sweep leaves it running (yah-marketing's shape);
+        /// an explicit teardown still stops it through the shim.
+        #[cfg(unix)]
+        /// R1021-F3 (b): a bundle's replay is skipped only when EVERY owned
+        /// process is live at the record's digest. Real sleep processes,
+        /// deployed straight into a NativeRuntime (in-map == adopted at boot).
+        #[tokio::test]
+        async fn a_bundle_is_fully_adopted_only_when_every_owned_process_is() {
+            let dir = tempfile::tempdir().unwrap();
+            let native = kamaji::native::NativeRuntime::new(dir.path());
+            let mesh = kamaji::MeshAssignment::inlined(std::net::Ipv4Addr::LOCALHOST);
+            let owned = vec!["site".to_string(), "site-revalidate".to_string()];
+            let fork = |name: &str| {
+                let mut spec = super::make_minimal_container_spec(name);
+                spec.command = Some(vec!["/bin/sleep".into(), "30".into()]);
+                spec
+            };
+            native
+                .deploy_with_digest(&fork("site"), &mesh, Some("d".into()))
+                .await
+                .unwrap();
+            let (complete, live) = adopted_with_digest(&native, &owned, Some("d")).await;
+            assert!(!complete, "a missing revalidate receiver must force a full replay");
+            assert_eq!(live, vec!["site".to_string()]);
+
+            native
+                .deploy_with_digest(&fork("site-revalidate"), &mesh, Some("other".into()))
+                .await
+                .unwrap();
+            assert!(!adopted_with_digest(&native, &owned, Some("d")).await.0, "digest mismatch");
+
+            native
+                .deploy_with_digest(&fork("site-revalidate"), &mesh, Some("d".into()))
+                .await
+                .unwrap();
+            assert!(adopted_with_digest(&native, &owned, Some("d")).await.0);
+            assert!(
+                !adopted_with_digest(&native, &owned, None).await.0,
+                "a digest-less record does not match members stamped with one"
+            );
+            for ident in &owned {
+                use kamaji::Kamaji as _;
+                native.teardown_workload(&workload_spec::MeshIdent(ident.clone())).await.unwrap();
+            }
+
+            // R1021-T6: a record written before R1021-F3 has no digest, and its
+            // replay forks members without one. They are fully adopted.
+            for ident in &owned {
+                native.deploy_with_digest(&fork(ident), &mesh, None).await.unwrap();
+            }
+            assert!(
+                adopted_with_digest(&native, &owned, None).await.0,
+                "digest-less members of a digest-less record are adopted, not replayed"
+            );
+            assert!(!adopted_with_digest(&native, &owned, Some("d")).await.0);
+            for ident in &owned {
+                use kamaji::Kamaji as _;
+                native.teardown_workload(&workload_spec::MeshIdent(ident.clone())).await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn shutdown_leaves_a_shimmed_keep_alive_bundle_running() {
+            use kamaji::Kamaji as _;
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let backend = BundleBackend::new(
+                Arc::clone(&store),
+                cache.path(),
+                state.path(),
+                kamaji::observe::Collector::disabled(),
+            )
+            .with_shim(super::shim_test_launcher());
+            let native = Arc::clone(&backend.native);
+            assert!(native.workloads_survive_supervisor());
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(10_212),
+                    id: WorkloadId::new("yah-marketing"),
+                    spec: serve_bundle_workload_on_port(&digest, BundleLifecycle::KeepAlive, None),
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::DeployAck { .. }), "got {reply:?}");
+            await_deploy_ok(&ctx, "yah-marketing").await;
+            let listed = native.list_workloads().await.unwrap();
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            let pid: u32 = listed[0]
+                .container_id
+                .trim_start_matches("native-")
+                .parse()
+                .unwrap();
+            let alive = |pid: u32| {
+                std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            };
+
+            ctx.stop_workloads_for_shutdown(std::time::Duration::from_secs(15)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(alive(pid), "a shimmed keep-alive bundle must survive kamaji's shutdown");
+            assert_eq!(native.list_workloads().await.unwrap().len(), 1);
+
+            native.teardown_workload(&listed[0].ident).await.unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while alive(pid) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(!alive(pid), "teardown must stop the shimmed bundle process");
+        }
+
+        /// R1021-F7: an on-demand bundle's listener lives in a JIT shim, so
+        /// kamaji's shutdown leaves it bound (connections queue for the next
+        /// kamaji's adopted shim to fork on) and teardown still closes it.
+        #[tokio::test]
+        async fn shutdown_leaves_a_shimmed_on_demand_bundle_listening() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
+            let digest = publish_self_bundle(store.as_ref(), true);
+            let cache = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let backend = BundleBackend::new(
+                Arc::clone(&store),
+                cache.path(),
+                state.path(),
+                kamaji::observe::Collector::disabled(),
+            )
+            .with_shim(super::shim_test_launcher());
+            let jit = Arc::clone(&backend.jit);
+            assert!(jit.workloads_survive_supervisor());
+            let ctx = Arc::new(ServerCtx::new().with_bundle_backend(backend));
+            let lifecycle = BundleLifecycle::OnDemand {
+                idle_ttl: workload_spec::Millis::from_secs(30),
+            };
+            let reply = handle_message(
+                YubabaToKamaji::Deploy {
+                    request_id: RequestId(10_213),
+                    id: WorkloadId::new("on-demand-site"),
+                    spec: serve_bundle_workload_on_port(&digest, lifecycle, None),
+                    mesh: None,
+                },
+                &ctx,
+            )
+            .await;
+            assert!(matches!(reply, KamajiToYubaba::DeployAck { .. }), "got {reply:?}");
+            await_deploy_ok(&ctx, "on-demand-site").await;
+            let listed = jit.list_workloads().await;
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            let port = *listed[0].ports.values().next().expect("a held port");
+            let socket = state
+                .path()
+                .join("on-demand-site")
+                .join(kamaji::shim::SOCKET_NAME);
+            assert!(socket.exists(), "the on-demand bundle is not shim-held");
+
+            ctx.stop_workloads_for_shutdown(std::time::Duration::from_secs(15)).await;
+            assert_eq!(jit.list_workloads().await.len(), 1);
+            assert!(socket.exists(), "shutdown ended the JIT shim");
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+                "the held listener must stay bound across kamaji's shutdown"
+            );
+
+            jit.teardown_workload(&listed[0].ident).await.unwrap();
+            assert!(!socket.exists(), "teardown must end the JIT shim");
         }
 
         /// [`await_deploy`], asserting the deploy succeeded.
@@ -9239,6 +10196,34 @@ mod tests {
             }
         }
 
+        /// Poll `DeployStatus` until it carries a retry reason, returning the
+        /// state it carried it in (R983-B2).
+        async fn await_retry_reported(ctx: &Arc<ServerCtx>, id: &str) -> (WorkloadState, String) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut last = None;
+            loop {
+                let reply = handle_message(
+                    YubabaToKamaji::DeployStatus {
+                        request_id: RequestId(986),
+                        id: WorkloadId::new(id),
+                    },
+                    ctx,
+                )
+                .await;
+                if let KamajiToYubaba::DeployStatusResult { state, detail, .. } = reply {
+                    if let Some(detail) = detail {
+                        return (state, detail);
+                    }
+                    last = Some(state);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{id} never reported a retry; last state {last:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
         async fn r983_stop(ctx: &Arc<ServerCtx>, id: &str) {
             let _ = handle_message(
                 YubabaToKamaji::Stop {
@@ -9254,9 +10239,14 @@ mod tests {
         /// materialize then fails on a blob GET, and the predecessor keeps
         /// serving the OLD bundle. Before R983-B1 that was the node's final
         /// state — record says new, `ps` says old, nothing reconciles. Now the
-        /// failure is still reported (a polling caller fails loudly), the old
-        /// process keeps serving meanwhile, and the run retries until the serve
-        /// child's `--bundle` dir is the recorded digest.
+        /// failure is still reported, the old process keeps serving meanwhile,
+        /// and the run retries until the serve child's `--bundle` dir is the
+        /// recorded digest.
+        ///
+        /// R983-B2: a GET that fails on I/O is transient, so it is reported as
+        /// `Pending` with the reason, never `Failed`. A polling apply treats
+        /// `Failed` as final, and noisetable's apply aborted on exactly this
+        /// shape while the retry went on to converge.
         #[tokio::test]
         async fn a_failed_bundle_run_retries_until_the_node_serves_the_recorded_digest() {
             let inner: Arc<dyn ObjectStore> = Arc::new(InMemoryObjectStore::new());
@@ -9273,10 +10263,14 @@ mod tests {
 
             store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
             r983_deploy(&ctx, "site", &new).await;
-            let (state, detail) = await_deploy(&ctx, "site").await;
-            assert_eq!(state, WorkloadState::Failed, "the injected GET failure must surface");
-            let detail = detail.unwrap_or_default();
-            assert!(detail.contains("retrying"), "Failed must say it is retrying: {detail}");
+            let (state, detail) = await_retry_reported(&ctx, "site").await;
+            assert_eq!(
+                state,
+                WorkloadState::Pending,
+                "a transient GET failure is in flight, not Failed: {detail}"
+            );
+            assert!(detail.contains("error sending request"), "the reason must surface: {detail}");
+            assert!(detail.contains("retrying"), "the detail must say it is retrying: {detail}");
             let argv = serving_argv(&ctx, "site").await.expect("predecessor still supervised");
             assert!(
                 argv.contains(&old),
@@ -9661,6 +10655,7 @@ mod tests {
                 },
                 revalidate: None,
                 mesh: None,
+                spec_digest: None,
             };
             backend.record_deploy(&record).unwrap();
 

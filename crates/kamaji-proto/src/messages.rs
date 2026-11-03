@@ -187,6 +187,15 @@ pub enum WorkloadState {
     /// this state. That is exactly what the [`crate::ProtocolVersion`] bump to
     /// `V11` exists to refuse.
     OomKilled,
+    /// The workload's `WorkloadSpec::deadline` fired and kamaji killed it
+    /// (R1019-F2, W384 §2.3). Terminal and never restarted.
+    ///
+    /// Like [`Self::OomKilled`], a **refinement of [`Self::Failed`]**: every
+    /// consumer that treats `Failed` as down treats this identically; it adds
+    /// the *why*, so the lease that granted the deadline can close with it.
+    /// Appended last (discriminant 7); that is what the `V14` bump refuses an
+    /// unbumped peer.
+    DeadlineExceeded,
 }
 
 /// Compact snapshot of one workload — returned in
@@ -764,6 +773,37 @@ pub enum KamajiToYubaba {
 /// either fails the decode loudly, and a new capability either gets a default
 /// that genuinely means "cannot" or costs a [`ProtocolVersion`] bump.
 /// `tests/tolerant_field_policy.rs` pins which fields are which.
+///
+/// @yah:ticket(R1019-F2, "lease_id and deadline on WorkloadSpec, enforced by kamaji on its own monotonic clock, plus a NodeCapabilities field (default cannot) that says it enforces them")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:at(2026-10-27T02:45:19Z)
+/// @yah:phase(P1)
+/// @yah:parent(R1019)
+/// @yah:next("Tier: Warrior. Add `lease_id: Option<...>` and `deadline: Option<Millis>` to WorkloadSpec with `#[serde(default)]`; absent means no lease and no deadline. `deadline` is a runtime DURATION kamaji arms when the workload starts, never a wall-clock instant (W384 §2.3).")
+/// @yah:verify("cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-proto --test tolerant_field_policy stays green with the new fields NOT on the frozen list (they cross a skew).")
+/// @yah:gotcha("The tolerant envelope is also the trap: an old kamaji silently drops `deadline`. The capability field must default to \"cannot\" per the rule at messages.rs:756, so a scheduler never grants a deadline lease on a kamaji that would ignore it.")
+/// @arch:see(.yah/docs/working/W384-fleet-build-leases.md)
+/// @yah:files(oss/yah-base/crates/workload-spec/src/lib.rs)
+/// @yah:files(oss/kamaji/crates/kamaji-proto/src/messages.rs)
+/// @yah:files(oss/kamaji/crates/kamaji-proto/tests/tolerant_field_policy.rs)
+/// @yah:next("Kamaji arms the deadline at workload start, kills the workload when it fires with no network involved, and reports a distinct terminal reason (deadline exceeded, beside R885's OomKilled) so the lease closes with it.")
+/// @yah:next("Report the capability from kamaji's CapabilitiesReport only when this binary enforces the deadline. Carry `lease_id` as an annotation on the supervised spec too, so a restarted yubaba can rebuild its grant table from kamaji List + Describe (R1019 grant-table ticket).")
+/// @yah:verify("A kamaji unit test: a workload with a 1 s deadline is killed and reports the deadline reason; one without a deadline runs to completion.")
+/// @yah:handoff("WorkloadSpec (oss/yah-base/crates/workload-spec/src/lib.rs) gained lease_id: Option<String> and deadline: Option<Millis>, both #[serde(default)] + ts optional. NodeCapabilities gained deadline_enforced: bool (#[serde(default)] = cannot), set true only in kamaji-bin server.rs CapabilitiesReport; yubaba leader.rs test literal sets false.")
+/// @yah:handoff("Kamaji: new WorkloadStatus::DeadlineExceeded{deadline_ms} (terminal, in is_terminal). native.rs NativeProcess arms deadline_at once at deploy on tokio monotonic Instant; wait() selects child vs sleep_until, on fire sets deadline_fired and stop_child (SIGTERM/grace/SIGKILL); settle() returns DeadlineExceeded ahead of OOM classification. supervise.rs never restarts a DeadlineExceeded completion regardless of RestartPolicy. Wire: server.rs maps DeadlineExceeded to WireState::Failed in both mapping sites; yubaba service_records.rs maps it to NotReady 'deadline exceeded'. lease_id is carried on the spec itself (Describe returns the spec), no extra annotation was added.")
+/// @yah:handoff("~46 WorkloadSpec struct literals got lease_id/deadline None (inserted after 'durability: None,'); the roadcase-gateway AppState hit was a false match and was reverted by hand (its remaining db/capabilities errors there are not from this ticket).")
+/// @yah:verify("PASS: cargo test -p kamaji-proto --test tolerant_field_policy: 6 passed, 0 failed (new fields not on frozen lists).")
+/// @yah:verify("PASS: cargo test -p kamaji --features native-integration --lib native::tests:: : 41 passed incl. a_deadline_kills_the_workload_and_reports_the_deadline_reason (1s deadline -> DeadlineExceeded{1000}) and no_deadline_runs_to_completion. NOTE: without --features native-integration these tests are filtered out.")
+/// @yah:verify("PASS compile: oss/kamaji cargo check --workspace --tests, kamaji-bin --features native-exec --tests, oss/yah-base workspace --tests. oss/yubaba --tests: 2 errors only in tests/raft_appliance_ownership.rs (spawn arity, not from this change). NOT VERIFIED: root workspace (yah-hub, camp-service, desktop) and roadcase compile after the roadcase fix - the builds were killed by the background time limit / never got a lane.")
+/// @yah:gotcha("Wire gap: DeadlineExceeded crosses the UDS as WireState::Failed. A distinct wire state needs a WorkloadState variant appended and a ProtocolVersion bump (like OomKilled/V11); not done here.")
+/// @yah:gotcha("Unverified root-workspace literals: crates/yah/hub, camp-service, app/yah/desktop shell_host were edited by the same sed but not compiled.")
+/// @yah:handoff("LEADER FOLLOW-UP DONE: WorkloadState::DeadlineExceeded appended (discriminant 7, kamaji-proto messages.rs). ProtocolVersion bumped to V14, NOT folded into V13: the 0.8.48 release commit ae1f7940 already has CURRENT=V13 and R971-B10 rolled kamaji at V13 to the x86 nodes, so V13 is released (the leader's V11/V12 numbering was one tree behind). Stanza added in version.rs. WorkloadStatus::DeadlineExceeded lost its deadline_ms payload (the wire cannot carry it; the spec does). Mapped in both kamaji-bin server.rs sites (WireState::DeadlineExceeded, liveness_rank 1, deploy-terminal check), sibling.rs return leg, yubaba service_records.rs and workload_reconcile.rs holds_a_copy, cloud-admin status class, cli cloud.rs colour + test list. Nothing maps it to Failed anymore.")
+/// @yah:handoff("Roadcase confirmation: the reverted hunk in roadcase-gateway/src/lib.rs was exactly the two lines (lease_id/deadline) my sed inserted after 'durability: None,'; git diff for that file is empty now, so nothing a peer wrote was touched. Its remaining errors (AppState has no db/capabilities) are in committed code, not from this ticket.")
+/// @yah:verify("PASS: kamaji-proto full suite 45+4+6 passed incl. tolerant_field_policy 6/0 and the codec discriminant test (DeadlineExceeded = 7); kamaji native::tests:: 41/0 (1 s deadline -> DeadlineExceeded; no deadline runs to completion); kamaji-bin an_oom_kill_reaches test (now also asserts WireWorkloadState::DeadlineExceeded) 1/0.")
+/// @yah:verify("PASS compile: oss/yubaba -p yubaba --lib --tests; yah-hub, camp-service, yah-cloud-admin checked clean. NOT VERIFIED: desktop and the yah cli crate - blocked by a peer's in-flight error in app/yah/cli/src/fleet_usage.rs (FleetUsageEntry has no field 'grants'), unrelated to this ticket; the cli cloud.rs edits are string-literal additions only. Earlier agent-tools BuildAdmitParams 'placeable' error was also a peer's.")
+/// @yah:verify("R1019-F4 courier 2026-10-27: cargo check -p yah --tests EXIT=0 and cargo check -p desktop --tests EXIT=0 on the tree carrying F2's WorkloadSpec lease_id/deadline literals; no literal needed fixing.")
+/// @yah:handoff("FYI 2026-10-27 from R1019-F28 (@Glimmerstone:polaris, session:9084cdc3): xtask schema_drift::committed_schemas_match_current_rust_types was red on .yah/schema/workload.toml.schema.json for this ticket's WorkloadSpec lease_id/deadline fields. Regenerated with `cargo run -p xtask -- emit-schemas` (only that file changed, +20 lines); xtask --test main now 79/0. workload-spec ts_drift was already green (1/0).")
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilities {
     /// Whether this Kamaji can fork+exec a native (non-container) workload —
@@ -807,6 +847,13 @@ pub struct NodeCapabilities {
     /// re-arms every tail itself on restart, floaters included.
     #[serde(default)]
     pub arm_tail: bool,
+    /// Whether this Kamaji arms `WorkloadSpec::deadline` at workload start on
+    /// its own monotonic clock and kills the workload when it fires
+    /// (R1019-F2, W384 §2.3). Defaults to `false`, which genuinely means
+    /// "cannot": a Kamaji that predates the field silently drops `deadline`,
+    /// so a scheduler must not grant a deadline lease on it.
+    #[serde(default)]
+    pub deadline_enforced: bool,
 }
 
 /// Live microVM-backend health, folded into [`NodeCapabilities`] (R605-T27).
@@ -971,6 +1018,7 @@ mod reply_correlation_tests {
                     log_stream: true,
                     exec: true,
                     arm_tail: true,
+                    deadline_enforced: true,
                 },
             },
             // R870-B24: a `None` spec is still an ANSWER to a request, so it

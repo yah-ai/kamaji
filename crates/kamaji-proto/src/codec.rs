@@ -676,6 +676,8 @@ mod tests {
                 m
             },
             durability: None,
+            lease_id: None,
+            deadline: None,
             db: Vec::new(),
             capabilities: Vec::new(),
             annotations: {
@@ -1328,6 +1330,7 @@ mod tests {
             (WorkloadState::Failed, 5),
             // The new one, and the only byte an unbumped V10 peer cannot read.
             (WorkloadState::OomKilled, 6),
+            (WorkloadState::DeadlineExceeded, 7),
         ] {
             let bytes = postcard::to_allocvec(&state)
                 .expect("a fieldless enum always encodes");

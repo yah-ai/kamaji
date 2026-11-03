@@ -230,11 +230,25 @@
 //! @yah:verify("A SELF-CAUGHT TEST BUG worth recording, because it is the kind that produces a false negative: the courier's first service-e2e assertion failed and it correctly diagnosed its own off-by-one — the scratch disk DOES persist; the 3rd instance is torn down mid-run before it can write — rather than concluding the feature was broken.")
 //! @yah:verify("NO PROTO, NO kamaji-bin, NO SYSTEMD SANDBOX CHANGE was needed and none was made. ProtocolVersion stays V9, so us-west-003's 0.8.38-h2 pairing is undisturbed and no re-ship is forced.")
 //! @yah:verify("UNCOMMITTED BY CAMP POLICY (git policy is 'defer'), against tree anchor e896d28a. The courier left the exact staging command for the operator's sweep, scoped to this ticket's five files and deliberately excluding sibling.rs.")
+//!
+//! @yah:ticket(R1021-F8, "Service-shaped microVMs survive kamaji: the shim parents Firecracker in its own leaf, and the boot pass adopts it instead of killing it")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-10-27T09:36:19Z)
+//! @yah:phase(P2)
+//! @yah:parent(R1021)
+//! @yah:next("Firecracker is forked with no cgroup leaf today, so it lives in kamaji's own native/ subgroup. Give it a leaf, spawn it through the shim, and change R1021-F3's native/-stray row so an adopted VM is skipped and R605-F16's replay does not run for it.")
+//! @yah:gotcha("Until this lands, R1021-F3 must KILL any Firecracker that survives a KillMode=process restart — a survivor plus R605-F16's replay is two VMs on one private root disk.")
+//! @arch:see(.yah/docs/working/W386-kamaji-restart-without-workload-downtime.md)
+//! @yah:gotcha("The leader sequenced this after R1021-F7, because both edit kamaji/src/shim.rs, boot.rs and native.rs on the shared tree.")
+//! @yah:depends_on(R1021-F7)
+//! @yah:handoff("Ashguard (courier session:f0e01171), 2026-10-27. BASELINE before edits: kamaji --features native-integration,microvm-integration --lib 304/0 (microvm-integration has its own feature; kamaji-bin's is `microvm`). kamaji-bin --features native-exec,bundle-serving,microvm 316+2+2+1/0. POST: kamaji native-integration --lib 256/0 (was 255, +1 boot test); kamaji native-integration,microvm-integration --lib 307/0 (+3); kamaji-bin native-exec,bundle-serving 316+2+2+1/0; kamaji-bin native-exec,bundle-serving,microvm 316+2+2+1/0 (no new kamaji-bin test). cargo check -p kamaji-bin on default features EXIT 0. cargo check -p kamaji-bin --features microvm --tests EXIT 0. cargo check -p kamaji --features microvm-integration --tests --target aarch64-unknown-linux-gnu EXIT 0. kamaji-bin was not cross-checked (the known ring limit). WHAT CHANGED. (1) kamaji Cargo.toml: microvm-integration now implies native-integration, so shim, boot, LaunchPlan and Proc are always present with the VM backend. (2) native.rs: Proc and its methods are pub(crate) so microvm reuses them. LaunchPlan gains `confine: bool`. false skips landlock and the cap drop and is used only for a VMM (the guest is the boundary; a guest-spec ruleset would deny /dev/kvm, the TAP and the disk images). The cgroup attach and disclaim still run. When stdout == stderr, LaunchPlan::build now reuses one fd (the console). native adopt_survivors also records the adopted child pid in Keep.child_pids. (3) boot.rs: Keep gains child_pids. The native/ stray row skips kept child pids and kept shim pids; everything else in native/ is still TERM->grace->KILL, including a pre-F8 leafless Firecracker. That is the migration path: it is killed once and replayed into a leaf. The module doc table is updated. (4) microvm.rs: MicroVmRuntime gets cgroup (resolve_cgroup_root(\"microvm\", state_dir), the same delegated root native uses) and with_shim(launcher). Its deploy is now deploy_with_digest(spec, mesh, Option<String>); the trait deploy_workload passes None. Steps 6-7 moved into launch_guest(GuestLaunch): cg.destroy_workload(ident) (never beside a populated leaf), then create_workload(ident, vmm_limits), then boot, with the leaf destroyed if the boot fails, then supervise_guest (shared with adoption). vmm_limits sets cpu.weight from the spec and the spec's pids_max, and deliberately NO memory.max (R885-B10's exclusion stands; the comment that described the leafless fork is rewritten). GuestBoot::boot builds a native LaunchPlan with argv [vmm, --no-api, --config-file, vm-config.json] and console.log for both streams. SHAPES: microvm.rs distinguishes them (VmShape). A SERVICE on a shimmed runtime persists spec.json (shim::PersistedSpec) and <vm_dir>/vm.json {slot_index}, then launches a process-mode shim (in _shim, never in the VM leaf) on <vm_dir>/shim.sock. A JOB keeps its current semantics: direct fork (now inside its own leaf), torn down at shutdown, never adopted, never replayed. There is no API socket to persist because it runs --no-api. The TAP and addresses are re-derived from slot_index via GuestSlot::derive; disk, console and config sit at fixed names. BootedGuest holds Proc; stop goes TERM->grace->KILL through Proc (via the shim's signal verb when shimmed), and outlives_supervisor is true for Proc::Shim. VmHandle gains survives, spec_digest and cgroup. New pub API: survives_supervisor(&ident), deployed_digest(ident), cgroup_root(), adopt_survivors() -> native::Adoption. Adoption requires all of: a process-mode shim; sanitize(hello.ident) == the dir name; the spec.json identity matches; the shape is Service; boot_id matches; child_start matches when the child is alive; the generation leaf exists and holds the child where cgroup.procs is readable (gen \\\"0\\\" when there is no cgroup); vm.json is readable; the slot is not held by another guest; vm-config.json exists. Teardown now also destroys the leaf and removes vm.json. (5) kamaji-bin: main.rs routes `kamaji shim` and runs boot_pass under `microvm` too, and the microVM runtime is built .with_shim(ShimLauncher::this_binary()). boot_pass (cfg widened to microvm) adopts microVMs, records adopted digests, extends keep (including child_pids, for native and jit as well), and falls back to microvm.cgroup_root() for the reap. deploy_microvm takes spec_digest; deploy_container_backend passes it. resume_microvm_workloads skips the replay when microvm.deployed_digest(ident) == spec_digest(record.workload), then calls set_deployed_spec; otherwise it replays with the digest. stop_workloads_for_shutdown skips a guest when microvm.survives_supervisor(ident) is true; the survives_supervisor() doc is updated. PRE-EXISTING FIX: a microvm-only kamaji-bin build did not compile (the Kamaji trait was not in scope for list_workloads/teardown_workload/health), so `microvm` was added to the module-level `use kamaji::Kamaji as _` gate. TESTS. microvm::tests::an_adopted_service_vm_keeps_its_pid_across_a_runtime_rebuild uses a STAND-IN VMM: a /bin/sh script that execs sleep in place of firecracker, run through the real launch path (launch_guest, LaunchPlan, a real out-of-process kamaji shim, the FIXTURE tempdir cgroup leaf, spec.json and vm.json). Steps 1-5 of deploy (mkfs scratch disk, root provisioning, TAP) are skipped because they need e2fsprogs and CAP_NET_ADMIN. The test launches, drops the runtime and its tokio runtime, and the VMM is still alive. A new runtime then adopts it at the same pid with digest d1gest, Running, microvm-<pid>, slot 0 rebuilt, survives true, and child_pids holding the pid. reap_unadopted spares it, and teardown kills it. microvm::tests::a_job_vm_is_forked_directly_in_its_own_leaf_and_does_not_survive checks: no shim.sock, survives false, a leaf node minted, not adopted, killed by teardown. boot::tests::an_adopted_vm_is_spared_while_a_leafless_vmm_in_native_is_killed uses a fixture cgroupfs and real sleeps; the adopted VMM pid is listed in native/ and its leaf and is spared, the kept shim is spared, and a legacy VMM in native/ is killed. NOT COVERED: the replay skip in resume_microvm_workloads and boot_pass's microVM branch are not driven end to end in kamaji-bin; the kamaji test asserts the deployed_digest equality the skip reads. Real Firecracker, the TAP, real cgroup membership and the _shim join are compiled for aarch64 but never run. W386 is not updated for F8.")
+//! @yah:handoff("Leader: service-shaped microVMs now run Firecracker in their own cgroup leaf under a process-mode kamaji shim, which persists spec.json and vm.json. The boot pass adopts them, and R605-F16's replay is skipped when the digest matches. Shutdown leaves them running. The native/ stray row spares adopted children but still kills a leafless VMM from before F8, which is the migration path. Job-shaped VMs are still forked directly, now inside a leaf, and are torn down at shutdown. microvm-integration now implies native-integration, and a microvm-only kamaji-bin build that was already broken was fixed along the way. Courier counts: kamaji native-integration 256/0, native+microvm 307/0 (was 304), kamaji-bin 316+2+2+1/0.")
+//! @yah:verify("Real Firecracker adopted across `systemctl restart kamaji` on a microVM-capable Linux node; the disk and TAP deploy steps run live")
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -247,6 +261,9 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use workload_spec::{EnvValue, RestartPolicy, VolumeSource, WorkloadSpec};
 
+use crate::cgroup::{CgroupHandle, CgroupV2, WorkloadLimits};
+use crate::native::{LaunchPlan, Proc};
+use crate::shim::ShimLauncher;
 use crate::supervise::{supervise, Completion, Ctrl, Exit, Supervised};
 use crate::{
     Backend, DeployResult, Kamaji, LogEvent, LogOpts, LogStream, LogStreamKind, MeshAssignment,
@@ -1180,7 +1197,9 @@ pub fn guest_vcpus(cfg: &MicroVmConfig, spec: &WorkloadSpec) -> u32 {
 /// The supervisor's unit of work — [`crate::supervise`]'s `Instance` for this
 /// backend, exactly as `SpawnedChild` is for [`crate::native`].
 struct BootedGuest {
-    child: tokio::process::Child,
+    /// Forked here (a job), or parented by a `kamaji shim` (a service on a
+    /// shimmed runtime, R1021-F8) — the native backend's own [`Proc`].
+    proc: Proc,
     pid: u32,
 }
 
@@ -1203,6 +1222,33 @@ struct GuestBoot {
     plan: Vec<workspace::PlannedMount>,
     slot: Option<GuestSlot>,
     net: Option<GuestNetwork>,
+    /// The mesh identity the shim and the cgroup leaf are keyed by (R1021-F8).
+    ident: String,
+    vm_dir: PathBuf,
+    /// Carried only into the launch plan and `spec.json` (R1021-F8): the plan
+    /// type is the native backend's, and the next kamaji adopts from the file.
+    /// No boot decision reads it — see above.
+    spec: WorkloadSpec,
+    mesh_ip: Ipv4Addr,
+    spec_digest: Option<String>,
+    /// `<root>/<ident>/<generation>/`, the VMM's own leaf (R1021-F8). No
+    /// `memory.max` on it — see [`vmm_limits`].
+    cgroup: Option<CgroupHandle>,
+    /// Set for a service on a shimmed runtime: its VMM outlives kamaji.
+    shim: Option<ShimLauncher>,
+}
+
+/// What [`MicroVmRuntime::launch_guest`] boots: a deploy's resolved machine.
+struct GuestLaunch<'a> {
+    spec: &'a WorkloadSpec,
+    mesh_ip: Ipv4Addr,
+    shape: VmShape,
+    vm_dir: PathBuf,
+    config_path: PathBuf,
+    disk: PathBuf,
+    plan: Vec<workspace::PlannedMount>,
+    slot: Option<GuestSlot>,
+    spec_digest: Option<String>,
 }
 
 /// One live guest's host-side bookkeeping.
@@ -1214,6 +1260,11 @@ struct VmHandle {
     /// What this workload is, which is what decides whether
     /// [`MicroVmRuntime::restart_workload`] means anything for it.
     shape: VmShape,
+    /// Shim-parented, so kamaji's own shutdown leaves it running (R1021-F8).
+    survives: bool,
+    /// R870-B24's digest it was deployed (or adopted) with, hex.
+    spec_digest: Option<String>,
+    cgroup: Option<CgroupHandle>,
     pid: Arc<AtomicU32>,
     status: watch::Receiver<WorkloadStatus>,
     /// Control channel to the supervisor task, which owns the VMM process.
@@ -1237,50 +1288,96 @@ impl GuestBoot {
     /// console capture, every later one appends, so a crash-looping service's
     /// history survives the loop that produced it.
     async fn boot(&self, truncate: bool) -> Result<BootedGuest> {
-        let console = if truncate {
-            std::fs::File::create(&self.console_path)
-        } else {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.console_path)
-        }
-        .with_context(|| format!("opening {}", self.console_path.display()))?;
-
-        // R885-B10 — THE THIRD FORK PATH, and the one deliberately NOT attached
-        // to a cgroup leaf. `native` (keep-alive) and `jit` (on-demand) both put
-        // their children inside `<delegated-root>/<workload-id>/<generation>/`
-        // before `exec`; this one does not, and the reason is that the ceiling
-        // is already expressed somewhere else: a microVM's memory is the
-        // `mem_size_mib` written into its machine config, enforced by the VMM
-        // and by the guest kernel's own view of RAM, and the vCPU count is the
-        // cpu allocation. Wrapping a `memory.max` around the VMM process would
-        // put a second, independent ceiling on the same workload, and the one
-        // that fired first would be an OOM kill of the whole VM with no OOM
-        // inside the guest to explain it.
+        // R1021-F8 — the VMM sits in its own leaf, `<root>/<ident>/<gen>/`,
+        // attached by `CgroupHandle::attach_at_exec` through the native
+        // backend's one builder, as R885-B10's note here always said it should
+        // be if it ever was. The leaf carries NO `memory.max` (see
+        // [`vmm_limits`]): the guest's RAM is its `mem_size_mib`, and a second
+        // ceiling would be an OOM kill of the whole VM with nothing in the
+        // guest to explain it. The leaf is for identity — the boot pass reads
+        // it to tell an adopted VM from a stray — plus `pids.max`.
         //
-        // This is a stated exclusion, not an oversight — if a later ticket
-        // decides the VMM *should* also sit in a leaf (for `pids.max`, or to
-        // bound VMM overhead above the guest's RAM), the mechanism to use is
-        // `CgroupHandle::attach_at_exec`, the same one both other paths use. Do
-        // not grow a second one here.
-        let child = tokio::process::Command::new(&self.vmm_bin)
-            .arg("--no-api")
-            .arg("--config-file")
-            .arg(&self.config_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(console.try_clone()?))
-            .stderr(Stdio::from(console))
-            .kill_on_drop(false)
-            .spawn()
-            .with_context(|| {
+        // The guest console is the workload's log: one file for both streams.
+        // `confine: false` — the guest is this workload's boundary, and a
+        // ruleset derived from its spec would deny the VMM `/dev/kvm`.
+        let plan = LaunchPlan {
+            argv: vec![
+                self.vmm_bin.to_string_lossy().into_owned(),
+                "--no-api".into(),
+                "--config-file".into(),
+                self.config_path.to_string_lossy().into_owned(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            stdout: self.console_path.clone(),
+            stderr: self.console_path.clone(),
+            truncate_logs: truncate,
+            cgroup: self.cgroup.clone(),
+            workload_dir: self.vm_dir.clone(),
+            spec: self.spec.clone(),
+            confine: false,
+        };
+
+        if let Some(launcher) = &self.shim {
+            // A service's VMM is parented by `kamaji shim` in the shared
+            // `_shim` leaf, so it outlives this kamaji; `spec.json` and
+            // `vm.json` are what the next one adopts it from.
+            crate::shim::persist_spec(
+                &self.vm_dir,
+                &crate::shim::PersistedSpec {
+                    spec_digest: self.spec_digest.clone(),
+                    mesh_ip: self.mesh_ip,
+                    spec: self.spec.clone(),
+                },
+            )?;
+            VmState {
+                slot_index: self.slot.as_ref().map(|s| s.index),
+            }
+            .persist(&self.vm_dir)?;
+            let request = crate::shim::ShimRequest {
+                ident: self.ident.clone(),
+                generation: self
+                    .cgroup
+                    .as_ref()
+                    .map_or_else(|| "0".to_string(), |c| c.generation().to_string()),
+                spec_digest: self.spec_digest.clone(),
+                socket: self.vm_dir.join(crate::shim::SOCKET_NAME),
+                shim_cgroup: self.cgroup.as_ref().and_then(|c| {
+                    c.workload_path()
+                        .parent()
+                        .map(|root| root.join(crate::shim::SHIM_LEAF))
+                }),
+                plan,
+                jit: None,
+            };
+            let conn = crate::shim::launch(launcher, &request).await.with_context(|| {
                 format!(
-                    "spawning {} — is firecracker installed and is /dev/kvm openable?",
+                    "starting the shim for microVM {} ({}) — is firecracker installed and is \
+                     /dev/kvm openable?",
+                    self.workload,
                     self.vmm_bin.display()
                 )
             })?;
+            let pid = conn.hello.child_pid;
+            return Ok(BootedGuest {
+                proc: Proc::Shim(conn),
+                pid,
+            });
+        }
+
+        let mut cmd = tokio::process::Command::from(plan.command()?);
+        cmd.kill_on_drop(false);
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "spawning {} — is firecracker installed and is /dev/kvm openable?",
+                self.vmm_bin.display()
+            )
+        })?;
         let pid = child.id().unwrap_or(0);
-        Ok(BootedGuest { child, pid })
+        Ok(BootedGuest {
+            proc: Proc::Direct(child),
+            pid,
+        })
     }
 
     /// Free this guest's TAP device, warning rather than failing.
@@ -1490,7 +1587,7 @@ impl Supervised for GuestBoot {
     }
 
     async fn wait(&self, inst: &mut BootedGuest) -> Exit {
-        inst.child.wait().await
+        inst.proc.wait().await
     }
 
     /// Boot the guest again from the machine definition already on disk.
@@ -1517,17 +1614,25 @@ impl Supervised for GuestBoot {
     /// completion path for either shape — the normal path is the guest going
     /// away on its own, which the supervisor sees as the VMM process exiting.
     async fn stop(&self, inst: &mut BootedGuest) {
-        if matches!(inst.child.try_wait(), Ok(Some(_))) {
+        if inst.proc.try_exit().is_some() {
+            // Releases a shim's latched exit, which ends that shim.
+            let _ = inst.proc.wait().await;
             return;
         }
-        signal_pid(inst.pid, libc::SIGTERM);
-        if tokio::time::timeout(TERM_GRACE, inst.child.wait())
+        inst.proc.signal(inst.pid, libc::SIGTERM).await;
+        if tokio::time::timeout(TERM_GRACE, inst.proc.wait())
             .await
             .is_err()
         {
-            let _ = inst.child.start_kill();
-            let _ = inst.child.wait().await;
+            inst.proc.kill(inst.pid).await;
+            let _ = inst.proc.wait().await;
         }
+    }
+
+    /// A shim-parented VMM is left running when the runtime is dropped
+    /// (R1021-F8): that is the event the shim exists to survive.
+    fn outlives_supervisor(&self, inst: &BootedGuest) -> bool {
+        matches!(inst.proc, Proc::Shim(_))
     }
 
     async fn settle(&self, exit: Exit) -> Completion {
@@ -1543,6 +1648,11 @@ impl Supervised for GuestBoot {
 pub struct MicroVmRuntime {
     cfg: MicroVmConfig,
     vms: Mutex<HashMap<String, VmHandle>>,
+    /// The delegated root each VMM gets a leaf under (R1021-F8). `None` on a
+    /// host with no delegated cgroup v2 subtree.
+    cgroup: Option<CgroupV2>,
+    /// Parent for service-shaped VMMs (R1021-F8); see [`Self::with_shim`].
+    shim: Option<ShimLauncher>,
 }
 
 impl MicroVmRuntime {
@@ -1621,10 +1731,49 @@ impl MicroVmRuntime {
         if let Some(toolchain) = &cfg.toolchain_image {
             log_provenance("toolchain", toolchain);
         }
+        let cgroup = crate::native::resolve_cgroup_root("microvm", &cfg.state_dir);
         Ok(Self {
             cfg,
             vms: Mutex::new(HashMap::new()),
+            cgroup,
+            shim: None,
         })
+    }
+
+    /// Parent every service-shaped guest's VMM through `kamaji shim`
+    /// (R1021-F8), so the guest outlives this kamaji and the next one adopts
+    /// it ([`Self::adopt_survivors`]). Job-shaped guests keep the direct fork:
+    /// a job is torn down at shutdown and re-dispatched, never resumed.
+    pub fn with_shim(mut self, launcher: ShimLauncher) -> Self {
+        self.shim = Some(launcher);
+        self
+    }
+
+    /// Test seam: a fixture cgroup root (a tempdir) in place of the host's.
+    #[cfg(test)]
+    fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.cgroup = Some(CgroupV2::new(root));
+        self
+    }
+
+    /// Whether `ident`'s guest outlives kamaji, so a SIGTERM shutdown must
+    /// leave it running (R1021-T1's hook): true for a shim-parented service.
+    pub async fn survives_supervisor(&self, ident: &MeshIdent) -> bool {
+        self.vms
+            .lock()
+            .await
+            .get(&ident.0)
+            .is_some_and(|h| h.survives)
+    }
+
+    /// The digest `ident`'s live guest was deployed (or adopted) with.
+    pub async fn deployed_digest(&self, ident: &str) -> Option<String> {
+        self.vms.lock().await.get(ident)?.spec_digest.clone()
+    }
+
+    /// The delegated cgroup this runtime gives VMM leaves under, if any.
+    pub fn cgroup_root(&self) -> Option<&CgroupV2> {
+        self.cgroup.as_ref()
     }
 
     /// The node configuration this backend was built with.
@@ -1652,16 +1801,16 @@ impl MicroVmRuntime {
     }
 }
 
-#[async_trait]
-impl Kamaji for MicroVmRuntime {
-    fn backend(&self) -> Backend {
-        Backend::MicroVm
-    }
-
-    async fn deploy_workload(
+impl MicroVmRuntime {
+    /// [`Kamaji::deploy_workload`], carrying R870-B24's digest of the envelope
+    /// the caller deployed from (hex, opaque here). It rides into the shim's
+    /// `hello` and `spec.json`, which is what lets the next kamaji adopt a
+    /// service guest and skip R605-F16's replay of the same spec (R1021-F8).
+    pub async fn deploy_with_digest(
         &self,
         spec: &WorkloadSpec,
         mesh: &MeshAssignment,
+        spec_digest: Option<String>,
     ) -> Result<DeployResult> {
         if spec.replicas > 1 {
             return Err(anyhow!(
@@ -1776,7 +1925,70 @@ impl Kamaji for MicroVmRuntime {
             .await
             .with_context(|| format!("writing {}", config_path.display()))?;
 
-        // 6. Boot, and hand the guest to the shared supervisor.
+        // 6–7. A leaf, the boot, the supervisor.
+        let vm_pid = self
+            .launch_guest(GuestLaunch {
+                spec,
+                mesh_ip: mesh.mesh_ip,
+                shape,
+                vm_dir,
+                config_path,
+                disk,
+                plan,
+                slot,
+                spec_digest,
+            })
+            .await?;
+        tracing::info!(
+            workload = %spec.name, root = %root.path.display(), root_read_only = root.read_only,
+            "microVM root"
+        );
+
+        Ok(DeployResult {
+            container_id: format!("microvm-{vm_pid}"),
+            mesh_ip: mesh.mesh_ip,
+            task_pid: vm_pid,
+            hydrate: None,
+            // R844-F2: the guest owns its own network stack, so the declared
+            // port is the bound port — nothing for this backend to resolve.
+            ports: Default::default(),
+        })
+    }
+
+    /// Mint the VMM's leaf, boot it, and hand it to the supervisor — the part
+    /// of a deploy that runs once the guest's machine is on disk. Returns the
+    /// VMM's pid.
+    async fn launch_guest(&self, l: GuestLaunch<'_>) -> Result<u32> {
+        let GuestLaunch {
+            spec,
+            mesh_ip,
+            shape,
+            vm_dir,
+            config_path,
+            disk,
+            plan,
+            slot,
+            spec_digest,
+        } = l;
+        let ident = &spec.expose.mesh.identity;
+        // 6. The VMM's own cgroup leaf (R1021-F8). Never beside a populated
+        //    one: every generation already under this ident is killed and
+        //    removed first — teardown above only reaches a guest this process
+        //    remembers, and a leaf is the ground truth of what still runs.
+        let cgroup = match &self.cgroup {
+            Some(cg) => {
+                if let Err(e) = cg.destroy_workload(&ident.0) {
+                    bail!("workload {}: cannot clear its previous cgroup leaf: {e}", spec.name);
+                }
+                Some(
+                    cg.create_workload(&ident.0, &vmm_limits(spec))
+                        .with_context(|| format!("creating the cgroup leaf for {}", spec.name))?,
+                )
+            }
+            None => None,
+        };
+
+        // 7. Boot, and hand the guest to the shared supervisor.
         //
         //    The first boot happens here rather than inside the supervisor so a
         //    boot failure (no firecracker, no /dev/kvm) surfaces to the caller
@@ -1794,58 +2006,274 @@ impl Kamaji for MicroVmRuntime {
             plan,
             slot: slot.clone(),
             net: self.cfg.network.clone(),
+            ident: ident.0.clone(),
+            vm_dir: vm_dir.clone(),
+            spec: spec.clone(),
+            mesh_ip,
+            spec_digest,
+            cgroup,
+            // Only a service survives kamaji; a job keeps the direct fork.
+            shim: (shape == VmShape::Service)
+                .then(|| self.shim.clone())
+                .flatten(),
         };
-        let console_path = boot.console_path.clone();
-        let initial = boot.boot(true).await?;
+        let initial = match boot.boot(true).await {
+            Ok(initial) => initial,
+            Err(e) => {
+                if let Some(cg) = &self.cgroup {
+                    let _ = cg.destroy_workload(&ident.0);
+                }
+                return Err(e);
+            }
+        };
         let vm_pid = initial.pid;
+        tracing::info!(
+            workload = %spec.name, shape = ?shape, pid = vm_pid,
+            shimmed = boot.shim.is_some(),
+            "microVM booted"
+        );
+        self.supervise_guest(boot, spec.restart_policy.clone(), initial)
+            .await;
+        Ok(vm_pid)
 
-        let pid = Arc::new(AtomicU32::new(vm_pid));
+    }
+
+    /// Hand a booted guest to the shared restart loop and register it — the
+    /// tail both a deploy and an adoption end in.
+    async fn supervise_guest(&self, boot: GuestBoot, policy: RestartPolicy, initial: BootedGuest) {
+        let pid = Arc::new(AtomicU32::new(initial.pid));
         let (status_tx, status_rx) = watch::channel(WorkloadStatus::Running);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        let ident = boot.ident.clone();
+        let slot = boot.slot.clone();
+        let mesh_ip = boot.mesh_ip;
+        let vm_dir = boot.vm_dir.clone();
+        let console_path = boot.console_path.clone();
+        let shape = boot.shape;
+        let survives = matches!(initial.proc, Proc::Shim(_));
+        let spec_digest = boot.spec_digest.clone();
+        let cgroup = boot.cgroup.clone();
         // One restart loop, shared with the native backend (crate::supervise).
-        // For a job the policy is `Never` — checked above — and the supervisor's
-        // handling of `Never` (settle, publish the terminal status, park) is
-        // precisely the behaviour this backend had when it had no supervisor at
-        // all, which is why the job path's observable semantics are unchanged.
+        // For a job the policy is `Never` — checked at deploy — and the
+        // supervisor's handling of `Never` (settle, publish the terminal
+        // status, park) is precisely the behaviour this backend had when it
+        // had no supervisor at all, which is why the job path's observable
+        // semantics are unchanged.
         let task = tokio::spawn(supervise(
             boot,
-            spec.restart_policy.clone(),
+            policy,
             initial,
             Arc::clone(&pid),
             status_tx,
             ctrl_rx,
         ));
-
-        tracing::info!(
-            workload = %spec.name, shape = ?shape, pid = vm_pid,
-            root = %root.path.display(), root_read_only = root.read_only,
-            "microVM booted"
-        );
-
         self.vms.lock().await.insert(
-            ident.0.clone(),
+            ident,
             VmHandle {
                 slot,
-                mesh_ip: mesh.mesh_ip,
+                mesh_ip,
                 vm_dir,
                 console_path,
                 shape,
+                survives,
+                spec_digest,
+                cgroup,
                 pid,
                 status: status_rx,
                 ctrl: ctrl_tx,
                 task,
             },
         );
+    }
 
-        Ok(DeployResult {
-            container_id: format!("microvm-{vm_pid}"),
-            mesh_ip: mesh.mesh_ip,
-            task_pid: vm_pid,
-            hydrate: None,
-            // R844-F2: the guest owns its own network stack, so the declared
-            // port is the bound port — nothing for this backend to resolve.
-            ports: Default::default(),
-        })
+    /// The boot pass's adoption half for guests (R1021-F8, W386 §2). Call
+    /// once, on a fresh runtime, BEFORE `resume_microvm_workloads` and before
+    /// [`crate::boot::reap_unadopted`].
+    ///
+    /// For each `<state_dir>/<vm dir>/shim.sock`: a process-mode shim that
+    /// answers with this kamaji's `proto`, names the ident `spec.json` names,
+    /// is on this boot, still parents the child it started, and reports a
+    /// generation leaf that exists (and, where `cgroup.procs` is readable,
+    /// holds that child) is adopted — a [`VmHandle`] goes back in the map,
+    /// `Running`, with a supervisor waiting on the shim's exit event, so the
+    /// service's [`RestartPolicy`] keeps working. Its machine is rebuilt from
+    /// disk exactly as a re-boot would read it: `vm-config.json`, the scratch
+    /// disk, `console.log`, and `vm.json`'s slot. Anything else is left for
+    /// the reap, which kills by leaf; its record then replays.
+    pub async fn adopt_survivors(&self) -> crate::native::Adoption {
+        let mut adoption = crate::native::Adoption::default();
+        if self.shim.is_none() {
+            return adoption;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.cfg.state_dir) else {
+            return adoption;
+        };
+        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let socket = dir.join(crate::shim::SOCKET_NAME);
+            if !socket.exists() {
+                continue;
+            }
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let conn = match tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::shim::ShimConn::connect(&socket),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) if e.downcast_ref::<crate::shim::IncompatibleProto>().is_some() => {
+                    tracing::warn!(vm_dir = %name, error = %e,
+                        "boot pass: microVM shim speaks another proto; its leaf is killed and \
+                         its record replays (R1021-F8)");
+                    continue;
+                }
+                other => {
+                    tracing::info!(vm_dir = %name,
+                        error = %match other { Ok(Err(e)) => format!("{e:#}"), _ => "timed out".into() },
+                        "boot pass: no microVM shim answers; its leaf is killed (R1021-F8)");
+                    continue;
+                }
+            };
+            match self.adopt_one(&name, &dir, conn).await {
+                Ok((ident, pid, leaf, shim_pid)) => {
+                    tracing::info!(workload = %ident, pid,
+                        "boot pass: adopted a running shim-parented microVM (R1021-F8)");
+                    adoption.adopted.push((ident, pid));
+                    if let Some(leaf) = leaf {
+                        adoption.keep.leaves.insert(leaf);
+                    }
+                    adoption.keep.shim_pids.insert(shim_pid);
+                    if pid != 0 {
+                        adoption.keep.child_pids.insert(pid);
+                    }
+                }
+                Err(e) => tracing::warn!(vm_dir = %name, error = %format!("{e:#}"),
+                    "boot pass: microVM shim answered but is not adoptable; its leaf is killed \
+                     (R1021-F8)"),
+            }
+        }
+        adoption
+    }
+
+    /// Adopt one answering shim; on `Err` the connection is dropped and
+    /// nothing was inserted. Returns `(ident, live pid or 0, leaf, shim pid)`.
+    async fn adopt_one(
+        &self,
+        dir_name: &str,
+        dir: &Path,
+        conn: crate::shim::ShimConn,
+    ) -> Result<(String, u32, Option<PathBuf>, u32)> {
+        let hello = conn.hello.clone();
+        if hello.mode != crate::shim::ShimMode::Process {
+            bail!("shim at {} is not a process-mode shim", dir.display());
+        }
+        if sanitize(&hello.ident) != dir_name {
+            bail!("shim at {} says it is {:?}", dir.display(), hello.ident);
+        }
+        let persisted = crate::shim::read_spec(dir)?;
+        let spec = persisted.spec;
+        if spec.expose.mesh.identity.0 != hello.ident {
+            bail!("spec.json names {:?}", spec.expose.mesh.identity.0);
+        }
+        let shape = VmShape::of_spec(&spec);
+        if shape != VmShape::Service {
+            bail!("a job-shaped guest is never adopted");
+        }
+        if let (Some(theirs), Some(ours)) = (&hello.boot_id, crate::shim::boot_id()) {
+            if *theirs != ours {
+                bail!("shim reports boot {theirs}, this is boot {ours}");
+            }
+        }
+        let alive = hello.last_exit.is_none();
+        if alive
+            && hello.child_start.is_some()
+            && crate::orphan::start_time(hello.child_pid) != hello.child_start
+        {
+            bail!("pid {} is no longer the VMM the shim started", hello.child_pid);
+        }
+        let cgroup = match &self.cgroup {
+            Some(cg) => {
+                let node = cg.root().join(&hello.ident);
+                let leaf = node.join(&hello.generation);
+                if hello.generation.is_empty() || !leaf.is_dir() {
+                    bail!("generation leaf {} is not there", leaf.display());
+                }
+                if alive
+                    && leaf.join("cgroup.procs").exists()
+                    && !crate::cgroup::live_members(&leaf).contains(&hello.child_pid)
+                {
+                    bail!("VMM {} is not in its generation leaf {}", hello.child_pid, leaf.display());
+                }
+                Some(CgroupHandle::existing(node, leaf))
+            }
+            None if hello.generation == "0" => None,
+            None => bail!("shim reports generation {} on a host with no cgroup", hello.generation),
+        };
+        let vm = VmState::read(dir)?;
+        let slot = match (vm.slot_index, &self.cfg.network) {
+            (Some(index), Some(net)) => Some(GuestSlot::derive(net, index)?),
+            (None, _) => None,
+            (Some(_), None) => bail!("the guest had a network slot; this node has no network"),
+        };
+        if let Some(slot) = &slot {
+            if self.vms.lock().await.values().any(|h| h.slot.as_ref().map(|s| s.index) == Some(slot.index)) {
+                bail!("slot {} is already held by another guest", slot.index);
+            }
+        }
+
+        let config_path = dir.join("vm-config.json");
+        if !config_path.exists() {
+            bail!("{} is gone", config_path.display());
+        }
+        let boot = GuestBoot {
+            workload: spec.name.clone(),
+            shape,
+            vmm_bin: self.cfg.vmm_bin.clone(),
+            config_path,
+            console_path: dir.join("console.log"),
+            workspace_disk: dir.join("workspace.ext4"),
+            plan: workspace::plan(&spec),
+            slot,
+            net: self.cfg.network.clone(),
+            ident: hello.ident.clone(),
+            vm_dir: dir.to_path_buf(),
+            mesh_ip: persisted.mesh_ip,
+            spec_digest: persisted.spec_digest,
+            cgroup,
+            shim: self.shim.clone(),
+            spec: spec.clone(),
+        };
+        let leaf = boot.cgroup.as_ref().map(|c| c.path().to_path_buf());
+        let pid = if alive { hello.child_pid } else { 0 };
+        let initial = BootedGuest {
+            proc: Proc::Shim(conn),
+            pid: hello.child_pid,
+        };
+        self.supervise_guest(boot, spec.restart_policy.clone(), initial).await;
+        if pid == 0 {
+            // A latched exit settles on the supervisor's first poll.
+            if let Some(h) = self.vms.lock().await.get(&hello.ident) {
+                h.pid.store(0, Ordering::SeqCst);
+            }
+        }
+        Ok((hello.ident, pid, leaf, hello.shim_pid))
+    }
+}
+
+#[async_trait]
+impl Kamaji for MicroVmRuntime {
+    fn backend(&self) -> Backend {
+        Backend::MicroVm
+    }
+
+    async fn deploy_workload(
+        &self,
+        spec: &WorkloadSpec,
+        mesh: &MeshAssignment,
+    ) -> Result<DeployResult> {
+        self.deploy_with_digest(spec, mesh, None).await
     }
 
     async fn list_workloads(&self) -> Result<Vec<WorkloadState>> {
@@ -1978,6 +2406,15 @@ impl Kamaji for MicroVmRuntime {
                 tracing::warn!(tap = %slot.tap, error = %e, "TAP teardown failed");
             }
         }
+        // R1021-F8: the VMM's leaf goes with it (killing anything the stop
+        // above left behind). `vm.json` goes too, so a stale slot can never
+        // be adopted from a torn-down guest's directory.
+        if let (Some(cg), Some(_)) = (&self.cgroup, &handle.cgroup) {
+            if let Err(e) = cg.destroy_workload(&ident.0) {
+                tracing::warn!(workload = %ident.0, error = %e, "microVM cgroup leaf teardown failed");
+            }
+        }
+        let _ = std::fs::remove_file(handle.vm_dir.join(VmState::FILE));
 
         // The VM directory is left in place deliberately: it holds the console
         // capture and the exact machine definition that was booted, which is
@@ -2055,11 +2492,46 @@ fn log_provenance(what: &str, image: &Path) {
     }
 }
 
-fn signal_pid(pid: u32, sig: i32) {
-    // SAFETY: kill(2) with a pid this process spawned; an ESRCH from an
-    // already-reaped child is the expected benign case and is ignored.
-    unsafe {
-        libc::kill(pid as libc::pid_t, sig);
+/// The numbers a VMM's leaf is minted with (R1021-F8): the guest's CPU weight
+/// and the spec's pids ceiling, and deliberately NO `memory.max` — the guest's
+/// RAM is its `mem_size_mib`, and a second, host-side ceiling on the same
+/// workload would fire as an OOM kill of the whole VM with nothing inside the
+/// guest to explain it (R885-B10's stated exclusion, which still holds).
+fn vmm_limits(spec: &WorkloadSpec) -> WorkloadLimits {
+    WorkloadLimits {
+        cpu_request_millis: spec.resources.cpu_millis,
+        cpu_limit_millis: None,
+        memory_max_mb: 0,
+        pids_max: spec.pids_limit(),
+    }
+}
+
+/// `<vm dir>/vm.json` (R1021-F8): what an adopting kamaji needs to rebuild a
+/// shim-parented guest's handle that is not already on disk. The machine
+/// itself is `vm-config.json`, the scratch disk and console sit at fixed
+/// names, and the spec is `spec.json`; the one runtime-assigned thing left is
+/// the network slot, from which the TAP name and addresses are re-derived.
+/// There is no API socket to record: the VMM runs `--no-api`.
+#[derive(Debug, Serialize, Deserialize)]
+struct VmState {
+    slot_index: Option<u32>,
+}
+
+impl VmState {
+    const FILE: &'static str = "vm.json";
+
+    fn persist(&self, vm_dir: &Path) -> Result<()> {
+        let path = vm_dir.join(Self::FILE);
+        let tmp = vm_dir.join(".vm.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+    }
+
+    fn read(vm_dir: &Path) -> Result<Self> {
+        let path = vm_dir.join(Self::FILE);
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
     }
 }
 
@@ -3106,6 +3578,9 @@ mod tests {
                 vm_dir: rt.cfg.state_dir.join(ident),
                 console_path: rt.cfg.state_dir.join(ident).join("console.log"),
                 shape,
+                survives: false,
+                spec_digest: None,
+                cgroup: None,
                 pid: Arc::new(AtomicU32::new(0)),
                 status: status_rx,
                 ctrl: ctrl_tx,
@@ -3113,6 +3588,136 @@ mod tests {
             },
         );
         ctrl_rx
+    }
+
+    // ── Surviving kamaji (R1021-F8) ─────────────────────────────────────────
+
+    /// A shimmed backend on a FIXTURE cgroup root whose "firecracker" is a
+    /// STAND-IN: a shell script that ignores `--no-api --config-file <path>`
+    /// and execs `sleep`. Firecracker cannot run on this host (no /dev/kvm,
+    /// and darwin), so everything below exercises the real launch path — the
+    /// LaunchPlan, a real out-of-process `kamaji shim`, the leaf, `spec.json`
+    /// and `vm.json` — with a process that is VM-shaped only in how it is
+    /// started and stopped.
+    fn shimmed_runtime_on(tmp: &tempfile::TempDir) -> MicroVmRuntime {
+        use std::os::unix::fs::PermissionsExt;
+        let rt = runtime_on(tmp)
+            .with_cgroup_root(tmp.path().join("cgroup-root"))
+            .with_shim(crate::shim::test_launcher());
+        let vmm = tmp.path().join("firecracker");
+        std::fs::write(&vmm, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&vmm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        rt
+    }
+
+    /// Steps 6–7 of a deploy (leaf, boot, supervisor) on a machine whose
+    /// steps 1–5 (scratch disk, root, TAP) need e2fsprogs and CAP_NET_ADMIN
+    /// this host does not have; `vm-config.json` is a placeholder the stand-in
+    /// never reads.
+    async fn launch_stand_in(rt: &MicroVmRuntime, spec: &WorkloadSpec, digest: &str) -> u32 {
+        let vm_dir = rt.cfg.state_dir.join(sanitize(&spec.expose.mesh.identity.0));
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let config_path = vm_dir.join("vm-config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+        let slot = rt.allocate_slot().await.unwrap();
+        rt.launch_guest(GuestLaunch {
+            spec,
+            mesh_ip: Ipv4Addr::new(100, 64, 0, 9),
+            shape: VmShape::of_spec(spec),
+            disk: vm_dir.join("workspace.ext4"),
+            vm_dir,
+            config_path,
+            plan: workspace::plan(spec),
+            slot,
+            spec_digest: Some(digest.into()),
+        })
+        .await
+        .unwrap()
+    }
+
+    fn alive(pid: u32) -> bool {
+        // SAFETY: signal 0 probes existence only.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// R1021-F8 verify, with the STAND-IN VMM above: a service guest launched
+    /// by one runtime survives that runtime and its tokio runtime being
+    /// dropped, and the next runtime adopts it at the same pid and digest —
+    /// which is the condition kamaji-bin's `resume_microvm_workloads` reads
+    /// to skip R605-F16's replay — keeps its slot, marks it as surviving
+    /// shutdown, and the boot pass's reap spares it. Teardown still ends it.
+    #[test]
+    fn an_adopted_service_vm_keeps_its_pid_across_a_runtime_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = service_spec("devbox");
+        let ident = spec.expose.mesh.identity.clone();
+
+        let first = tokio::runtime::Runtime::new().unwrap();
+        let pid = first.block_on(async {
+            let rt = shimmed_runtime_on(&tmp);
+            let pid = launch_stand_in(&rt, &spec, "d1gest").await;
+            assert!(rt.survives_supervisor(&ident).await);
+            pid
+        });
+        drop(first);
+        assert!(alive(pid), "the VMM died with the runtime that launched it");
+
+        let second = tokio::runtime::Runtime::new().unwrap();
+        second.block_on(async {
+            let rt = shimmed_runtime_on(&tmp);
+            let adoption = rt.adopt_survivors().await;
+            assert_eq!(adoption.adopted, vec![(ident.0.clone(), pid)]);
+            assert!(adoption.keep.child_pids.contains(&pid));
+            assert_eq!(rt.deployed_digest(&ident.0).await.as_deref(), Some("d1gest"));
+            assert!(rt.survives_supervisor(&ident).await);
+            let listed = rt.list_workloads().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].status, WorkloadStatus::Running);
+            assert_eq!(listed[0].container_id, format!("microvm-{pid}"), "pid changed");
+            assert_eq!(
+                rt.vms.lock().await[&ident.0].slot.as_ref().map(|s| s.index),
+                Some(0),
+                "the slot was not rebuilt from vm.json"
+            );
+
+            let reaped = crate::boot::reap_unadopted(
+                rt.cgroup_root().unwrap(),
+                &adoption.keep,
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(
+                reaped.leaves.is_empty() && reaped.shims.is_empty() && reaped.strays.is_empty(),
+                "{reaped:?}"
+            );
+            assert!(alive(pid), "the boot pass killed an adopted VM");
+
+            rt.teardown_workload(&ident).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while alive(pid) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!alive(pid), "teardown left the adopted VMM running");
+        });
+    }
+
+    /// A job-shaped guest on the same shimmed backend keeps its pre-F8
+    /// semantics: forked directly (no shim socket), not surviving shutdown,
+    /// never adopted — but it does get its own leaf.
+    #[tokio::test]
+    async fn a_job_vm_is_forked_directly_in_its_own_leaf_and_does_not_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = shimmed_runtime_on(&tmp);
+        let spec = spec("build");
+        let ident = spec.expose.mesh.identity.clone();
+        let pid = launch_stand_in(&rt, &spec, "j0b").await;
+        let vm_dir = rt.cfg.state_dir.join(sanitize(&ident.0));
+        assert!(!vm_dir.join(crate::shim::SOCKET_NAME).exists(), "a job VM got a shim");
+        assert!(!rt.survives_supervisor(&ident).await);
+        assert!(tmp.path().join("cgroup-root").join(&ident.0).is_dir(), "no leaf minted");
+        assert!(rt.adopt_survivors().await.adopted.is_empty());
+        rt.teardown_workload(&ident).await.unwrap();
+        assert!(!alive(pid), "teardown left the job's VMM running");
     }
 
     // ── Slot arithmetic ─────────────────────────────────────────────────────

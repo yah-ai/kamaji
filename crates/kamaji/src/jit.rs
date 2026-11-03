@@ -136,12 +136,11 @@ use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::process::Child;
@@ -149,7 +148,8 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use workload_spec::{EnvValue, MeshIdent, WorkloadSpec};
 
-use crate::native::argv;
+use crate::native::{argv, LaunchPlan};
+use crate::shim::{JitConn, ShimEvent, ShimLauncher, ShimMode};
 use crate::socket_custody::SocketCustodian;
 use crate::{MeshAssignment, WorkloadState, WorkloadStatus};
 
@@ -187,6 +187,8 @@ struct JitHandle {
     /// unbounded as they did before that ticket. Held for the whole deploy, not
     /// per cold start: see the module doc.
     cgroup: Option<crate::cgroup::CgroupHandle>,
+    /// R870-B24's digest this workload was deployed (or adopted) with.
+    spec_digest: Option<String>,
     /// Flip to `true` to tear the workload down: the supervisor stops any live
     /// child and exits.
     shutdown: watch::Sender<bool>,
@@ -195,6 +197,20 @@ struct JitHandle {
 
 /// On-demand (JIT) runtime. One instance supervises any number of on-demand
 /// workloads; it is the custodian of each one's listen socket.
+///
+/// @yah:ticket(R1021-F7, "On-demand bundles survive kamaji: the shim becomes the custodian of the JIT listen socket and forks the serve process on connection")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:at(2026-10-27T08:30:29Z)
+/// @yah:phase(P2)
+/// @yah:parent(R1021)
+/// @yah:next("Move R599-F9's held fd and R599-F6's poll-fork-rearm loop from kamaji into the per-workload shim, so connections queue on a listener that outlives kamaji. Until this lands, R1021-T1's SIGTERM path stops JIT serve processes gracefully and the listener is down for the restart window.")
+/// @yah:assumes("The systemd fd store (W386 spike T6b: listener handed back, same inode, after a crash) is NOT the answer here: it is Linux+systemd only, and JitRuntime also runs in the desktop camp.")
+/// @arch:see(.yah/docs/working/W386-kamaji-restart-without-workload-downtime.md)
+/// @yah:depends_on(R1021-F3)
+/// @yah:handoff("Ashguard (courier session:3fe26659). BASELINE before edits: kamaji --features native-integration --lib 253/0, plus the jit_lazy_fork harness-less test OK. kamaji-bin --features native-exec,bundle-serving 315+2+2+1/0. POST: kamaji 255/0 (+2 new), jit_lazy_fork OK (lazy fork, idle reap, re-fork, 0 dropped). kamaji-bin 316+2+2+1/0 (+1 new). cargo check -p kamaji-bin on default features: EXIT 0. cargo check -p kamaji --features native-integration --tests --target aarch64-unknown-linux-gnu: EXIT 0. kamaji-bin was not cross-checked (the known ring limitation). WHAT CHANGED. (1) shim.rs gets a JIT MODE, chosen when ShimRequest.jit = Some(JitRequest{listen_addr}). The PROTO stays 1 because every addition is serde-defaulted. In JIT mode the shim binds and holds the TcpListener itself, then runs R599-F6's loop synchronously: poll(2) with a 200ms tick, so it notices `stop`. On readiness it forks plan.command_with_listen_fd under the state lock, then wait(), then re-arms. A failed fork broadcasts fork_failed and backs off 1s (JIT_FORK_FAIL_BACKOFF). Hello gains mode (process|jit, default process) and listen_addr (the actual bound address). In JIT mode child_pid is the live fork (0 when idle), last_exit is the previous fork's, and spec_digest is echoed. New events: forked{pid} and fork_failed{reason}; exit is per fork and is not terminal. New op: stop{grace_ms}. It TERMs the live fork, KILLs it after the grace if the same pid is still live, breaks the loop, closes the listener, removes the socket only if the inode is still its own, and exits. The kamaji side gets JitConn (connect, next_event, stop) and launch_jit. launch() was split into start() plus connect, and the hello/proto check is shared as read_hello. (2) native.rs: LaunchPlan::command_with_listen_fd. The fd-3 dup2/CLOEXEC hook (jit::inherit_listen_fd_at_exec) is installed right after the cgroup attach and before landlock, the cap drop and disclaim. jit.rs's in-process fork now builds the same LaunchPlan (jit_plan), so both JIT paths and the keep-alive tier share one builder. NOTE: the in-process JIT fork now also gets disclaim_at_exec on macOS. jit_lazy_fork still passes, so fd 3 survives posix_spawn SETEXEC. native adopt_survivors skips mode!=process shims, because the bundle tier's native and JIT runtimes SHARE one state dir. (3) jit.rs: JitRuntime gets with_shim(launcher), workloads_survive_supervisor(), deployed_digest(), cgroup_root(), deploy_on_demand_with_digest(), and adopt_survivors() returning native::Adoption. With a shim, deploy mints the cgroup as before, persists spec.json (PersistedSpec), and launches the JIT shim into the shared _shim leaf. If the launch fails, the cgroup is destroyed. supervise_shimmed mirrors the shim's events into pid and status: forked means Running, exit means Pending, fork_failed means Failed. On teardown it sends stop{TERM_GRACE} and waits for EOF. When the runtime is dropped it just lets go. Adoption validates ident, spec.json, boot_id, child_start when serving, generation leaf and membership as F3 does, and listen_addr present. Ports come from hello.listen_addr. JitRuntime::new keeps the in-process loop, and its doc says why: the desktop camp has no `shim` subcommand. WHERE EACH SEMANTIC LIVES: idle timeout stays in the serve runtime (--idle-ttl, unchanged). Re-arm-on-exit (the JIT restart policy), the fork-failure backoff and TERM→grace→KILL all live in the shim. kamaji only observes the shim and asks it to stop. (4) kamaji-bin server.rs: BundleBackend::with_shim also rebuilds bundle.jit with the launcher, so on-demand bundles are shimmed (main.rs is unchanged; it already calls with_shim). The tenant_passway JitRuntime is NOT shimmed and stays in-process; survives_supervisor() is still false for it. boot_pass runs bundle.jit.adopt_survivors() before the reap, records adopted digests, and extends keep. stop_workloads_for_shutdown skips bundle.jit when jit.workloads_survive_supervisor(), mirroring native's per-runtime predicate rather than changing the free fn survives_supervisor(ident), whose doc is updated. run_bundle_on_demand takes the record digest, passes it to deploy_on_demand_with_digest, and passes it to fork_revalidate_receiver (previously None). resume_bundle_workloads, for an OnDemand record: the replay is skipped only if the JIT ident is held at record.spec_digest AND every native sibling (revalidate, feed) is adopted at it. If the bundle is only partly adopted, the JIT and native members are torn down and the whole bundle is replayed. reregister_adopted_bundle for on-demand sets DeployProgress Running and registers no probe, matching run_bundle_on_demand. TESTS. REAL shim processes and real forks: jit::tests::a_shimmed_jit_listener_serves_a_connection_with_no_kamaji_runtime_alive deploys via the shim, then drops the JitRuntime and its tokio runtime. A std TcpStream is then served twice by two distinct python3 forks that accept on fd 3, and neither fork is the shim. A raw std UnixStream hello reports the same shim_pid, mode jit, the digest and listen_addr. A raw stop removes the socket and closes the port. jit::tests::an_adopted_jit_shim_keeps_its_listener_across_a_runtime_rebuild (F3's style, with a FIXTURE tempdir cgroup root): deploy, drop both runtimes. Then NativeRuntime adopt_survivors on the same dir adopts nothing, and JitRuntime adopt_survivors adopts it with keep.shim_pids = the same shim, a single leaf, digest d1gest, Pending, and the right port. reap_unadopted spares it, a connection is served, and teardown ends the shim. kamaji-bin server::tests::bundle_serving::shutdown_leaves_a_shimmed_on_demand_bundle_listening deploys an OnDemand bundle through the Deploy handler, runs stop_workloads_for_shutdown, then asserts the socket still exists, the bundle is still listed and the port still connects; teardown removes the socket. NOT COVERED: boot_pass and resume_bundle_workloads for on-demand records are not driven end to end. Linux-only paths (pidfd signalling, the _shim cgroup join, real cgroup membership) are compiled for aarch64 but not run.")
+/// @yah:handoff("Leader: on-demand bundles now run under a JIT-mode `kamaji shim`. It owns the listener and the poll/fork/re-arm loop, along with fork backoff and TERM/grace/KILL; the idle timeout stays in the serve runtime. JitRuntime is now a client of that shim. The desktop camp and tenant-passway keep the in-process loop on purpose. The boot pass adopts live JIT shims and skips their replay when the digest matches, and shutdown leaves them running. Courier counts: kamaji native-integration 255/0 (was 253); kamaji-bin native-exec,bundle-serving 316+2+2+1/0 (was 315). The default and aarch64 checks are clean.")
+/// @yah:verify("Linux-only paths and an end-to-end boot pass with an on-demand bundle, checked live during R1021-T6")
 pub struct JitRuntime {
     /// Owns the held listen sockets (R599-F9). Shared so the supervisor tasks
     /// and the teardown path see the same custody map.
@@ -212,6 +228,10 @@ pub struct JitRuntime {
     /// workload must not learn whether it is traced from which tier happened to
     /// start it.
     collector: crate::observe::Collector,
+    /// R1021-F7: when set, each workload's listener and its poll-fork-rearm
+    /// loop live in a per-workload `kamaji shim` (JIT mode) instead of here, so
+    /// both outlive this kamaji. `None` is the in-process loop.
+    shim: Option<ShimLauncher>,
 }
 
 impl JitRuntime {
@@ -223,6 +243,14 @@ impl JitRuntime {
     /// `warn!` for a host that cannot confine anything belongs at startup, next
     /// to the other backend-availability lines, not inside the first cold start
     /// that silently ran without a ceiling.
+    ///
+    /// R1021-F7: a runtime built here runs the poll-fork-rearm loop IN this
+    /// process and holds the listener itself, so its workloads (listener and
+    /// serve process) end with it. That is deliberate for every caller that is
+    /// not kamaji-bin — the desktop camp and anything else without a `shim`
+    /// subcommand to re-exec, and with no supervisor-restart hazard. kamaji-bin
+    /// opts its bundle tier into [`Self::with_shim`], which moves both into a
+    /// per-workload shim that survives a kamaji restart.
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         let state_dir = state_dir.into();
         Self {
@@ -231,7 +259,36 @@ impl JitRuntime {
             cgroup: crate::native::resolve_cgroup_root("jit", &state_dir),
             collector: crate::observe::Collector::disabled(),
             state_dir,
+            shim: None,
         }
+    }
+
+    /// R1021-F7: run each workload's listener and poll-fork-rearm loop in a
+    /// `kamaji shim` (JIT mode) started by `launcher`, so a connection that
+    /// arrives while kamaji restarts queues on a socket that never closed and
+    /// is served by a fork nobody had to replay. Idle detection stays in the
+    /// serve runtime (`--idle-ttl`); re-arm-on-exit, the fork-failure backoff
+    /// and the TERM→grace→KILL stop all move into the shim. See [`Self::new`]
+    /// for who keeps the in-process loop.
+    pub fn with_shim(mut self, launcher: ShimLauncher) -> Self {
+        self.shim = Some(launcher);
+        self
+    }
+
+    /// Whether this runtime's workloads outlive it (a shim holds them), so a
+    /// supervisor shutdown must leave them running (R1021-T1's hook).
+    pub fn workloads_survive_supervisor(&self) -> bool {
+        self.shim.is_some()
+    }
+
+    /// The digest `ident` was deployed (or adopted) with, if it is live here.
+    pub async fn deployed_digest(&self, ident: &str) -> Option<String> {
+        self.workloads.lock().await.get(ident)?.spec_digest.clone()
+    }
+
+    /// The delegated cgroup this runtime confines workloads under, if any.
+    pub fn cgroup_root(&self) -> Option<&crate::cgroup::CgroupV2> {
+        self.cgroup.as_ref()
     }
 
     /// Point this backend's on-demand workloads at the node's local collector
@@ -289,6 +346,19 @@ impl JitRuntime {
         mesh: &MeshAssignment,
         listen_addr: &str,
     ) -> Result<()> {
+        self.deploy_on_demand_with_digest(spec, mesh, listen_addr, None)
+            .await
+    }
+
+    /// [`Self::deploy_on_demand`], recording R870-B24's `spec_digest` so a
+    /// later kamaji that adopts the shim can skip the replay (R1021-F7).
+    pub async fn deploy_on_demand_with_digest(
+        &self,
+        spec: &WorkloadSpec,
+        mesh: &MeshAssignment,
+        listen_addr: &str,
+        spec_digest: Option<String>,
+    ) -> Result<()> {
         // Validate argv eagerly so a misconfigured spec fails the deploy rather
         // than the first connection's fork.
         let _ = argv(spec)?;
@@ -297,6 +367,12 @@ impl JitRuntime {
         // Idempotent redeploy: drop any predecessor (stops its supervisor +
         // releases its held socket) before binding fresh.
         self.teardown_workload(&ident).await?;
+
+        if let Some(launcher) = &self.shim {
+            return self
+                .deploy_shimmed(launcher, spec, mesh, listen_addr, spec_digest)
+                .await;
+        }
 
         // Bind + hold the listen socket in the HOST netns. This is what outlives
         // every forked child. A JIT workload is a plain forked host process, so
@@ -326,33 +402,11 @@ impl JitRuntime {
         // and what the forked child reads as `PORT` (R844-T13) are the same map,
         // built once here, so a JIT workload's own idea of its port cannot differ
         // from the one kamaji publishes.
-        let ports = crate::name_anonymous_ports(
-            &listen_addr
-                .rsplit_once(':')
-                .and_then(|(_, p)| p.parse::<u16>().ok())
-                .into_iter()
-                .collect::<Vec<_>>(),
-        );
+        let ports = ports_of(listen_addr);
 
-        // R885-B10: mint the workload node + this deploy's generation leaf before
-        // the supervisor can fork anything into it. Minted here rather than at
-        // the first cold start so a host that cannot confine the workload says
-        // so at deploy time — and, as in `native`, a failure fails the deploy:
-        // this runtime already decided at startup whether the host can confine
-        // anything, so a failure now means the subtree it verified has changed
-        // underneath us. Last fallible step before the supervisor starts, so a
-        // deploy that fails later cannot leave a cgroup behind.
-        let cgroup = self
-            .cgroup
-            .as_ref()
-            .map(|cg| cg.create_workload(&ident.0, &crate::cgroup::WorkloadLimits::from_spec(spec)))
-            .transpose()
-            .with_context(|| {
-                format!(
-                    "creating the cgroup leaf for on-demand workload {}",
-                    spec.name
-                )
-            })?;
+        // Last fallible step before the supervisor starts, so a deploy that
+        // fails later cannot leave a cgroup behind.
+        let cgroup = self.mint_cgroup(spec)?;
 
         let pid = Arc::new(AtomicU32::new(0));
         let (status_tx, status_rx) = watch::channel(WorkloadStatus::Pending);
@@ -378,11 +432,273 @@ impl JitRuntime {
                 pid,
                 status: status_rx,
                 cgroup,
+                spec_digest,
                 shutdown: shutdown_tx,
                 task,
             },
         );
         Ok(())
+    }
+
+    /// R885-B10: mint the workload node + this deploy's generation leaf before
+    /// anything can fork into it. Minted at deploy rather than at the first
+    /// cold start so a host that cannot confine the workload says so at deploy
+    /// time — and, as in `native`, a failure fails the deploy: this runtime
+    /// already decided at startup whether the host can confine anything, so a
+    /// failure now means the subtree it verified has changed underneath us.
+    fn mint_cgroup(&self, spec: &WorkloadSpec) -> Result<Option<crate::cgroup::CgroupHandle>> {
+        self.cgroup
+            .as_ref()
+            .map(|cg| {
+                cg.create_workload(
+                    &spec.expose.mesh.identity.0,
+                    &crate::cgroup::WorkloadLimits::from_spec(spec),
+                )
+            })
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "creating the cgroup leaf for on-demand workload {}",
+                    spec.name
+                )
+            })
+    }
+
+    /// The shim half of [`Self::deploy_on_demand_with_digest`] (R1021-F7): the
+    /// shim binds `listen_addr`, holds it, and runs the poll-fork-rearm loop;
+    /// this runtime only watches it.
+    async fn deploy_shimmed(
+        &self,
+        launcher: &ShimLauncher,
+        spec: &WorkloadSpec,
+        mesh: &MeshAssignment,
+        listen_addr: &str,
+        spec_digest: Option<String>,
+    ) -> Result<()> {
+        let ident = spec.expose.mesh.identity.clone();
+        let ports = ports_of(listen_addr);
+        let cgroup = self.mint_cgroup(spec)?;
+        let started = async {
+            let plan = jit_plan(
+                &self.state_dir,
+                spec,
+                mesh.mesh_ip,
+                &ports,
+                cgroup.as_ref(),
+                &self.collector,
+            )?;
+            let dir = plan.workload_dir.clone();
+            crate::shim::persist_spec(
+                &dir,
+                &crate::shim::PersistedSpec {
+                    spec_digest: spec_digest.clone(),
+                    mesh_ip: mesh.mesh_ip,
+                    spec: spec.clone(),
+                },
+            )?;
+            let request = crate::shim::ShimRequest {
+                ident: ident.0.clone(),
+                generation: cgroup
+                    .as_ref()
+                    .map_or_else(|| "0".to_string(), |c| c.generation().to_string()),
+                spec_digest: spec_digest.clone(),
+                socket: dir.join(crate::shim::SOCKET_NAME),
+                shim_cgroup: self
+                    .cgroup
+                    .as_ref()
+                    .map(|cg| cg.root().join(crate::shim::SHIM_LEAF)),
+                plan,
+                jit: Some(crate::shim::JitRequest {
+                    listen_addr: listen_addr.to_string(),
+                }),
+            };
+            crate::shim::launch_jit(launcher, &request).await
+        }
+        .await
+        .with_context(|| format!("starting the JIT shim for on-demand workload {}", spec.name));
+        let conn = match started {
+            Ok(conn) => conn,
+            Err(e) => {
+                if let (Some(cg), Some(_)) = (&self.cgroup, &cgroup) {
+                    let _ = cg.destroy_workload(&ident.0);
+                }
+                return Err(e);
+            }
+        };
+        self.insert_shimmed(&ident.0, mesh.mesh_ip, ports, cgroup, spec_digest, conn)
+            .await;
+        Ok(())
+    }
+
+    /// Register a JIT shim connection (fresh or adopted) and start watching it.
+    async fn insert_shimmed(
+        &self,
+        ident: &str,
+        mesh_ip: Ipv4Addr,
+        ports: std::collections::BTreeMap<String, u16>,
+        cgroup: Option<crate::cgroup::CgroupHandle>,
+        spec_digest: Option<String>,
+        conn: JitConn,
+    ) {
+        let child = conn.hello.child_pid;
+        let pid = Arc::new(AtomicU32::new(child));
+        let (status_tx, status_rx) = watch::channel(if child != 0 {
+            WorkloadStatus::Running
+        } else {
+            WorkloadStatus::Pending
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_shimmed(
+            ident.to_string(),
+            conn,
+            Arc::clone(&pid),
+            status_tx,
+            shutdown_rx,
+        ));
+        self.workloads.lock().await.insert(
+            ident.to_string(),
+            JitHandle {
+                mesh_ip,
+                ports,
+                pid,
+                status: status_rx,
+                cgroup,
+                spec_digest,
+                shutdown: shutdown_tx,
+                task,
+            },
+        );
+    }
+
+    /// The boot pass's JIT half (R1021-F7, W386 §2). Call once, on a fresh
+    /// runtime, BEFORE any replay and before [`crate::boot::reap_unadopted`].
+    ///
+    /// For each `<state_dir>/<ident>/shim.sock` whose shim answers in JIT mode
+    /// with this kamaji's `proto` and names this ident: the workload goes back
+    /// in the map, watched, at the digest in its `spec.json`. The shim is
+    /// neither killed nor replayed, so its listener never closed. A process-mode
+    /// shim in the same directory (the bundle tier shares one state dir between
+    /// its native and JIT runtimes) is skipped silently — the native runtime's
+    /// own pass owns it. Anything else is left for the reap.
+    pub async fn adopt_survivors(&self) -> crate::native::Adoption {
+        let mut adoption = crate::native::Adoption::default();
+        if self.shim.is_none() {
+            return adoption;
+        }
+        let Ok(entries) = std::fs::read_dir(&self.state_dir) else {
+            return adoption;
+        };
+        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let socket = dir.join(crate::shim::SOCKET_NAME);
+            let Some(ident) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if !socket.exists() {
+                continue;
+            }
+            let conn =
+                match tokio::time::timeout(Duration::from_secs(2), JitConn::connect(&socket)).await
+                {
+                    Ok(Ok(conn)) => conn,
+                    // Another proto: the native pass reports it and restarts it.
+                    Ok(Err(e)) if e.downcast_ref::<crate::shim::IncompatibleProto>().is_some() => {
+                        continue
+                    }
+                    other => {
+                        tracing::debug!(
+                            workload = %ident,
+                            error = %match other { Ok(Err(e)) => format!("{e:#}"), _ => "timed out".into() },
+                            "jit boot pass: no shim answers"
+                        );
+                        continue;
+                    }
+                };
+            if conn.hello.mode != ShimMode::Jit {
+                continue;
+            }
+            match self.adopt_one(&ident, &dir, conn).await {
+                Ok((pid, leaf, shim_pid)) => {
+                    tracing::info!(
+                        workload = %ident, pid, shim_pid,
+                        "boot pass: adopted a live JIT shim; its listener never closed (R1021-F7)"
+                    );
+                    adoption.adopted.push((ident, pid));
+                    if let Some(leaf) = leaf {
+                        adoption.keep.leaves.insert(leaf);
+                    }
+                    adoption.keep.shim_pids.insert(shim_pid);
+                }
+                Err(e) => tracing::warn!(
+                    workload = %ident, error = %format!("{e:#}"),
+                    "boot pass: JIT shim answered but is not adoptable; it is reaped (R1021-F7)"
+                ),
+            }
+        }
+        adoption
+    }
+
+    /// Adopt one answering JIT shim; on `Err` nothing was inserted.
+    async fn adopt_one(
+        &self,
+        ident: &str,
+        dir: &Path,
+        conn: JitConn,
+    ) -> Result<(u32, Option<PathBuf>, u32)> {
+        let hello = conn.hello.clone();
+        if hello.ident != ident {
+            bail!("shim at {} says it is {:?}", dir.display(), hello.ident);
+        }
+        let persisted = crate::shim::read_spec(dir)?;
+        if persisted.spec.expose.mesh.identity.0 != ident {
+            bail!("spec.json names {:?}", persisted.spec.expose.mesh.identity.0);
+        }
+        if let (Some(theirs), Some(ours)) = (&hello.boot_id, crate::shim::boot_id()) {
+            if *theirs != ours {
+                bail!("shim reports boot {theirs}, this is boot {ours}");
+            }
+        }
+        let serving = hello.child_pid != 0;
+        if serving
+            && hello.child_start.is_some()
+            && crate::orphan::start_time(hello.child_pid) != hello.child_start
+        {
+            bail!("pid {} is no longer the child the shim forked", hello.child_pid);
+        }
+        let listen_addr = hello
+            .listen_addr
+            .clone()
+            .ok_or_else(|| anyhow!("JIT shim reports no listen address"))?;
+        let cgroup = match &self.cgroup {
+            Some(cg) => {
+                let node = cg.root().join(ident);
+                let leaf = node.join(&hello.generation);
+                if hello.generation.is_empty() || !leaf.is_dir() {
+                    bail!("generation leaf {} is not there", leaf.display());
+                }
+                if serving
+                    && leaf.join("cgroup.procs").exists()
+                    && !crate::cgroup::live_members(&leaf).contains(&hello.child_pid)
+                {
+                    bail!("child {} is not in its generation leaf {}", hello.child_pid, leaf.display());
+                }
+                Some(crate::cgroup::CgroupHandle::existing(node, leaf))
+            }
+            None if hello.generation == "0" => None,
+            None => bail!("shim reports generation {} on a host with no cgroup", hello.generation),
+        };
+        let leaf = cgroup.as_ref().map(|c| c.path().to_path_buf());
+        self.insert_shimmed(
+            ident,
+            persisted.mesh_ip,
+            ports_of(&listen_addr),
+            cgroup,
+            persisted.spec_digest,
+            conn,
+        )
+        .await;
+        Ok((hello.child_pid, leaf, hello.shim_pid))
     }
 
     /// Snapshot every on-demand workload. `Pending` (pid `0`) is the idle,
@@ -652,84 +968,93 @@ fn spawn_jit_child(
     cgroup: Option<&crate::cgroup::CgroupHandle>,
     collector: &crate::observe::Collector,
 ) -> Result<JitChild> {
+    let plan = jit_plan(state_dir, spec, mesh_ip, ports, cgroup, collector)?;
+    let mut cmd = tokio::process::Command::from(plan.command_with_listen_fd(listen_fd)?);
+    cmd.kill_on_drop(false);
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("forking {} for on-demand workload {}", plan.argv[0], spec.name))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow!("on-demand child for {} exited before pid read", spec.name))?;
+    Ok(JitChild { child, pid })
+}
+
+/// The one [`LaunchPlan`] for an on-demand fork, in-process or in the JIT shim
+/// (R1021-F7). Env in the order the fork has always set it: `YAH_MESH_IP`,
+/// `LISTEN_FDS=1`, the port set, the collector contract, the spec's literals
+/// (a later entry wins). Logs append across forks — each on-demand fork is a
+/// fresh serve, and keeping history mirrors the native backend's respawn.
+///
+/// `LISTEN_PID` is deliberately NOT set: the serve binary adopts fd 3 whenever
+/// it is unset, and setting it to the child's own pid would need an
+/// async-signal-unsafe setenv in the pre_exec hook. See
+/// mesofact-serve::socket_activation_listener.
+///
+/// The pre-exec hooks — cgroup attach, the fd-3 handoff, landlock, capability
+/// drop, disclaimed exec — come from [`LaunchPlan::command_with_listen_fd`],
+/// the builder the keep-alive tier shares, so the tiers cannot drift.
+pub(crate) fn jit_plan(
+    state_dir: &Path,
+    spec: &WorkloadSpec,
+    mesh_ip: Ipv4Addr,
+    ports: &std::collections::BTreeMap<String, u16>,
+    cgroup: Option<&crate::cgroup::CgroupHandle>,
+    collector: &crate::observe::Collector,
+) -> Result<LaunchPlan> {
     let ident = &spec.expose.mesh.identity;
     let argv = argv(spec)?;
-
-    // Per-workload log capture, appended across forks (each on-demand fork is a
-    // fresh serve; keeping history mirrors the native backend's respawn append).
     let dir = state_dir.join(&ident.0);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating state dir {}", dir.display()))?;
-    let open = |name: &str| -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(name))
-    };
-    let stdout_file =
-        open("stdout.log").with_context(|| format!("opening {}/stdout.log", dir.display()))?;
-    let stderr_file =
-        open("stderr.log").with_context(|| format!("opening {}/stderr.log", dir.display()))?;
-
-    let mut cmd = tokio::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .env("YAH_MESH_IP", mesh_ip.to_string())
-        // systemd socket-activation: the serve runtime adopts fd 3 as its
-        // listener. We deliberately do NOT set LISTEN_PID — the serve binary
-        // adopts fd 3 whenever LISTEN_PID is unset, and setting it to the child's
-        // own pid would require an async-signal-unsafe setenv in the pre_exec
-        // hook (the child's pid isn't known before fork). See
-        // mesofact-serve::socket_activation_listener.
-        .env("LISTEN_FDS", "1")
-        .kill_on_drop(false);
-    if let Some(workdir) = &spec.workdir {
-        cmd.current_dir(workdir);
-    }
-    for (k, v) in crate::ports::port_env(ports) {
-        cmd.env(k, v);
-    }
+    let mut env = vec![
+        ("YAH_MESH_IP".to_string(), mesh_ip.to_string()),
+        ("LISTEN_FDS".to_string(), "1".to_string()),
+    ];
+    env.extend(crate::ports::port_env(ports));
     // R893-B17 — same host-namespace contract the native backend forks with.
-    for (k, v) in collector.env_for(spec, crate::observe::MountNs::Host) {
-        cmd.env(k, v);
-    }
+    env.extend(collector.env_for(spec, crate::observe::MountNs::Host));
     for e in &spec.env {
         if let EnvValue::Literal { value } = &e.value {
-            cmd.env(&e.name, value);
+            env.push((e.name.clone(), value.clone()));
         }
     }
+    Ok(LaunchPlan {
+        argv,
+        env,
+        cwd: spec.workdir.clone(),
+        stdout: dir.join("stdout.log"),
+        stderr: dir.join("stderr.log"),
+        truncate_logs: false,
+        cgroup: cgroup.cloned(),
+        workload_dir: dir,
+        spec: spec.clone(),
+        confine: true,
+    })
+}
 
-    // R885-B10 — the boundary, registered FIRST so the child is inside its
-    // ceiling before it is handed anything. Both hooks run post-fork/pre-exec in
-    // registration order, so no workload code runs either way; ordering it first
-    // keeps the confinement ahead of the socket handoff rather than behind it.
-    // Same hook the keep-alive tier uses — see `CgroupHandle::attach_at_exec`.
-    #[cfg(target_os = "linux")]
-    if let Some(handle) = cgroup {
-        handle.attach_at_exec(cmd.as_std_mut()).with_context(|| {
-            format!(
-                "installing the cgroup self-attach hook for on-demand workload {}",
-                spec.name
-            )
-        })?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = cgroup;
+/// The `PORT` set a held `host:port` resolves to (R844-T13).
+fn ports_of(listen_addr: &str) -> std::collections::BTreeMap<String, u16> {
+    crate::name_anonymous_ports(
+        &listen_addr
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )
+}
 
-    // Hand the held listener to the child as fd 3 and clear its close-on-exec so
-    // it survives the exec. The custodian's fd is CLOEXEC (Rust sets it on every
-    // socket it creates), so it would otherwise close on exec — dup2 onto a fresh
-    // fd number clears CLOEXEC on the duplicate.
-    //
+/// Hand the held listener to the child as fd 3 and clear its close-on-exec so
+/// it survives the exec. The held fd is CLOEXEC (Rust sets it on every socket
+/// it creates), so it would otherwise close on exec — dup2 onto a fresh fd
+/// number clears CLOEXEC on the duplicate. Used by [`LaunchPlan`]'s builder.
+pub(crate) fn inherit_listen_fd_at_exec(cmd: &mut std::process::Command, listen_fd: RawFd) {
     // SAFETY: the pre_exec closure runs post-fork/pre-exec in the child and calls
     // only async-signal-safe libc primitives (dup2, fcntl). `listen_fd` is valid
     // in the child because fork copies the parent's fd table.
     unsafe {
-        cmd.as_std_mut().pre_exec(move || {
-            // dup2 only when the held fd isn't already at the target slot; the
-            // short-circuit keeps the "skip when equal" guard.
+        cmd.pre_exec(move || {
+            // dup2 only when the held fd isn't already at the target slot.
             if listen_fd != LISTEN_FD_CHILD && libc::dup2(listen_fd, LISTEN_FD_CHILD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -745,45 +1070,68 @@ fn spawn_jit_child(
             Ok(())
         });
     }
+}
 
-    // R885-B11 — the filesystem boundary, registered between the fd-3 handoff
-    // and the capability drop: the handoff's `dup2`/`fcntl` touch no path, but
-    // keeping the confinement ahead of the drop matches kamaji-bin's
-    // `pre_exec_in_child` order, in which landlock precedes every privilege
-    // change. Confines only a spec that describes its writes — an on-demand
-    // bundle server declares none today and so runs unconfined, exactly as the
-    // rule says it should.
-    #[cfg(target_os = "linux")]
-    crate::sandbox::confine_fs_at_exec(spec, &dir, cmd.as_std_mut()).with_context(|| {
-        format!(
-            "installing the filesystem-confinement hook for on-demand workload {}",
-            spec.name
-        )
-    })?;
-
-    // R885-B9 — the capability boundary, the same helper the keep-alive tier
-    // uses (`kamaji::sandbox::drop_caps_at_exec`). Registered LAST on purpose:
-    // `std` runs pre_exec closures in registration order, and both the cgroup
-    // self-attach above and the fd-3 handoff immediately above it need
-    // privileges this drop takes away. An on-demand fork needs no capability of
-    // its own to serve — kamaji binds the listener and hands it over as fd 3 —
-    // but the drop is derived from the spec here exactly as it is on the native
-    // path, so the two tiers cannot answer the question differently.
-    #[cfg(target_os = "linux")]
-    crate::sandbox::drop_caps_at_exec(spec, cmd.as_std_mut()).with_context(|| {
-        format!(
-            "installing the capability-drop hook for on-demand workload {}",
-            spec.name
-        )
-    })?;
-
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("forking {} for on-demand workload {}", argv[0], spec.name))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow!("on-demand child for {} exited before pid read", spec.name))?;
-    Ok(JitChild { child, pid })
+/// kamaji's side of a shimmed on-demand workload (R1021-F7): mirror the shim's
+/// `forked` / `exit` / `fork_failed` events into the pid cell and the status,
+/// and on teardown ask the shim to stop (it TERMs, waits its grace, KILLs, and
+/// exits). A dropped runtime (the sender gone) just lets go of the shim.
+async fn supervise_shimmed(
+    name: String,
+    mut conn: JitConn,
+    pid: Arc<AtomicU32>,
+    status_tx: watch::Sender<WorkloadStatus>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                if *shutdown.borrow() {
+                    conn.stop(TERM_GRACE).await;
+                    // The shim exits once its child is gone; EOF says so.
+                    let _ = tokio::time::timeout(TERM_GRACE + Duration::from_secs(5), async {
+                        while conn.next_event().await.is_some() {}
+                    })
+                    .await;
+                    pid.store(0, Ordering::SeqCst);
+                    return;
+                }
+            }
+            event = conn.next_event() => match event {
+                Some(ShimEvent::Forked { pid: child }) => {
+                    pid.store(child, Ordering::SeqCst);
+                    let _ = status_tx.send(WorkloadStatus::Running);
+                }
+                Some(ShimEvent::Exit(_)) => {
+                    pid.store(0, Ordering::SeqCst);
+                    let _ = status_tx.send(WorkloadStatus::Pending);
+                }
+                Some(ShimEvent::ForkFailed { reason }) => {
+                    tracing::warn!(workload = %name, error = %reason,
+                        "on-demand fork failed in the JIT shim; it re-arms after backoff");
+                    let _ = status_tx.send(WorkloadStatus::Failed {
+                        oom_killed: false,
+                        reason: format!("on-demand fork failed: {reason}"),
+                    });
+                }
+                Some(ShimEvent::Hello(_)) => {}
+                None => {
+                    tracing::warn!(workload = %name, "JIT shim went away; the workload is down");
+                    pid.store(0, Ordering::SeqCst);
+                    let _ = status_tx.send(WorkloadStatus::Failed {
+                        oom_killed: false,
+                        reason: "the JIT shim exited".to_string(),
+                    });
+                    let _ = shutdown.wait_for(|s| *s).await;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// SIGTERM → grace → SIGKILL, mirroring the native backend's teardown.
@@ -872,6 +1220,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            lease_id: None,
+            deadline: None,
             db: Vec::new(),
             capabilities: Vec::new(),
             annotations: Default::default(),
@@ -1079,5 +1429,188 @@ mod tests {
         );
 
         runtime.teardown_workload(&ident).await.unwrap();
+    }
+
+    // ── R1021-F7: the listener and the fork loop live in a real shim ─────────
+
+    /// A serve process that accepts ONE connection on the inherited fd 3,
+    /// answers `served-by-<pid>`, and exits — so every connection is a fork.
+    fn fd3_server_spec(name: &str) -> WorkloadSpec {
+        jit_spec(
+            name,
+            vec![
+                "/usr/bin/env".into(),
+                "python3".into(),
+                "-c".into(),
+                "import os,socket\n\
+                 s=socket.socket(fileno=3)\n\
+                 c,_=s.accept()\n\
+                 c.sendall(('served-by-%d' % os.getpid()).encode())\n\
+                 c.close()"
+                    .into(),
+            ],
+        )
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Connect and read the serve process's whole answer.
+    fn fetch(addr: &str) -> String {
+        use std::io::Read as _;
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    /// A fresh std client's `hello` — no kamaji runtime involved.
+    fn raw_hello(socket: &Path) -> crate::shim::Hello {
+        use std::io::BufRead as _;
+        let stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line).unwrap();
+        match serde_json::from_str(&line).unwrap() {
+            ShimEvent::Hello(h) => h,
+            other => panic!("not a hello: {other:?}"),
+        }
+    }
+
+    fn stop_raw(socket: &Path) {
+        use std::io::{Read as _, Write as _};
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        stream.write_all(b"{\"op\":\"stop\",\"grace_ms\":1000}\n").unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest); // EOF: the shim exited
+    }
+
+    /// THE VERIFY: the shim owns the listener, so with the JitRuntime AND its
+    /// tokio runtime gone a connection is still served by a fresh fork, and a
+    /// fresh client's hello reports the same shim.
+    #[test]
+    fn a_shimmed_jit_listener_serves_a_connection_with_no_kamaji_runtime_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let spec = fd3_server_spec("jit-shimmed");
+        let addr = format!("127.0.0.1:{}", free_port());
+        let socket = state.join("jit-shimmed").join(crate::shim::SOCKET_NAME);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+
+        let first = tokio::runtime::Runtime::new().unwrap();
+        first.block_on(async {
+            let rt = JitRuntime::new(&state).with_shim(crate::shim::test_launcher());
+            rt.deploy_on_demand_with_digest(&spec, &mesh, &addr, Some("d1gest".into()))
+                .await
+                .unwrap();
+            assert!(rt.workloads_survive_supervisor());
+            drop(rt);
+        });
+        drop(first);
+
+        let before = raw_hello(&socket);
+        assert_eq!(before.mode, ShimMode::Jit);
+        assert_eq!(before.child_pid, 0, "on-demand: nothing forked before a connection");
+        assert_eq!(before.listen_addr.as_deref(), Some(addr.as_str()));
+        assert_eq!(before.spec_digest.as_deref(), Some("d1gest"));
+
+        let answer = fetch(&addr);
+        let served_by: u32 = answer
+            .strip_prefix("served-by-")
+            .unwrap_or_else(|| panic!("unexpected answer {answer:?}"))
+            .parse()
+            .unwrap();
+        assert_ne!(served_by, before.shim_pid, "the shim must fork, not serve");
+
+        // Re-armed: a second connection is a second fork on the same listener.
+        let again = fetch(&addr);
+        assert!(again.starts_with("served-by-") && again != answer, "{again:?}");
+
+        let after = raw_hello(&socket);
+        assert_eq!(after.shim_pid, before.shim_pid, "a different shim answered");
+        assert_eq!(after.spec_digest.as_deref(), Some("d1gest"));
+
+        stop_raw(&socket);
+        assert!(!socket.exists(), "a stopped shim removes its socket");
+        assert!(
+            std::net::TcpStream::connect(&addr).is_err(),
+            "a stopped shim closes the listener"
+        );
+    }
+
+    /// F3's adoption shape for the JIT tier: the boot pass adopts the live JIT
+    /// shim (same shim pid, same digest), the native pass over the SHARED state
+    /// dir leaves it alone, the reap spares it, and the adopted runtime both
+    /// observes its forks and can tear it down.
+    #[test]
+    fn an_adopted_jit_shim_keeps_its_listener_across_a_runtime_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let spec = fd3_server_spec("jit-adoptee");
+        let ident = spec.expose.mesh.identity.clone();
+        let addr = format!("127.0.0.1:{}", free_port());
+        let socket = state.join("jit-adoptee").join(crate::shim::SOCKET_NAME);
+        let mesh = MeshAssignment::inlined(Ipv4Addr::new(127, 0, 0, 1));
+        let runtime = || {
+            JitRuntime::with_cgroup_root(&state, &cgroup_root)
+                .with_shim(crate::shim::test_launcher())
+        };
+
+        let first = tokio::runtime::Runtime::new().unwrap();
+        first.block_on(async {
+            let rt = runtime();
+            rt.deploy_on_demand_with_digest(&spec, &mesh, &addr, Some("d1gest".into()))
+                .await
+                .unwrap();
+            drop(rt);
+        });
+        drop(first);
+        let shim_pid = raw_hello(&socket).shim_pid;
+
+        let second = tokio::runtime::Runtime::new().unwrap();
+        second.block_on(async {
+            // The bundle tier's native runtime shares this dir and must skip it.
+            let native = crate::native::NativeRuntime::new(&state)
+                .with_shim(crate::shim::test_launcher());
+            let skipped = native.adopt_survivors().await;
+            assert!(skipped.adopted.is_empty() && skipped.incompatible.is_empty());
+
+            let rt = runtime();
+            let adoption = rt.adopt_survivors().await;
+            assert_eq!(adoption.adopted, vec![("jit-adoptee".to_string(), 0)]);
+            assert!(adoption.keep.shim_pids.contains(&shim_pid));
+            assert_eq!(adoption.keep.leaves.len(), 1);
+            assert_eq!(rt.deployed_digest("jit-adoptee").await.as_deref(), Some("d1gest"));
+            let listed = rt.list_workloads().await;
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].status, WorkloadStatus::Pending);
+            assert_eq!(listed[0].ports.values().copied().collect::<Vec<_>>(), vec![
+                addr.rsplit_once(':').unwrap().1.parse::<u16>().unwrap()
+            ]);
+
+            let reaped = crate::boot::reap_unadopted(
+                rt.cgroup_root().unwrap(),
+                &adoption.keep,
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(reaped.leaves.is_empty() && reaped.shims.is_empty(), "{reaped:?}");
+            assert_eq!(raw_hello(&socket).shim_pid, shim_pid, "adoption replaced the shim");
+
+            let a = addr.clone();
+            let answer = tokio::task::spawn_blocking(move || fetch(&a)).await.unwrap();
+            assert!(answer.starts_with("served-by-"), "{answer:?}");
+
+            rt.teardown_workload(&ident).await.unwrap();
+            assert!(!socket.exists(), "teardown must end the shim");
+            assert!(std::net::TcpStream::connect(&addr).is_err());
+        });
     }
 }
